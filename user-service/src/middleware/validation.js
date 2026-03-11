@@ -122,6 +122,18 @@ const validateUserUpdate = [
     .isArray({ max: 20 })
     .withMessage('Interests must be an array with maximum 20 items'),
 
+  body('department')
+    .optional()
+    .trim()
+    .isIn(['Public Event', 'Private Event', 'Core Operation'])
+    .withMessage('Department must be one of: Public Event, Private Event, Core Operation'),
+
+  body('assignedRole')
+    .optional()
+    .trim()
+    .isIn(['Senior Event Manager', 'Junior Manager', 'Event Coordinator'])
+    .withMessage('Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator'),
+
   // Prevent updating protected fields
   body('authId').not().exists().withMessage('Cannot update authId'),
   body('role').not().exists().withMessage('Cannot update role'),

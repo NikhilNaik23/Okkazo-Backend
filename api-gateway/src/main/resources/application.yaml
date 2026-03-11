@@ -38,7 +38,19 @@ spring:
                   args:
                     roles: USER,VENDOR,ADMIN,MANAGER
 
-            # Admin Routes - Admin Only
+            # Admin Service Routes - Manager Management (Admin Only)
+            - id: admin-service-managers
+              uri: lb://admin-service
+              predicates:
+                - Path=/api/admin/managers/**
+              filters:
+                - RewritePath=/api/admin/(?<segment>.*), /${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: ADMIN
+
+            # Admin Routes - Admin Only (user-service)
             - id: admin-routes
               uri: lb://user-service
               predicates:

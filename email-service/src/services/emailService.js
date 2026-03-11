@@ -258,6 +258,38 @@ const sendVendorAccountCreatedEmail = async (email, passwordResetToken, business
   }
 };
 
+/**
+ * Send manager account created email with password setup link
+ */
+const sendManagerAccountCreatedEmail = async (email, passwordResetToken, name, department, assignedRole, authId) => {
+  try {
+    if (!email || !passwordResetToken || !name) {
+      throw new Error('Email, password reset token, and name are required');
+    }
+
+    const template = await loadTemplate('manager-invitation');
+    const setPasswordLink = `${process.env.RESET_PASSWORD_URL}?token=${passwordResetToken}`;
+
+    const html = template({
+      setPasswordLink,
+      name,
+      department: department || 'Not assigned',
+      assignedRole: assignedRole || 'MANAGER',
+      email,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+      expiryTime: '7 days',
+    });
+
+    await sendEmail(email, 'You\'ve Been Invited as a Manager - Set Your Password', html);
+
+    logger.info('Manager account created email sent', { email, authId, department });
+  } catch (error) {
+    logger.error('Error sending manager account created email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -267,4 +299,5 @@ module.exports = {
   sendWelcomeEmail,
   sendTestEmail,
   sendVendorAccountCreatedEmail,
+  sendManagerAccountCreatedEmail,
 };

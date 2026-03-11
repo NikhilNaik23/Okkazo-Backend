@@ -30,10 +30,20 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: auth-service-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+        spring.json.value.default.type: java.util.HashMap
 
 Kafka:
     topic:
         name: ${KAFKA_TOPIC_NAME:auth_events}
+    admin-topic:
+        name: ${KAFKA_ADMIN_TOPIC_NAME:admin_events}
 
 jwt:
   secret: ${JWT_SECRET:your-default-secret-key-change-this-in-production}

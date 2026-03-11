@@ -104,11 +104,12 @@ public class PasswordResetService {
         // Update password
         user.setHashedPassword(passwordEncoder.encode(requestDto.newPassword()));
         
-        // Auto-verify vendors when they set their password for the first time
-        if (user.getRole() == com.okkazo.authservice.models.Role.VENDOR && !user.getIsVerified()) {
+        // Auto-verify vendors and managers when they set their password for the first time
+        if ((user.getRole() == com.okkazo.authservice.models.Role.VENDOR ||
+             user.getRole() == com.okkazo.authservice.models.Role.MANAGER) && !user.getIsVerified()) {
             user.setIsVerified(true);
             user.setStatus(Status.ACTIVE);
-            log.info("Auto-verified vendor account after password setup: {}", user.getEmail());
+            log.info("Auto-verified {} account after password setup: {}", user.getRole(), user.getEmail());
         }
         
         authRepository.save(user);

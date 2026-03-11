@@ -5,6 +5,7 @@ import com.okkazo.authservice.dtos.PasswordResetEvent;
 import com.okkazo.authservice.dtos.UserLoginEvent;
 import com.okkazo.authservice.dtos.UserRegistrationEvent;
 import com.okkazo.authservice.dtos.UserRoleChangedEvent;
+import com.okkazo.authservice.dtos.ManagerAccountCreatedEvent;
 import com.okkazo.authservice.dtos.VendorAccountCreatedEvent;
 import com.okkazo.authservice.dtos.VendorRegistrationEvent;
 import lombok.RequiredArgsConstructor;
@@ -24,10 +25,12 @@ public class AuthEventProducer {
     private String topicName;
 
     public void userRegistered(UUID authId, String email, String username, String verificationToken){
+    public void userRegistered(UUID authId, String email, String username, String verificationToken){
         UserRegistrationEvent event = new UserRegistrationEvent(
                 "USER_REGISTERED",
                 authId,
                 email,
+                username,
                 username,
                 verificationToken
         );
@@ -88,6 +91,19 @@ public class AuthEventProducer {
                 previousRole,
                 newRole,
                 LocalDateTime.now()
+        );
+        kafkaTemplate.send(topicName, authId.toString(), event);
+    }
+
+    public void managerAccountCreated(UUID authId, String email, String passwordResetToken, String name, String department, String assignedRole){
+        ManagerAccountCreatedEvent event = new ManagerAccountCreatedEvent(
+                "MANAGER_ACCOUNT_CREATED",
+                authId,
+                email,
+                passwordResetToken,
+                name,
+                department,
+                assignedRole
         );
         kafkaTemplate.send(topicName, authId.toString(), event);
     }

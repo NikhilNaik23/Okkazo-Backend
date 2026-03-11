@@ -92,12 +92,39 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    department: {
+      type: String,
+      trim: true,
+      default: null,
+      enum: {
+        values: [null, 'Public Event', 'Private Event', 'Core Operation'],
+        message: 'Department must be one of: Public Event, Private Event, Core Operation',
+      },
+    },
+    assignedRole: {
+      type: String,
+      trim: true,
+      default: null,
+      enum: {
+        values: [null, 'Senior Event Manager', 'Junior Manager', 'Event Coordinator'],
+        message: 'Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator',
+      },
+    },
   },
   {
     timestamps: true,
     versionKey: false,
   }
 );
+
+// Clear manager-only fields if role is not MANAGER
+userSchema.pre('save', function (next) {
+  if (this.role !== 'MANAGER') {
+    this.department = null;
+    this.assignedRole = null;
+  }
+  next();
+});
 
 // Indexes for better query performance
 userSchema.index({ email: 1, isActive: 1 });

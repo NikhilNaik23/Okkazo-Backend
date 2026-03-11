@@ -108,6 +108,10 @@ const handleEvent = async (event) => {
         await handleVendorAccountCreated(event);
         break;
 
+      case 'MANAGER_ACCOUNT_CREATED':
+        await handleManagerAccountCreated(event);
+        break;
+
       default:
         logger.warn(`Unknown event type: ${event.type}`);
     }
@@ -247,6 +251,39 @@ const handleVendorAccountCreated = async (event) => {
     logger.info('Vendor account created email sent successfully', { authId, email, applicationId });
   } catch (error) {
     logger.error('Error handling VENDOR_ACCOUNT_CREATED event:', error);
+    throw error;
+  }
+};
+
+const handleManagerAccountCreated = async (event) => {
+  try {
+    const { authId, email, passwordResetToken, name, department, assignedRole } = event;
+
+    if (!authId || !email || !passwordResetToken || !name) {
+      logger.error('MANAGER_ACCOUNT_CREATED event missing required fields', { event });
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      logger.error('MANAGER_ACCOUNT_CREATED event has invalid email format', { email });
+      return;
+    }
+
+    logger.info('Processing MANAGER_ACCOUNT_CREATED event', { authId, email, name, department });
+
+    await emailService.sendManagerAccountCreatedEmail(
+      email,
+      passwordResetToken,
+      name,
+      department,
+      assignedRole,
+      authId
+    );
+
+    logger.info('Manager account created email sent successfully', { authId, email });
+  } catch (error) {
+    logger.error('Error handling MANAGER_ACCOUNT_CREATED event:', error);
     throw error;
   }
 };

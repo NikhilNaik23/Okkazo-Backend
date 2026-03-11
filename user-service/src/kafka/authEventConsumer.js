@@ -106,6 +106,10 @@ const handleEvent = async (event) => {
         await handleUserRoleChanged(event);
         break;
 
+      case 'MANAGER_ACCOUNT_CREATED':
+        await handleManagerAccountCreated(event);
+        break;
+
       default:
         logger.warn(`Unknown event type: ${event.type}`);
     }
@@ -118,10 +122,13 @@ const handleEvent = async (event) => {
 const handleUserRegistered = async (event) => {
   try {
     const { authId, email, username, verificationToken } = event;
+    const { authId, email, username, verificationToken } = event;
 
     // Validate required fields
     if (!authId || !email || !username) {
+    if (!authId || !email || !username) {
       logger.error('USER_REGISTERED event missing required fields', { event });
+      throw new Error('Invalid event data: authId, email, and username are required');
       throw new Error('Invalid event data: authId, email, and username are required');
     }
 
@@ -132,6 +139,7 @@ const handleUserRegistered = async (event) => {
       throw new Error('Invalid email format');
     }
 
+    logger.info('Processing USER_REGISTERED event', { authId, email, username });
     logger.info('Processing USER_REGISTERED event', { authId, email, username });
 
     // Create user profile
@@ -233,6 +241,49 @@ const handleUserRoleChanged = async (event) => {
       return null;
     }
     logger.error('Error handling USER_ROLE_CHANGED event:', error);
+    throw error;
+  }
+};
+
+const handleManagerAccountCreated = async (event) => {
+  try {
+    const { authId, email, name, department, assignedRole } = event;
+
+    if (!authId || !email || !name) {
+      logger.error('MANAGER_ACCOUNT_CREATED event missing required fields', { event });
+      throw new Error('Invalid event data: authId, email, and name are required');
+    }
+
+    logger.info('Processing MANAGER_ACCOUNT_CREATED event', { authId, email, name, department });
+
+    const userData = {
+      authId: authId,
+      name: name,
+      email: email,
+      role: 'MANAGER',
+      department: department || null,
+      assignedRole: assignedRole || 'MANAGER',
+      profileIsComplete: false,
+      memberSince: new Date(),
+      isActive: true,
+    };
+
+    const user = await userService.createUser(userData);
+
+    logger.info('Manager profile created successfully', {
+      authId,
+      userId: user.id,
+      email: user.email,
+      department,
+    });
+
+    return user;
+  } catch (error) {
+    if (error.code === 11000) {
+      logger.warn('Manager user already exists', { authId: event.authId });
+      return null;
+    }
+    logger.error('Error handling MANAGER_ACCOUNT_CREATED event:', error);
     throw error;
   }
 };

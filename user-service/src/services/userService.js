@@ -116,6 +116,12 @@ const updateUser = async (userId, updateData) => {
       throw createApiError(404, 'User not found');
     }
 
+    // Strip manager-only fields if user is not a MANAGER
+    if (user.role !== 'MANAGER') {
+      delete allowedUpdates.department;
+      delete allowedUpdates.assignedRole;
+    }
+
     Object.assign(user, allowedUpdates);
     
     // Update profile completion status

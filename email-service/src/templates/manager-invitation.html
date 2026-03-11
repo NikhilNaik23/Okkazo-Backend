@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manager Invitation</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7fa;
+        }
+        .email-container {
+            max-width: 600px;
+            margin: 40px auto;
+            background-color: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: #ffffff;
+            padding: 40px 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+        .header p {
+            margin: 10px 0 0;
+            font-size: 16px;
+            opacity: 0.95;
+        }
+        .content {
+            padding: 40px 30px;
+            color: #333333;
+        }
+        .content h2 {
+            color: #6366f1;
+            font-size: 22px;
+            margin: 0 0 20px;
+            font-weight: 600;
+        }
+        .content p {
+            line-height: 1.8;
+            font-size: 16px;
+            margin: 15px 0;
+            color: #4b5563;
+        }
+        .info-box {
+            background-color: #f0f9ff;
+            border-left: 4px solid #6366f1;
+            padding: 20px;
+            margin: 25px 0;
+            border-radius: 6px;
+        }
+        .info-box p {
+            margin: 8px 0;
+            font-size: 14px;
+            color: #374151;
+        }
+        .info-box strong {
+            color: #1e293b;
+        }
+        .btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: #ffffff;
+            text-decoration: none;
+            padding: 14px 36px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            margin: 25px 0;
+            text-align: center;
+        }
+        .footer {
+            background-color: #f8fafc;
+            padding: 25px 30px;
+            text-align: center;
+            border-top: 1px solid #e5e7eb;
+        }
+        .footer p {
+            margin: 5px 0;
+            font-size: 13px;
+            color: #9ca3af;
+        }
+    </style>
+</head>
+<body>
+    <div class="email-container">
+        <div class="header">
+            <h1>{{platformName}}</h1>
+            <p>Manager Invitation</p>
+        </div>
+        <div class="content">
+            <h2>Welcome to the Team, {{name}}!</h2>
+            <p>You've been invited to join <strong>{{platformName}}</strong> as a <strong>{{assignedRole}}</strong>.</p>
+
+            <div class="info-box">
+                <p><strong>Email:</strong> {{email}}</p>
+                <p><strong>Department:</strong> {{department}}</p>
+                <p><strong>Role:</strong> {{assignedRole}}</p>
+            </div>
+
+            <p>To get started, please set your password by clicking the button below:</p>
+
+            <div style="text-align: center;">
+                <a href="{{setPasswordLink}}" class="btn">Set Your Password</a>
+            </div>
+
+            <p style="font-size: 14px; color: #6b7280;">
+                This link will expire in <strong>{{expiryTime}}</strong>. If you didn't expect this invitation, please ignore this email.
+            </p>
+
+            <p style="font-size: 13px; color: #9ca3af; word-break: break-all;">
+                If the button doesn't work, copy and paste this link into your browser:<br>
+                {{setPasswordLink}}
+            </p>
+        </div>
+        <div class="footer">
+            <p>&copy; 2025 {{platformName}}. All rights reserved.</p>
+            <p>Need help? Contact us at {{supportEmail}}</p>
+        </div>
+    </div>
+</body>
+</html>
