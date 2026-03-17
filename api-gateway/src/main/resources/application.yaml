@@ -97,6 +97,38 @@ spring:
                   args:
                     roles: ADMIN
 
+            # Event Service Routes - Planning (All authenticated users)
+            - id: event-service
+              uri: lb://EVENT-SERVICE
+              predicates:
+                - Path=/api/events/**
+              filters:
+                - RewritePath=/api/events/(?<segment>.*), /${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: USER,VENDOR,ADMIN,MANAGER
+
+            # Order Service Routes - Payments (All authenticated users)
+            - id: order-service-webhook
+              uri: lb://order-service
+              predicates:
+                - Path=/api/orders/webhook
+              filters:
+                - RewritePath=/api/orders/webhook, /orders/webhook
+
+            # Order Service Routes - Payments (All authenticated users)
+            - id: order-service
+              uri: lb://order-service
+              predicates:
+                - Path=/api/orders/**
+              filters:
+                - RewritePath=/api/orders/(?<segment>.*), /orders/${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: USER,VENDOR,ADMIN,MANAGER
+
           globalcors:
             cors-configurations:
               '[/**]':
