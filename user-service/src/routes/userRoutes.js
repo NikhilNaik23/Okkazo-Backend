@@ -28,6 +28,24 @@ router.get(
 );
 
 router.get(
+  '/team-access',
+  authorizeRoles(['ADMIN']),
+  userController.getTeamAccess
+);
+
+router.patch(
+  '/team-access/:authId/block',
+  authorizeRoles(['ADMIN']),
+  userController.blockTeamMember
+);
+
+router.patch(
+  '/team-access/:authId/unblock',
+  authorizeRoles(['ADMIN']),
+  userController.unblockTeamMember
+);
+
+router.get(
   '/',
   authorizeRoles(['ADMIN', 'MANAGER']),
   userController.getAllUsers

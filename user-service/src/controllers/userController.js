@@ -310,6 +310,118 @@ const getUserStats = async (req, res) => {
 };
 
 /**
+ * Get team access data (Admin only)
+ * GET /api/users/team-access
+ */
+const getTeamAccess = async (req, res) => {
+  try {
+    let { page = 1, limit = 10, search = '' } = req.query;
+
+    page = parseInt(page, 10);
+    limit = parseInt(limit, 10);
+
+    if (isNaN(page) || page < 1) page = 1;
+    if (isNaN(limit) || limit < 1) limit = 10;
+    if (limit > 50) limit = 50;
+
+    const result = await userService.getTeamAccessData({
+      search,
+      page,
+      limit,
+    });
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in getTeamAccess:', error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * Block team member (Admin only)
+ * PATCH /api/users/team-access/:authId/block
+ */
+const blockTeamMember = async (req, res) => {
+  try {
+    const { authId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'User authentication information missing',
+      });
+    }
+
+    const user = await userService.blockTeamMember({
+      authId,
+      requestedByAuthId: req.user.authId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Team member blocked successfully',
+      data: {
+        authId: user.authId,
+        email: user.email,
+        role: user.role,
+        status: user.isActive ? 'ACTIVE' : 'BLOCKED',
+      },
+    });
+  } catch (error) {
+    logger.error('Error in blockTeamMember:', error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * Unblock team member (Admin only)
+ * PATCH /api/users/team-access/:authId/unblock
+ */
+const unblockTeamMember = async (req, res) => {
+  try {
+    const { authId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'User authentication information missing',
+      });
+    }
+
+    const user = await userService.unblockTeamMember({
+      authId,
+      requestedByAuthId: req.user.authId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Team member unblocked successfully',
+      data: {
+        authId: user.authId,
+        email: user.email,
+        role: user.role,
+        status: user.isActive ? 'ACTIVE' : 'BLOCKED',
+      },
+    });
+  } catch (error) {
+    logger.error('Error in unblockTeamMember:', error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
  * Update last login
  * POST /api/users/login
  */
@@ -360,6 +472,9 @@ module.exports = {
   updateUser,
   deleteUser,
   getAllUsers,
+  getTeamAccess,
+  blockTeamMember,
+  unblockTeamMember,
   getUserStats,
   updateLastLogin,
   healthCheck,

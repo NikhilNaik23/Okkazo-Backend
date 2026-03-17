@@ -547,6 +547,23 @@ const searchVendorServices = async (req, res) => {
 };
 
 /**
+ * Public vendor profile lookup (sanitized)
+ * GET /api/vendor/public/vendors?authIds=a,b,c
+ */
+const getPublicVendors = async (req, res) => {
+  try {
+    const { authIds } = req.query;
+    const vendors = await vendorServiceCatalog.getPublicVendorsByAuthIds(authIds);
+    return res.status(200).json(formatSuccessResponse({ vendors }));
+  } catch (error) {
+    logger.error('Error in getPublicVendors:', error);
+    return res.status(error.statusCode || 500).json(
+      formatErrorResponse(error.statusCode === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
  * Update a vendor service (owned by calling vendor)
  * PATCH /api/vendor/services/:serviceId
  */
@@ -641,6 +658,7 @@ module.exports = {
   rejectDocument,
   createVendorService,
   searchVendorServices,
+  getPublicVendors,
   getMyServices,
   updateVendorService,
   deleteVendorService,

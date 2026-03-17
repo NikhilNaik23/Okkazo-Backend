@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const logger = require('../utils/logger');
 const createApiError = require('../utils/ApiError');
+const teamAccessEventProducer = require('../kafka/teamAccessEventProducer');
 
 /**
  * Create a new user
@@ -279,6 +280,188 @@ const updateUserRole = async (authId, newRole) => {
 };
 
 /**
+ * Get team access data for admin page
+ */
+const getTeamAccessData = async ({ search = '', page = 1, limit = 10 } = {}) => {
+  try {
+    const safePage = Math.max(Number(page) || 1, 1);
+    const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 50);
+    const skip = (safePage - 1) * safeLimit;
+
+    const baseQuery = {
+      role: { $in: ['ADMIN', 'MANAGER'] },
+    };
+
+    if (search && search.trim() !== '') {
+      const regex = new RegExp(search.trim(), 'i');
+      baseQuery.$or = [
+        { name: regex },
+        { fullName: regex },
+        { email: regex },
+        { assignedRole: regex },
+      ];
+    }
+
+    const [users, total, totalAdmins, totalManagers, activeMembers, pendingInvites] = await Promise.all([
+      User.find(baseQuery)
+        .sort({ lastLogin: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(safeLimit)
+        .lean(),
+      User.countDocuments(baseQuery),
+      User.countDocuments({ role: 'ADMIN' }),
+      User.countDocuments({ role: 'MANAGER' }),
+      User.countDocuments({ role: { $in: ['ADMIN', 'MANAGER'] }, isActive: true }),
+      User.countDocuments({ role: { $in: ['ADMIN', 'MANAGER'] }, isActive: true, lastLogin: null }),
+    ]);
+
+    const members = users.map((user) => ({
+      id: user._id,
+      authId: user.authId,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      assignedRole: user.assignedRole,
+      department: user.department,
+      isActive: user.isActive,
+      status: !user.isActive ? 'BLOCKED' : (!user.lastLogin ? 'UNVERIFIED' : 'ACTIVE'),
+      lastActive: user.lastLogin,
+      access: user.role === 'ADMIN' ? 'Full Access' : user.assignedRole || 'Manager Access',
+    }));
+
+    return {
+      members,
+      stats: {
+        totalMembers: totalAdmins + totalManagers,
+        admins: totalAdmins,
+        managers: totalManagers,
+        activeMembers,
+        pendingInvites,
+      },
+      pagination: {
+        page: safePage,
+        limit: safeLimit,
+        total,
+        totalPages: Math.ceil(total / safeLimit),
+      },
+    };
+  } catch (error) {
+    logger.error('Error fetching team access data:', error);
+    throw createApiError(500, 'Error fetching team access data');
+  }
+};
+
+/**
+ * Block a team member (Admin action)
+ */
+const blockTeamMember = async ({ authId, requestedByAuthId }) => {
+  try {
+    if (!authId || authId.trim() === '') {
+      throw createApiError(400, 'Auth ID is required');
+    }
+
+    if (authId === requestedByAuthId) {
+      throw createApiError(400, 'You cannot block your own account');
+    }
+
+    const user = await User.findOne({ authId: authId.trim() });
+    if (!user) {
+      throw createApiError(404, 'Team member not found');
+    }
+
+    if (!['ADMIN', 'MANAGER'].includes(user.role)) {
+      throw createApiError(400, 'Only admin/manager team members can be blocked from Team Access');
+    }
+
+    if (!user.isActive) {
+      return user;
+    }
+
+    const previousIsActive = user.isActive;
+    user.isActive = false;
+    await user.save();
+
+    try {
+      await teamAccessEventProducer.publishTeamMemberBlocked({
+        authId: user.authId,
+        email: user.email,
+        changedBy: requestedByAuthId,
+      });
+    } catch (eventError) {
+      user.isActive = previousIsActive;
+      await user.save();
+      logger.error('Failed to publish TEAM_MEMBER_BLOCKED event', eventError);
+      throw createApiError(502, 'Failed to synchronize block status with auth service');
+    }
+
+    logger.info('Team member blocked successfully', {
+      authId: user.authId,
+      email: user.email,
+      blockedBy: requestedByAuthId,
+    });
+
+    return user;
+  } catch (error) {
+    if (error.statusCode) throw error;
+    logger.error('Error blocking team member:', error);
+    throw createApiError(500, 'Error blocking team member');
+  }
+};
+
+/**
+ * Unblock a team member (Admin action)
+ */
+const unblockTeamMember = async ({ authId, requestedByAuthId }) => {
+  try {
+    if (!authId || authId.trim() === '') {
+      throw createApiError(400, 'Auth ID is required');
+    }
+
+    const user = await User.findOne({ authId: authId.trim() });
+    if (!user) {
+      throw createApiError(404, 'Team member not found');
+    }
+
+    if (!['ADMIN', 'MANAGER'].includes(user.role)) {
+      throw createApiError(400, 'Only admin/manager team members can be unblocked from Team Access');
+    }
+
+    if (user.isActive) {
+      return user;
+    }
+
+    const previousIsActive = user.isActive;
+    user.isActive = true;
+    await user.save();
+
+    try {
+      await teamAccessEventProducer.publishTeamMemberUnblocked({
+        authId: user.authId,
+        email: user.email,
+        changedBy: requestedByAuthId,
+      });
+    } catch (eventError) {
+      user.isActive = previousIsActive;
+      await user.save();
+      logger.error('Failed to publish TEAM_MEMBER_UNBLOCKED event', eventError);
+      throw createApiError(502, 'Failed to synchronize unblock status with auth service');
+    }
+
+    logger.info('Team member unblocked successfully', {
+      authId: user.authId,
+      email: user.email,
+      unblockedBy: requestedByAuthId,
+    });
+
+    return user;
+  } catch (error) {
+    if (error.statusCode) throw error;
+    logger.error('Error unblocking team member:', error);
+    throw createApiError(500, 'Error unblocking team member');
+  }
+};
+
+/**
  * Get user statistics
  */
 const getUserStats = async () => {
@@ -319,5 +502,8 @@ module.exports = {
   getAllUsers,
   updateLastLogin,
   updateUserRole,
+  getTeamAccessData,
+  blockTeamMember,
+  unblockTeamMember,
   getUserStats,
 };

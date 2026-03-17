@@ -35,6 +35,10 @@ public class AdminEventConsumer {
 
             if ("MANAGER_CREATED".equals(eventType)) {
                 handleManagerCreated(event);
+            } else if ("TEAM_MEMBER_BLOCKED".equals(eventType)) {
+                handleTeamMemberBlocked(event);
+            } else if ("TEAM_MEMBER_UNBLOCKED".equals(eventType)) {
+                handleTeamMemberUnblocked(event);
             } else {
                 log.warn("Unknown admin event type: {}", eventType);
             }
@@ -98,5 +102,39 @@ public class AdminEventConsumer {
             baseUsername = email.split("@")[0].replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
         }
         return baseUsername + "_" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    @Transactional
+    private void handleTeamMemberBlocked(Map<String, Object> event) {
+        String authId = (String) event.get("authId");
+        String changedBy = (String) event.get("changedBy");
+
+        if (authId == null || authId.isBlank()) {
+            log.warn("TEAM_MEMBER_BLOCKED event missing authId: {}", event);
+            return;
+        }
+
+        authRepository.findById(UUID.fromString(authId)).ifPresentOrElse(user -> {
+            user.setStatus(Status.BLOCKED);
+            authRepository.save(user);
+            log.info("Account blocked in auth-service for authId: {} by {}", authId, changedBy);
+        }, () -> log.warn("Auth account not found for TEAM_MEMBER_BLOCKED event authId: {}", authId));
+    }
+
+    @Transactional
+    private void handleTeamMemberUnblocked(Map<String, Object> event) {
+        String authId = (String) event.get("authId");
+        String changedBy = (String) event.get("changedBy");
+
+        if (authId == null || authId.isBlank()) {
+            log.warn("TEAM_MEMBER_UNBLOCKED event missing authId: {}", event);
+            return;
+        }
+
+        authRepository.findById(UUID.fromString(authId)).ifPresentOrElse(user -> {
+            user.setStatus(Status.ACTIVE);
+            authRepository.save(user);
+            log.info("Account unblocked in auth-service for authId: {} by {}", authId, changedBy);
+        }, () -> log.warn("Auth account not found for TEAM_MEMBER_UNBLOCKED event authId: {}", authId));
     }
 }

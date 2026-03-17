@@ -4,6 +4,18 @@ const VendorService = require('../models/VendorService');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 
+const parseAuthIds = (value) => {
+  if (value == null) return [];
+
+  // Support both comma-separated string and repeated query keys.
+  const raw = Array.isArray(value) ? value.join(',') : String(value);
+
+  return raw
+    .split(',')
+    .map((v) => String(v).trim())
+    .filter(Boolean);
+};
+
 /**
  * Create a new service listing for the calling vendor.
  *
@@ -322,10 +334,34 @@ const searchServices = async (filters = {}) => {
   }
 };
 
+/**
+ * Public vendor profile lookup for a set of vendor authIds.
+ *
+ * Returns sanitized VendorApplication fields only (no email/phone/documents).
+ * Only APPROVED vendors are returned.
+ */
+const getPublicVendorsByAuthIds = async (authIds) => {
+  const ids = parseAuthIds(authIds);
+  if (ids.length === 0) {
+    throw new ApiError(400, 'authIds is required');
+  }
+
+  // Keep this payload strictly public-safe
+  const vendors = await VendorApplication.find({
+    authId: { $in: ids },
+    status: 'APPROVED',
+  })
+    .select('authId businessName serviceCategory location place country latitude longitude description status')
+    .lean();
+
+  return vendors;
+};
+
 module.exports = {
   createService,
   getMyServices,
   searchServices,
+  getPublicVendorsByAuthIds,
   updateService,
   deleteService,
 };
