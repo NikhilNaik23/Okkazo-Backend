@@ -1,6 +1,9 @@
 const Planning = require("../models/Planning");
+const VendorSelection = require('../models/VendorSelection');
 const logger = require("../utils/logger");
 const createApiError = require("../utils/ApiError");
+const { STATUS } = require('../utils/planningConstants');
+const vendorSelectionService = require('./vendorSelectionService');
 
 /**
  * Create a new planning event
@@ -136,6 +139,17 @@ const updatePlanningStatus = async (
 
   await planning.save();
   logger.info(`Planning status updated: ${eventId} -> ${status}`);
+
+  if (planning.status === STATUS.IMMEDIATE_ACTION) {
+    try {
+      await vendorSelectionService.ensureForPlanning(planning);
+    } catch (err) {
+      logger.error('Failed to ensure VendorSelection after status update', {
+        eventId: planning.eventId,
+        message: err.message,
+      });
+    }
+  }
   return planning;
 };
 
@@ -200,6 +214,67 @@ const markPlanningPaid = async (eventId) => {
     logger.info(`Planning marked as paid: ${eventId}`);
   }
 
+  if (planning.status === STATUS.IMMEDIATE_ACTION) {
+    try {
+      await vendorSelectionService.ensureForPlanning(planning);
+    } catch (err) {
+      logger.error('Failed to ensure VendorSelection after markPlanningPaid', {
+        eventId: planning.eventId,
+        message: err.message,
+      });
+    }
+  }
+
+  return planning;
+};
+
+/**
+ * Confirm a planning selection (Owner)
+ * - Sets planning.status to PENDING_APPROVAL
+ * - Ensures VendorSelection exists and snapshots selected vendors onto planning.selectedVendors
+ *
+ * Uses validateBeforeSave=false to avoid blocking confirmation on legacy/partial public fields
+ * (e.g., ticketAvailability date rules) when we're not modifying those fields.
+ */
+const confirmPlanning = async ({ eventId, authId }) => {
+  if (!eventId || !String(eventId).trim()) {
+    throw createApiError(400, 'Event ID is required');
+  }
+  if (!authId || !String(authId).trim()) {
+    throw createApiError(400, 'Auth ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: String(eventId).trim(), authId: String(authId).trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  // Ensure vendorSelectionId exists on planning
+  await vendorSelectionService.ensureForPlanning(planning);
+
+  // Recompute VendorSelection totals/status at confirm time.
+  // This ensures totalMinAmount/totalMaxAmount reflect any latest per-service pricing.
+  const selectionDoc = await VendorSelection.findOne({ eventId: planning.eventId });
+  if (selectionDoc) {
+    await selectionDoc.save();
+  }
+
+  const selection = selectionDoc ? selectionDoc.toObject() : null;
+  const selectedVendors = Array.isArray(selection?.vendors)
+    ? selection.vendors
+        .filter((v) => v?.vendorAuthId)
+        .map((v) => ({
+          service: String(v.service || '').trim(),
+          vendorAuthId: String(v.vendorAuthId || '').trim(),
+        }))
+        .filter((v) => v.service && v.vendorAuthId)
+    : [];
+
+  planning.status = STATUS.PENDING_APPROVAL;
+  planning.selectedVendors = selectedVendors;
+
+  await planning.save({ validateBeforeSave: false });
+  logger.info(`Planning confirmed: ${planning.eventId} -> ${planning.status}`);
   return planning;
 };
 
@@ -212,4 +287,5 @@ module.exports = {
   deletePlanning,
   getPlanningStats,
   markPlanningPaid,
+  confirmPlanning,
 };

@@ -182,6 +182,26 @@ const PlanningSchema = new mongoose.Schema(
         message: 'Selected services must include valid service options',
       },
     },
+
+    // Snapshot of the user's selected vendors at confirmation time.
+    // This keeps planning queries simple without always joining VendorSelection.
+    selectedVendors: {
+      type: [
+        {
+          service: {
+            type: String,
+            trim: true,
+            required: true,
+          },
+          vendorAuthId: {
+            type: String,
+            trim: true,
+            required: true,
+          },
+        },
+      ],
+      default: [],
+    },
     isUrgent: {
       type: Boolean,
       default: false,
@@ -192,6 +212,16 @@ const PlanningSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    fullPaymentPaid: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    totalAmount: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
     status: {
       type: String,
       enum: STATUS_VALUES,
@@ -200,6 +230,12 @@ const PlanningSchema = new mongoose.Schema(
     },
     assignedManagerId: {
       type: mongoose.Schema.Types.ObjectId,
+      default: null,
+      index: true,
+    },
+    vendorSelectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'VendorSelection',
       default: null,
       index: true,
     },

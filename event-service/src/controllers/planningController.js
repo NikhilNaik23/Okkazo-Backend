@@ -2,6 +2,126 @@ const planningService = require('../services/planningService');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
+const axios = require('axios');
+
+const defaultVendorServiceUrl = process.env.SERVICE_HOST
+  ? 'http://vendor-service:8084' // docker-compose service name
+  : 'http://localhost:8084';
+const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceUrl;
+const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
+
+const toNumber = (value, fallback = null) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const haversineKm = ({ lat1, lon1, lat2, lon2 }) => {
+  const R = 6371;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+const normalizeSortKey = (value) => {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v) return 'recommended';
+  if (v === 'nearest' || v.includes('nearest')) return 'nearest';
+  if (v === 'toprated' || v.includes('top')) return 'topRated';
+  if (v === 'trending' || v.includes('trend')) return 'trending';
+  if (v.includes('price') && v.includes('low')) return 'priceLow';
+  if (v.includes('price') && v.includes('high')) return 'priceHigh';
+  return v;
+};
+
+const extractRating = (service) => {
+  const direct = toNumber(service?.rating, null);
+  if (direct != null) return direct;
+
+  const fromDetails = toNumber(service?.details?.rating, null);
+  if (fromDetails != null) return fromDetails;
+
+  const fromAvg = toNumber(service?.details?.avgRating, null);
+  if (fromAvg != null) return fromAvg;
+
+  return 0;
+};
+
+const buildMapsUrl = ({ latitude, longitude }) => {
+  if (latitude == null || longitude == null) return null;
+  return `https://www.google.com/maps?q=${encodeURIComponent(String(latitude))},${encodeURIComponent(String(longitude))}`;
+};
+
+const ensureAccessToPlanning = async ({ eventId, user }) => {
+  const planning = await planningService.getPlanningByEventId(eventId);
+
+  if (
+    user?.role !== 'ADMIN' &&
+    user?.role !== 'MANAGER' &&
+    planning.authId !== user?.authId
+  ) {
+    const err = new Error('Access denied. You can only view your own plannings.');
+    err.statusCode = 403;
+    throw err;
+  }
+
+  return planning;
+};
+
+const fetchAllVendorsBasedOnService = async ({
+  serviceCategory,
+  latitude,
+  longitude,
+  radiusKm,
+  limit,
+  skip,
+  businessName,
+  enableGeo,
+}) => {
+  const params = {
+    serviceCategory,
+    limit,
+    skip,
+    ...(businessName ? { businessName } : {}),
+  };
+
+  // Only include geo params when explicitly enabled AND coordinates are valid.
+  // This avoids unintentionally filtering out all vendors for distant events.
+  if (enableGeo && latitude != null && longitude != null) {
+    params.latitude = latitude;
+    params.longitude = longitude;
+    if (radiusKm != null) params.radiusKm = radiusKm;
+  }
+
+  const response = await axios.get(`${vendorServiceUrl}/api/vendor/services/search`, {
+    timeout: upstreamTimeoutMs,
+    params,
+  });
+
+  const services = response.data?.data?.services;
+  return Array.isArray(services) ? services : [];
+};
+
+const fetchPublicVendorsByAuthIds = async (authIds) => {
+  if (!Array.isArray(authIds) || authIds.length === 0) return [];
+
+  const response = await axios.get(`${vendorServiceUrl}/api/vendor/public/vendors`, {
+    timeout: upstreamTimeoutMs,
+    params: {
+      authIds: authIds.join(','),
+    },
+  });
+
+  const vendors = response.data?.data?.vendors;
+  return Array.isArray(vendors) ? vendors : [];
+};
 
 /**
  * Create a new planning event
@@ -311,12 +431,254 @@ const getPlanningStats = async (req, res) => {
   }
 };
 
+/**
+ * Confirm a planning selection (Owner)
+ * POST /planning/:eventId/confirm
+ */
+const confirmPlanning = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const confirmed = await planningService.confirmPlanning({
+      eventId,
+      authId: req.user.authId,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Planning confirmed successfully',
+      data: confirmed,
+    });
+  } catch (error) {
+    logger.error('Error in confirmPlanning:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * Fetch vendor services for a planning, based on a selected serviceCategory.
+ *
+ * GET /planning/:eventId/vendors?serviceCategory=...&sort=Nearest&priceMin=0&priceMax=200000&radiusKm=50&limit=50&skip=0&q=...
+ */
+const getVendorsForPlanning = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const {
+      serviceCategory,
+      sort,
+      priceMin,
+      priceMax,
+      radiusKm,
+      limit,
+      skip,
+      q,
+    } = req.query;
+
+    if (!eventId || !eventId.trim()) {
+      return res.status(400).json({ success: false, message: 'Event ID is required' });
+    }
+
+    if (!serviceCategory || !String(serviceCategory).trim()) {
+      return res.status(400).json({ success: false, message: 'serviceCategory is required' });
+    }
+
+    const planning = await ensureAccessToPlanning({ eventId: eventId.trim(), user: req.user });
+    const lat1 = toNumber(planning?.location?.latitude, null);
+    const lon1 = toNumber(planning?.location?.longitude, null);
+
+    const hasRadiusParam = Object.prototype.hasOwnProperty.call(req.query, 'radiusKm');
+    const effectiveLimit = Math.min(toNumber(limit, 100), 100);
+
+    const vendorServices = await fetchAllVendorsBasedOnService({
+      serviceCategory: String(serviceCategory).trim(),
+      latitude: lat1,
+      longitude: lon1,
+      radiusKm: hasRadiusParam ? toNumber(radiusKm, 50) : null,
+      limit: effectiveLimit,
+      skip: toNumber(skip, 0),
+      businessName: q ? String(q).trim() : null,
+      enableGeo: hasRadiusParam && lat1 != null && lon1 != null,
+    });
+
+    const minP = toNumber(priceMin, 0);
+    const maxP = toNumber(priceMax, null);
+    const sortKey = normalizeSortKey(sort);
+
+    const serviceItems = vendorServices
+      .map((s) => {
+        return {
+          serviceId: s?._id,
+          vendorAuthId: s?.authId,
+          businessName: s?.businessName,
+          name: s?.name,
+          serviceCategory: s?.serviceCategory,
+          categoryId: s?.categoryId,
+          price: s?.price,
+          tier: s?.tier,
+          description: s?.description,
+          details: s?.details || {},
+          latitude: s?.latitude,
+          longitude: s?.longitude,
+          rating: extractRating(s),
+          createdAt: s?.createdAt,
+        };
+      })
+      .filter((v) => {
+        const price = toNumber(v.price, null);
+        if (price == null) return true;
+        if (price < minP) return false;
+        if (maxP != null && price > maxP) return false;
+        return true;
+      });
+
+    const authIds = Array.from(
+      new Set(serviceItems.map((s) => s.vendorAuthId).filter(Boolean))
+    );
+
+    const vendorApps = await fetchPublicVendorsByAuthIds(authIds);
+    const vendorAppByAuthId = new Map(vendorApps.map((v) => [v.authId, v]));
+
+    // Group services by vendor
+    let items = authIds
+      .map((authId) => {
+        const services = serviceItems
+          .filter((s) => s.vendorAuthId === authId)
+          .sort((a, b) => {
+            const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return tb - ta;
+          });
+
+        const app = vendorAppByAuthId.get(authId) || null;
+
+        const vLat = toNumber(app?.latitude, toNumber(services?.[0]?.latitude, null));
+        const vLon = toNumber(app?.longitude, toNumber(services?.[0]?.longitude, null));
+
+        const distanceKm =
+          lat1 != null && lon1 != null && vLat != null && vLon != null
+            ? haversineKm({ lat1, lon1, lat2: vLat, lon2: vLon })
+            : null;
+
+        const prices = services.map((s) => toNumber(s.price, null)).filter((p) => p != null);
+        const priceMin = prices.length ? Math.min(...prices) : null;
+        const priceMax = prices.length ? Math.max(...prices) : null;
+
+        const rating = Math.max(
+          0,
+          ...services.map((s) => toNumber(s.rating, 0)).filter((n) => n != null)
+        );
+
+        const latestCreatedAt = services[0]?.createdAt || null;
+
+        return {
+          vendorAuthId: authId,
+          businessName: app?.businessName || services?.[0]?.businessName || null,
+          serviceCategory: String(serviceCategory).trim(),
+          categoryId: services?.[0]?.categoryId || null,
+          rating,
+          location: {
+            name: app?.location || null,
+            latitude: vLat,
+            longitude: vLon,
+            mapsUrl: buildMapsUrl({ latitude: vLat, longitude: vLon }),
+          },
+          distanceKm,
+          description: app?.description || null,
+          priceMin,
+          priceMax,
+          latestCreatedAt,
+          services: services.map((s) => ({
+            serviceId: s.serviceId,
+            name: s.name,
+            price: s.price,
+            tier: s.tier,
+            description: s.description,
+            details: s.details,
+            rating: s.rating,
+            createdAt: s.createdAt,
+          })),
+        };
+      })
+      // If vendor apps endpoint returns fewer vendors (e.g. not APPROVED), still allow fallback from service items.
+      .filter((v) => Array.isArray(v.services) && v.services.length > 0);
+
+    // Apply vendor-level price filter: keep vendor if any service price is within range
+    items = items.filter((v) => {
+      const min = toNumber(v.priceMin, null);
+      const max = toNumber(v.priceMax, null);
+      if (min == null && max == null) return true;
+      if (maxP != null && min != null && min > maxP) return false;
+      if (minP != null && max != null && max < minP) return false;
+      return true;
+    });
+
+    if (sortKey === 'nearest') {
+      items = [...items].sort((a, b) => {
+        const da = a.distanceKm == null ? Number.POSITIVE_INFINITY : a.distanceKm;
+        const db = b.distanceKm == null ? Number.POSITIVE_INFINITY : b.distanceKm;
+        return da - db;
+      });
+    } else if (sortKey === 'topRated') {
+      items = [...items].sort((a, b) => {
+        const dr = (b.rating || 0) - (a.rating || 0);
+        if (dr !== 0) return dr;
+        const da = a.distanceKm == null ? Number.POSITIVE_INFINITY : a.distanceKm;
+        const db = b.distanceKm == null ? Number.POSITIVE_INFINITY : b.distanceKm;
+        return da - db;
+      });
+    } else if (sortKey === 'priceLow') {
+      items = [...items].sort((a, b) => (toNumber(a.priceMin, Number.POSITIVE_INFINITY) - toNumber(b.priceMin, Number.POSITIVE_INFINITY)));
+    } else if (sortKey === 'priceHigh') {
+      items = [...items].sort((a, b) => (toNumber(b.priceMax, 0) - toNumber(a.priceMax, 0)));
+    } else if (sortKey === 'trending') {
+      items = [...items].sort((a, b) => {
+        const ta = a.latestCreatedAt ? new Date(a.latestCreatedAt).getTime() : 0;
+        const tb = b.latestCreatedAt ? new Date(b.latestCreatedAt).getTime() : 0;
+        return tb - ta;
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        serviceCategory: String(serviceCategory).trim(),
+        vendors: items,
+      },
+    });
+  } catch (error) {
+    logger.error('Error in getVendorsForPlanning:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch vendors',
+    });
+  }
+};
+
 module.exports = {
   createPlanning,
   getMyPlannings,
   getPlanningByEventId,
   getAllPlannings,
   updatePlanningStatus,
+  confirmPlanning,
   deletePlanning,
   getPlanningStats,
+  getVendorsForPlanning,
 };

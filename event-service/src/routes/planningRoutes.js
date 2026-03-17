@@ -47,6 +47,20 @@ router.get(
   planningController.getPlanningByEventId
 );
 
+// GET /planning/:eventId/vendors - Fetch vendors for a service category
+router.get(
+  '/planning/:eventId/vendors',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.getVendorsForPlanning
+);
+
+// POST /planning/:eventId/confirm - Confirm finalized selection (Owner)
+router.post(
+  '/planning/:eventId/confirm',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.confirmPlanning
+);
+
 // PATCH /planning/:eventId/status - Update planning status (Admin/Manager only)
 router.patch(
   '/planning/:eventId/status',
