@@ -125,7 +125,10 @@ const handleVendorRegistration = async (event) => {
       applicationId: event.applicationId,
       businessName: event.businessName,
       serviceCategory: event.serviceCategory,
-      customService: event.customService,
+      images: {
+        profile: event?.images?.profile || (event.profileImageUrl ? { fileUrl: event.profileImageUrl } : null),
+        banner: event?.images?.banner || (event.bannerImageUrl ? { fileUrl: event.bannerImageUrl } : null),
+      },
       email: event.email,
       phone: event.phone,
       location: event.location,

@@ -25,6 +25,13 @@ router.use('/api/vendor', extractUser);
 // Get my application - accessible by the vendor
 router.get('/api/vendor/me/application', vendorController.getMyApplication);
 
+// Upload/replace profile or banner image
+router.post(
+  '/api/vendor/me/application/images/:imageType',
+  upload.single('file'),
+  vendorController.uploadMyApplicationImage
+);
+
 // Get application status - accessible by the applicant
 router.get('/api/vendor/registration/status/:applicationId', vendorController.getApplicationStatus);
 

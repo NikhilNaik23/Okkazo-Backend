@@ -351,7 +351,9 @@ const getPublicVendorsByAuthIds = async (authIds) => {
     authId: { $in: ids },
     status: 'APPROVED',
   })
-    .select('authId businessName serviceCategory location place country latitude longitude description status')
+    .select(
+      'authId businessName serviceCategory images location place country latitude longitude description status'
+    )
     .lean();
 
   return vendors;

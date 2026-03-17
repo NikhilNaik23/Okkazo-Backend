@@ -1,6 +1,7 @@
 const VendorApplication = require('../models/VendorApplication');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
+const fileUploadService = require('./fileUploadService');
 
 /**
  * Create vendor application
@@ -130,10 +131,17 @@ const getMyApplication = async (authId) => {
       authId: application.authId,
       businessName: application.businessName,
       serviceCategory: application.serviceCategory,
-      customService: application.customService,
+      images: {
+        profile: application.images?.profile || null,
+        banner: application.images?.banner || null,
+      },
       email: application.email,
       phone: application.phone,
       location: application.location,
+      place: application.place,
+      country: application.country,
+      latitude: application.latitude,
+      longitude: application.longitude,
       description: application.description,
       status: application.status,
       submittedAt: application.submittedAt,
@@ -176,6 +184,70 @@ const getMyApplication = async (authId) => {
     };
   } catch (error) {
     logger.error('Error getting my application:', error);
+    throw error;
+  }
+};
+
+/**
+ * Upload/replace a vendor's profile or banner image (Cloudinary)
+ */
+const uploadMyApplicationImage = async (authId, imageType, file) => {
+  try {
+    if (!authId) {
+      throw new ApiError(401, 'User not authenticated');
+    }
+
+    if (!['profile', 'banner'].includes(imageType)) {
+      throw new ApiError(400, 'Invalid image type');
+    }
+
+    const application = await VendorApplication.findOne({ authId });
+    if (!application) {
+      throw new ApiError(404, 'No vendor application found for your account');
+    }
+
+    // Upload to Cloudinary
+    const uploadResult = await fileUploadService.uploadFile(
+      file,
+      `${application.applicationId}/images/${imageType}`
+    );
+
+    // Clean up old image if present
+    const previousPublicId = application.images?.[imageType]?.publicId;
+    if (previousPublicId) {
+      try {
+        await fileUploadService.deleteFile(previousPublicId);
+      } catch (cleanupError) {
+        logger.warn('Failed to delete previous Cloudinary image', {
+          applicationId: application.applicationId,
+          imageType,
+          publicId: previousPublicId,
+          error: cleanupError?.message,
+        });
+      }
+    }
+
+    if (!application.images) {
+      application.images = { profile: null, banner: null };
+    }
+
+    application.images[imageType] = {
+      fileUrl: uploadResult.url,
+      publicId: uploadResult.publicId,
+      uploadedAt: new Date(),
+    };
+
+    application.markModified('images');
+    await application.save();
+
+    return {
+      images: {
+        profile: application.images?.profile || null,
+        banner: application.images?.banner || null,
+      },
+    };
+  } catch (error) {
+    logger.error('Error uploading application image:', error);
     throw error;
   }
 };
@@ -521,6 +593,7 @@ module.exports = {
   getApplicationById,
   getApplicationStatus,
   getMyApplication,
+  uploadMyApplicationImage,
   uploadDocument,
   getAllApplications,
   approveApplication,

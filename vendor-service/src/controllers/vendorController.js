@@ -172,6 +172,74 @@ const uploadDocument = async (req, res) => {
 };
 
 /**
+ * Upload/replace vendor profile or banner image
+ * POST /api/vendor/me/application/images/:imageType
+ */
+const uploadMyApplicationImage = async (req, res) => {
+  try {
+    const authId = req.user.authId;
+    const { imageType } = req.params;
+    const file = req.file;
+
+    if (!authId) {
+      return res.status(401).json(formatErrorResponse('UNAUTHORIZED', 'User not authenticated'));
+    }
+
+    if (!['profile', 'banner'].includes(imageType)) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'Invalid image type', [
+          {
+            field: 'imageType',
+            message: 'imageType must be one of: profile, banner',
+          },
+        ])
+      );
+    }
+
+    if (!file) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'File is required', [
+          { field: 'file', message: 'File is required' },
+        ])
+      );
+    }
+
+    // Ensure image only (reuse shared multer allows pdf too)
+    const allowedImageTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+    if (!allowedImageTypes.includes(file.mimetype)) {
+      return res.status(400).json(
+        formatErrorResponse(
+          'VALIDATION_ERROR',
+          'Invalid file type. Only JPEG and PNG images are allowed',
+          [{ field: 'file', message: 'Only JPEG and PNG images are allowed' }]
+        )
+      );
+    }
+
+    const result = await vendorService.uploadMyApplicationImage(authId, imageType, file);
+    res.status(200).json(formatSuccessResponse(result));
+  } catch (error) {
+    logger.error('Error in uploadMyApplicationImage:', error);
+
+    if (error.statusCode === 404) {
+      return res.status(404).json(formatErrorResponse('APPLICATION_NOT_FOUND', error.message));
+    }
+
+    if (error.statusCode === 400) {
+      return res.status(400).json(formatErrorResponse('VALIDATION_ERROR', error.message));
+    }
+
+    if (error.message.includes('file type') || error.message.includes('file size')) {
+      return res.status(400).json(formatErrorResponse('FILE_UPLOAD_ERROR', error.message));
+    }
+
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse('INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
  * Get all applications (Admin only)
  * GET /api/vendor/applications
  */
@@ -649,6 +717,7 @@ module.exports = {
   healthCheck,
   getApplicationStatus,
   getMyApplication,
+  uploadMyApplicationImage,
   uploadDocument,
   getAllApplications,
   approveApplication,

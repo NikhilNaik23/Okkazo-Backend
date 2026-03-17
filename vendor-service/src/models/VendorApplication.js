@@ -41,6 +41,26 @@ const documentSchema = new mongoose.Schema({
   },
 });
 
+const imageSchema = new mongoose.Schema(
+  {
+    fileUrl: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    publicId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    uploadedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  { _id: false }
+);
+
 const vendorApplicationSchema = new mongoose.Schema(
   {
     authId: {
@@ -83,10 +103,15 @@ const vendorApplicationSchema = new mongoose.Schema(
         'Other',
       ],
     },
-    customService: {
-      type: String,
-      trim: true,
-      default: null,
+    images: {
+      profile: {
+        type: imageSchema,
+        default: null,
+      },
+      banner: {
+        type: imageSchema,
+        default: null,
+      },
     },
     email: {
       type: String,
@@ -95,7 +120,7 @@ const vendorApplicationSchema = new mongoose.Schema(
       trim: true,
       index: true,
       match: [
-        /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/,
+        /^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/,
         'Please provide a valid email address',
       ],
     },
