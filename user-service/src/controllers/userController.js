@@ -151,7 +151,22 @@ const updateCurrentUser = async (req, res) => {
 
     const authId = req.user.authId;
     const user = await userService.getUserByAuthId(authId);
-    const updatedUser = await userService.updateUser(user.id, req.body);
+
+    // Email is immutable for self-service profile updates.
+    // If the frontend sends email (even from a disabled input), allow it only if unchanged.
+    const updateData = { ...req.body };
+    if (Object.prototype.hasOwnProperty.call(updateData, 'email')) {
+      const incomingEmail = updateData.email;
+      if (incomingEmail && String(incomingEmail).toLowerCase() !== String(user.email).toLowerCase()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email cannot be updated',
+        });
+      }
+      delete updateData.email;
+    }
+
+    const updatedUser = await userService.updateUser(user.id, updateData);
 
     res.status(200).json({
       success: true,
