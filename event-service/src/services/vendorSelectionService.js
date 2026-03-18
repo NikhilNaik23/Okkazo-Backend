@@ -161,6 +161,10 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
       vendorUpdate.vendorAuthId != null && String(vendorUpdate.vendorAuthId).trim()
         ? String(vendorUpdate.vendorAuthId).trim()
         : null,
+    serviceId:
+      vendorUpdate.serviceId != null && String(vendorUpdate.serviceId).trim()
+        ? String(vendorUpdate.serviceId).trim()
+        : null,
     status: vendorUpdate.status || VENDOR_STATUS.YET_TO_SELECT,
     rejectionReason: vendorUpdate.rejectionReason != null && String(vendorUpdate.rejectionReason).trim() ? String(vendorUpdate.rejectionReason).trim() : null,
     alternativeNeeded: Boolean(vendorUpdate.alternativeNeeded),

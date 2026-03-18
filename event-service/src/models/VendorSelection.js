@@ -29,6 +29,12 @@ const VendorItemSchema = new mongoose.Schema(
       default: null,
       trim: true,
     },
+    // Optional: for Venue selections we store the concrete vendor serviceId that user picked.
+    serviceId: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     status: {
       type: String,
       required: true,
