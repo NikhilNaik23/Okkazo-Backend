@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const VendorApplication = require('../models/VendorApplication');
 const VendorService = require('../models/VendorService');
 const ApiError = require('../utils/ApiError');
+const fileUploadService = require('./fileUploadService');
 const logger = require('../utils/logger');
 
 const parseAuthIds = (value) => {
@@ -198,7 +199,18 @@ const updateService = async (authId, serviceId, payload = {}) => {
     }
 
     if (Object.prototype.hasOwnProperty.call(validated, 'details')) {
-      service.details = validated.details === null ? {} : validated.details;
+      if (validated.details === null) {
+        service.details = {};
+      } else {
+        const currentDetails =
+          service.details && typeof service.details === 'object' ? service.details : {};
+        const nextDetails =
+          validated.details && typeof validated.details === 'object' ? validated.details : {};
+
+        // Merge instead of replace so fields not present in the edit form
+        // (e.g. Venue images stored at details.images) are preserved.
+        service.details = { ...currentDetails, ...nextDetails };
+      }
     }
 
     if (Object.prototype.hasOwnProperty.call(validated, 'status')) {
@@ -254,6 +266,193 @@ const deleteService = async (authId, serviceId) => {
     return { serviceId };
   } catch (error) {
     logger.error('Error in deleteService:', error);
+    throw error;
+  }
+};
+
+/**
+ * Upload venue images to an existing service owned by the vendor.
+ * Enforced rule: only services with serviceCategory === 'Venue' can accept images.
+ * Images are stored under service.details.images.
+ */
+const addVenueServiceImages = async (authId, serviceId, files = []) => {
+  const MAX_IMAGES = 10;
+
+  try {
+    if (!authId) {
+      throw new ApiError(401, 'User not authenticated');
+    }
+
+    if (!serviceId || !serviceId.trim()) {
+      throw new ApiError(400, 'Service ID is required');
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(serviceId)) {
+      throw new ApiError(400, 'Invalid service ID');
+    }
+
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new ApiError(400, 'At least one image file is required');
+    }
+
+    const service = await VendorService.findOne({ _id: serviceId, authId });
+    if (!service) {
+      throw new ApiError(404, 'Service not found');
+    }
+
+    if (service.serviceCategory !== 'Venue') {
+      throw new ApiError(403, 'Images can only be uploaded for Venue services');
+    }
+
+    const existingImages = Array.isArray(service.details?.images) ? service.details.images : [];
+    if (existingImages.length + files.length > MAX_IMAGES) {
+      throw new ApiError(400, `You can upload up to ${MAX_IMAGES} images per service`);
+    }
+
+    const uploaded = [];
+
+    try {
+      for (const file of files) {
+        const uploadResult = await fileUploadService.uploadFile(
+          file,
+          `services/${serviceId}/venue-images`
+        );
+        uploaded.push({
+          url: uploadResult.url,
+          publicId: uploadResult.publicId,
+          format: uploadResult.format,
+          uploadedAt: new Date(),
+        });
+      }
+    } catch (uploadError) {
+      // Best-effort cleanup of already uploaded images
+      await Promise.all(
+        uploaded
+          .map((img) => img.publicId)
+          .filter(Boolean)
+          .map((publicId) => fileUploadService.deleteFile(publicId).catch(() => null))
+      );
+      throw uploadError;
+    }
+
+    const nextDetails =
+      service.details && typeof service.details === 'object' ? service.details : {};
+
+    nextDetails.images = [...existingImages, ...uploaded];
+    service.details = nextDetails;
+    service.markModified('details');
+    await service.save();
+
+    logger.info('Venue images uploaded for service', {
+      serviceId,
+      authId,
+      added: uploaded.length,
+      total: nextDetails.images.length,
+    });
+
+    return service.toObject();
+  } catch (error) {
+    logger.error('Error in addVenueServiceImages:', error);
+    throw error;
+  }
+};
+
+/**
+ * Delete a single venue image for a service (Venue only).
+ * Enforces at least one image remains (venue images are required).
+ */
+const deleteVenueServiceImage = async (authId, serviceId, publicId) => {
+  try {
+    if (!authId) throw new ApiError(401, 'User not authenticated');
+    if (!serviceId || !serviceId.trim()) throw new ApiError(400, 'Service ID is required');
+    if (!mongoose.Types.ObjectId.isValid(serviceId)) throw new ApiError(400, 'Invalid service ID');
+    if (!publicId || !String(publicId).trim()) throw new ApiError(400, 'publicId is required');
+
+    const service = await VendorService.findOne({ _id: serviceId, authId });
+    if (!service) throw new ApiError(404, 'Service not found');
+    if (service.serviceCategory !== 'Venue') {
+      throw new ApiError(403, 'Images can only be managed for Venue services');
+    }
+
+    const images = Array.isArray(service.details?.images) ? service.details.images : [];
+    if (images.length <= 1) {
+      throw new ApiError(400, 'At least one venue image is required');
+    }
+
+    const idx = images.findIndex((img) => String(img?.publicId) === String(publicId));
+    if (idx === -1) {
+      throw new ApiError(404, 'Image not found');
+    }
+
+    // Delete from Cloudinary first
+    await fileUploadService.deleteFile(String(publicId));
+
+    const nextImages = [...images.slice(0, idx), ...images.slice(idx + 1)];
+    const nextDetails = service.details && typeof service.details === 'object' ? service.details : {};
+    nextDetails.images = nextImages;
+    service.details = nextDetails;
+    service.markModified('details');
+    await service.save();
+
+    logger.info('Venue image deleted for service', {
+      serviceId,
+      authId,
+      publicId,
+      remaining: nextImages.length,
+    });
+
+    return service.toObject();
+  } catch (error) {
+    logger.error('Error in deleteVenueServiceImage:', error);
+    throw error;
+  }
+};
+
+/**
+ * Set a venue service profile image by moving the selected image to index 0.
+ */
+const setVenueServiceProfileImage = async (authId, serviceId, publicId) => {
+  try {
+    if (!authId) throw new ApiError(401, 'User not authenticated');
+    if (!serviceId || !serviceId.trim()) throw new ApiError(400, 'Service ID is required');
+    if (!mongoose.Types.ObjectId.isValid(serviceId)) throw new ApiError(400, 'Invalid service ID');
+    if (!publicId || !String(publicId).trim()) throw new ApiError(400, 'publicId is required');
+
+    const service = await VendorService.findOne({ _id: serviceId, authId });
+    if (!service) throw new ApiError(404, 'Service not found');
+    if (service.serviceCategory !== 'Venue') {
+      throw new ApiError(403, 'Images can only be managed for Venue services');
+    }
+
+    const images = Array.isArray(service.details?.images) ? service.details.images : [];
+    if (images.length === 0) {
+      throw new ApiError(400, 'No images found for this service');
+    }
+
+    const idx = images.findIndex((img) => String(img?.publicId) === String(publicId));
+    if (idx === -1) {
+      throw new ApiError(404, 'Image not found');
+    }
+
+    if (idx === 0) return service.toObject();
+
+    const selected = images[idx];
+    const nextImages = [selected, ...images.slice(0, idx), ...images.slice(idx + 1)];
+    const nextDetails = service.details && typeof service.details === 'object' ? service.details : {};
+    nextDetails.images = nextImages;
+    service.details = nextDetails;
+    service.markModified('details');
+    await service.save();
+
+    logger.info('Venue profile image set for service', {
+      serviceId,
+      authId,
+      publicId,
+    });
+
+    return service.toObject();
+  } catch (error) {
+    logger.error('Error in setVenueServiceProfileImage:', error);
     throw error;
   }
 };
@@ -366,4 +565,7 @@ module.exports = {
   getPublicVendorsByAuthIds,
   updateService,
   deleteService,
+  addVenueServiceImages,
+  deleteVenueServiceImage,
+  setVenueServiceProfileImage,
 };

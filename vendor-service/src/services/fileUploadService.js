@@ -1,6 +1,7 @@
 const { cloudinary } = require('../config/cloudinary');
 const logger = require('../utils/logger');
 const { isValidFileType, isValidFileSize, getFileExtension } = require('../utils/helpers');
+const fs = require('fs');
 
 /**
  * Upload file to Cloudinary
@@ -47,6 +48,15 @@ const uploadFile = async (file, folder = 'vendor-documents') => {
   } catch (error) {
     logger.error('Error uploading file to Cloudinary:', error);
     throw error;
+  } finally {
+    // Best-effort cleanup of local temp file saved by multer
+    try {
+      if (file?.path) {
+        await fs.promises.unlink(file.path);
+      }
+    } catch {
+      // ignore
+    }
   }
 };
 

@@ -713,6 +713,168 @@ const deleteVendorService = async (req, res) => {
   }
 };
 
+/**
+ * Upload venue service images (Venue only)
+ * POST /api/vendor/services/:serviceId/images
+ */
+const uploadVenueServiceImages = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+    const { serviceId } = req.params;
+    const files = req.files;
+
+    if (!authId) {
+      return res.status(401).json(formatErrorResponse('UNAUTHORIZED', 'User not authenticated'));
+    }
+
+    if (!serviceId || serviceId.trim() === '') {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'Service ID is required')
+      );
+    }
+
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'At least one image file is required', [
+          { field: 'files', message: 'At least one image file is required' },
+        ])
+      );
+    }
+
+    // Ensure image only (shared multer allows pdf too)
+    const allowedImageTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+    const invalid = files.find((f) => !allowedImageTypes.includes(f.mimetype));
+    if (invalid) {
+      return res.status(400).json(
+        formatErrorResponse(
+          'VALIDATION_ERROR',
+          'Invalid file type. Only JPEG and PNG images are allowed',
+          [{ field: 'files', message: 'Only JPEG and PNG images are allowed' }]
+        )
+      );
+    }
+
+    const updatedService = await vendorServiceCatalog.addVenueServiceImages(authId, serviceId, files);
+
+    return res.status(200).json(
+      formatSuccessResponse(updatedService, 'Venue images uploaded successfully')
+    );
+  } catch (error) {
+    logger.error('Error in uploadVenueServiceImages:', error);
+
+    const status = error.statusCode || 500;
+    const errorCode =
+      status === 400
+        ? 'VALIDATION_ERROR'
+        : status === 401
+          ? 'UNAUTHORIZED'
+          : status === 403
+            ? 'FORBIDDEN'
+            : status === 404
+              ? 'SERVICE_NOT_FOUND'
+              : 'INTERNAL_ERROR';
+
+    return res.status(status).json(formatErrorResponse(errorCode, error.message));
+  }
+};
+
+/**
+ * Delete a specific venue image (Venue only)
+ * DELETE /api/vendor/services/:serviceId/images?publicId=...
+ */
+const deleteVenueServiceImage = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+    const { serviceId } = req.params;
+    const publicId = req.query?.publicId;
+
+    if (!authId) {
+      return res.status(401).json(formatErrorResponse('UNAUTHORIZED', 'User not authenticated'));
+    }
+
+    if (!publicId || !String(publicId).trim()) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'publicId is required')
+      );
+    }
+
+    const updatedService = await vendorServiceCatalog.deleteVenueServiceImage(
+      authId,
+      serviceId,
+      String(publicId).trim()
+    );
+
+    return res.status(200).json(
+      formatSuccessResponse(updatedService, 'Venue image deleted successfully')
+    );
+  } catch (error) {
+    logger.error('Error in deleteVenueServiceImage:', error);
+
+    const status = error.statusCode || 500;
+    const errorCode =
+      status === 400
+        ? 'VALIDATION_ERROR'
+        : status === 401
+          ? 'UNAUTHORIZED'
+          : status === 403
+            ? 'FORBIDDEN'
+            : status === 404
+              ? 'SERVICE_NOT_FOUND'
+              : 'INTERNAL_ERROR';
+
+    return res.status(status).json(formatErrorResponse(errorCode, error.message));
+  }
+};
+
+/**
+ * Set an existing venue image as the profile image (Venue only)
+ * PATCH /api/vendor/services/:serviceId/images/profile
+ * body: { publicId }
+ */
+const setVenueServiceProfileImage = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+    const { serviceId } = req.params;
+    const publicId = req.body?.publicId;
+
+    if (!authId) {
+      return res.status(401).json(formatErrorResponse('UNAUTHORIZED', 'User not authenticated'));
+    }
+
+    if (!publicId || !String(publicId).trim()) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'publicId is required')
+      );
+    }
+
+    const updatedService = await vendorServiceCatalog.setVenueServiceProfileImage(
+      authId,
+      serviceId,
+      String(publicId).trim()
+    );
+
+    return res.status(200).json(
+      formatSuccessResponse(updatedService, 'Venue profile image updated successfully')
+    );
+  } catch (error) {
+    logger.error('Error in setVenueServiceProfileImage:', error);
+
+    const status = error.statusCode || 500;
+    const errorCode =
+      status === 400
+        ? 'VALIDATION_ERROR'
+        : status === 401
+          ? 'UNAUTHORIZED'
+          : status === 403
+            ? 'FORBIDDEN'
+            : status === 404
+              ? 'SERVICE_NOT_FOUND'
+              : 'INTERNAL_ERROR';
+
+    return res.status(status).json(formatErrorResponse(errorCode, error.message));
+  }
+};
+
 module.exports = {
   healthCheck,
   getApplicationStatus,
@@ -731,4 +893,7 @@ module.exports = {
   getMyServices,
   updateVendorService,
   deleteVendorService,
+  uploadVenueServiceImages,
+  deleteVenueServiceImage,
+  setVenueServiceProfileImage,
 };

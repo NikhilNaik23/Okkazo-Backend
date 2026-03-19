@@ -53,6 +53,28 @@ router.patch(
   vendorController.updateVendorService
 );
 
+// Vendor: upload venue service images (Venue only)
+router.post(
+  '/api/vendor/services/:serviceId/images',
+  validateServiceIdParam,
+  upload.array('files', 10),
+  vendorController.uploadVenueServiceImages
+);
+
+// Vendor: delete a specific venue service image (Venue only)
+router.delete(
+  '/api/vendor/services/:serviceId/images',
+  validateServiceIdParam,
+  vendorController.deleteVenueServiceImage
+);
+
+// Vendor: set an existing venue image as the profile image (moves to first)
+router.patch(
+  '/api/vendor/services/:serviceId/images/profile',
+  validateServiceIdParam,
+  vendorController.setVenueServiceProfileImage
+);
+
 // Vendor: delete a service
 router.delete(
   '/api/vendor/services/:serviceId',
