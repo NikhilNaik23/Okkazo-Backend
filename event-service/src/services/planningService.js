@@ -1,10 +1,75 @@
 const Planning = require("../models/Planning");
+const Promote = require('../models/Promote');
 const VendorSelection = require('../models/VendorSelection');
 const logger = require("../utils/logger");
 const createApiError = require("../utils/ApiError");
-const { STATUS } = require('../utils/planningConstants');
+const { STATUS, CATEGORY } = require('../utils/planningConstants');
+const { PROMOTE_STATUS } = require('../utils/promoteConstants');
 const vendorSelectionService = require('./vendorSelectionService');
 const promoteConfigService = require('./promoteConfigService');
+const mongoose = require('mongoose');
+const { fetchUserById } = require('./userServiceClient');
+
+const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
+  [CATEGORY.PUBLIC]: 'Public Event',
+  [CATEGORY.PRIVATE]: 'Private Event',
+};
+
+const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const isAssignedRoleEligible = (assignedRole) => {
+  if (!assignedRole) return false;
+  const role = normalizeLoose(assignedRole);
+  return role.includes('junior') || role.includes('senior');
+};
+
+const assertManagerEligibleForPlanning = async ({ managerId, planningCategory } = {}) => {
+  const user = await fetchUserById(managerId);
+  if (!user) throw createApiError(404, 'Manager not found in user-service');
+
+  if (normalizeLoose(user?.role) !== 'manager') {
+    throw createApiError(400, 'Provided user is not a MANAGER');
+  }
+
+  const requiredDepartment = REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY[planningCategory] || null;
+  if (requiredDepartment && normalizeLoose(user?.department) !== normalizeLoose(requiredDepartment)) {
+    throw createApiError(400, `Manager department must be ${requiredDepartment}`);
+  }
+
+  if (!isAssignedRoleEligible(user?.assignedRole)) {
+    throw createApiError(400, 'Manager assignedRole must be JUNIOR or SENIOR');
+  }
+
+  if (user.isActive === false) {
+    throw createApiError(400, 'Manager is not active');
+  }
+};
+
+const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdToExclude } = {}) => {
+  if (!mongoose.Types.ObjectId.isValid(String(managerId))) {
+    throw createApiError(400, 'assignedManagerId must be a valid id');
+  }
+
+  const existingPromote = await Promote.findOne({
+    assignedManagerId: managerId,
+    eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+    'adminDecision.status': { $ne: 'REJECTED' },
+  })
+    .select('eventId')
+    .lean();
+  if (existingPromote) throw createApiError(409, 'Manager is already assigned to another event');
+
+  const planningQuery = {
+    assignedManagerId: managerId,
+    status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+  };
+  if (planningEventIdToExclude) {
+    planningQuery.eventId = { $ne: String(planningEventIdToExclude).trim() };
+  }
+
+  const existingPlanning = await Planning.findOne(planningQuery).select('eventId').lean();
+  if (existingPlanning) throw createApiError(409, 'Manager is already assigned to another event');
+};
 
 const hydratePlanningFees = (planning, platformFeeFallback) => {
   if (!planning) return planning;
@@ -157,6 +222,8 @@ const updatePlanningStatus = async (
 
   planning.status = status;
   if (assignedManagerId) {
+    await assertManagerEligibleForPlanning({ managerId: assignedManagerId, planningCategory: planning.category });
+    await assertManagerAvailableAcrossEvents({ managerId: assignedManagerId, planningEventIdToExclude: planning.eventId });
     planning.assignedManagerId = assignedManagerId;
   }
 
@@ -173,6 +240,101 @@ const updatePlanningStatus = async (
       });
     }
   }
+  return planning;
+};
+
+/**
+ * Assign a manager to a planning without changing status.
+ * This supports admin/manual assignment and auto-assign flows that should not be coupled to an "approval" step.
+ */
+const assignPlanningManager = async (eventId, assignedManagerId) => {
+  if (!eventId || !String(eventId).trim()) {
+    throw createApiError(400, 'Event ID is required');
+  }
+  if (!assignedManagerId) {
+    throw createApiError(400, 'assignedManagerId is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: String(eventId).trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  await assertManagerEligibleForPlanning({ managerId: assignedManagerId, planningCategory: planning.category });
+  await assertManagerAvailableAcrossEvents({ managerId: assignedManagerId, planningEventIdToExclude: planning.eventId });
+
+  planning.assignedManagerId = assignedManagerId;
+  await planning.save();
+  logger.info(`Planning manager assigned: ${planning.eventId} -> ${assignedManagerId}`);
+
+  if (planning.status === STATUS.IMMEDIATE_ACTION) {
+    try {
+      await vendorSelectionService.ensureForPlanning(planning);
+    } catch (err) {
+      logger.error('Failed to ensure VendorSelection after manager assignment', {
+        eventId: planning.eventId,
+        message: err.message,
+      });
+    }
+  }
+
+  return planning;
+};
+
+/**
+ * Auto-assign helper used by the background job.
+ * - Idempotent: will NOT overwrite an existing assignment.
+ * - Does NOT call user-service (eligibility is enforced by the job's manager cache).
+ */
+const tryAutoAssignPlanningManager = async (eventId, assignedManagerId) => {
+  if (!eventId || !String(eventId).trim()) {
+    throw createApiError(400, 'Event ID is required');
+  }
+  if (!assignedManagerId) {
+    throw createApiError(400, 'assignedManagerId is required');
+  }
+
+  await assertManagerAvailableAcrossEvents({
+    managerId: assignedManagerId,
+    planningEventIdToExclude: String(eventId).trim(),
+  });
+
+  const updateResult = await Planning.updateOne(
+    {
+      eventId: String(eventId).trim(),
+      assignedManagerId: null,
+      status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+      $or: [{ vendorSelectionId: { $ne: null } }, { isPaid: true }],
+    },
+    {
+      $set: {
+        assignedManagerId,
+      },
+    }
+  );
+
+  if (updateResult?.modifiedCount === 1) {
+    logger.info(`Planning manager auto-assigned: ${String(eventId).trim()} -> ${assignedManagerId}`);
+  }
+
+  return {
+    assigned: updateResult?.modifiedCount === 1,
+  };
+};
+
+const unassignPlanningManager = async (eventId) => {
+  if (!eventId || !String(eventId).trim()) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: String(eventId).trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  planning.assignedManagerId = null;
+  await planning.save();
+  logger.info(`Planning manager unassigned: ${planning.eventId}`);
   return planning;
 };
 
@@ -301,14 +463,65 @@ const confirmPlanning = async ({ eventId, authId }) => {
   return planning;
 };
 
+/**
+ * Admin dashboard lists for Planning requests.
+ * - assigned: manager assigned, not rejected
+ * - applications: manager not assigned, not completed/rejected, and has progressed beyond draft
+ * - rejected: explicitly rejected
+ */
+const getAdminDashboard = async ({ limit = 200 } = {}) => {
+  const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
+
+  const progressedGate = { $or: [{ vendorSelectionId: { $ne: null } }, { isPaid: true }] };
+  const baseSelect =
+    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent isPaid vendorSelectionId';
+
+  const [assigned, applications, rejected] = await Promise.all([
+    Planning.find({
+      assignedManagerId: { $ne: null },
+      status: { $ne: STATUS.REJECTED },
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+    Planning.find({
+      assignedManagerId: null,
+      status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+      ...progressedGate,
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+    Planning.find({
+      status: STATUS.REJECTED,
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+  ]);
+
+  return {
+    assigned: assigned || [],
+    applications: applications || [],
+    rejected: rejected || [],
+  };
+};
+
 module.exports = {
   createPlanning,
   getPlanningsByAuthId,
   getPlanningByEventId,
   getAllPlannings,
   updatePlanningStatus,
+  assignPlanningManager,
+  tryAutoAssignPlanningManager,
+  unassignPlanningManager,
   deletePlanning,
   getPlanningStats,
   markPlanningPaid,
   confirmPlanning,
+  getAdminDashboard,
 };

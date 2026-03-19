@@ -43,6 +43,27 @@ router.get(
   promoteController.getAllPromotes
 );
 
+// GET /promote/admin/dashboard — Admin dashboard lists (Admin only)
+router.get(
+  '/promote/admin/dashboard',
+  isAdmin,
+  promoteController.getAdminDashboard
+);
+
+// GET /promote/admin/unavailable-managers — Manager ids currently assigned (Admin only)
+router.get(
+  '/promote/admin/unavailable-managers',
+  isAdmin,
+  promoteController.getUnavailableManagers
+);
+
+// PATCH /promote/:eventId/decision — Approve/Reject application (Admin only)
+router.patch(
+  '/promote/:eventId/decision',
+  isAdmin,
+  promoteController.decidePromote
+);
+
 // GET /promote/:eventId — Get a single promote record
 router.get(
   '/promote/:eventId',
@@ -62,6 +83,13 @@ router.patch(
   '/promote/:eventId/assign',
   isAdmin,
   promoteController.assignManager
+);
+
+// PATCH /promote/:eventId/unassign-manager — Unassign a manager (Admin only)
+router.patch(
+  '/promote/:eventId/unassign-manager',
+  isAdmin,
+  promoteController.unassignManager
 );
 
 // DELETE /promote/:eventId — Delete a promote record (Owner or Admin)

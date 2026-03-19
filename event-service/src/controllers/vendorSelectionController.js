@@ -2,6 +2,27 @@ const Planning = require('../models/Planning');
 const vendorSelectionService = require('../services/vendorSelectionService');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
+const axios = require('axios');
+
+const defaultVendorServiceUrl = process.env.SERVICE_HOST
+  ? 'http://vendor-service:8084' // docker-compose service name
+  : 'http://localhost:8084';
+const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceUrl;
+const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
+
+const fetchPublicVendorsByAuthIds = async (authIds) => {
+  if (!Array.isArray(authIds) || authIds.length === 0) return [];
+
+  const response = await axios.get(`${vendorServiceUrl}/api/vendor/public/vendors`, {
+    timeout: upstreamTimeoutMs,
+    params: {
+      authIds: authIds.join(','),
+    },
+  });
+
+  const vendors = response.data?.data?.vendors;
+  return Array.isArray(vendors) ? vendors : [];
+};
 
 const ensureAccessToPlanning = async ({ eventId, user }) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
@@ -30,6 +51,26 @@ const getOrCreateForPlanning = async (req, res) => {
     const planning = await ensureAccessToPlanning({ eventId, user: req.user });
 
     const selection = await vendorSelectionService.ensureForPlanning(planning);
+
+    const includeVendors = String(req.query.includeVendors || '').toLowerCase() === 'true';
+    if (includeVendors) {
+      const vendorAuthIds = Array.from(
+        new Set(
+          (selection?.vendors || [])
+            .map((v) => (v?.vendorAuthId != null ? String(v.vendorAuthId).trim() : ''))
+            .filter(Boolean)
+        )
+      );
+
+      const vendorProfiles = await fetchPublicVendorsByAuthIds(vendorAuthIds);
+      return res.status(200).json({
+        success: true,
+        data: {
+          ...(selection?.toObject ? selection.toObject() : selection),
+          vendorProfiles,
+        },
+      });
+    }
 
     return res.status(200).json({
       success: true,

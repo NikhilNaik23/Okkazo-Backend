@@ -1,8 +1,90 @@
 const Promote = require('../models/Promote');
+const Planning = require('../models/Planning');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { PROMOTE_STATUS } = require('../utils/promoteConstants');
+const { STATUS: PLANNING_STATUS } = require('../utils/planningConstants');
 const promoteConfigService = require('./promoteConfigService');
+const mongoose = require('mongoose');
+const { fetchUserById } = require('./userServiceClient');
+
+const DECISION_STATUS = {
+  PENDING: 'PENDING',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+};
+
+const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(String(value));
+
+const REQUIRED_PROMOTE_MANAGER_DEPARTMENT = 'Public Event';
+
+const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const isEligibleManagerRole = (user) => normalizeLoose(user?.role) === 'manager';
+
+const isDepartmentMatch = (userDepartment, requiredDepartment) => {
+  if (!requiredDepartment) return true;
+  return normalizeLoose(userDepartment) === normalizeLoose(requiredDepartment);
+};
+
+// Accept both junior/senior manager roles. If assignedRole is null, allow it.
+const isAssignedRoleEligible = (assignedRole) => {
+  if (!assignedRole) return false;
+  const role = normalizeLoose(assignedRole);
+  return role.includes('junior') || role.includes('senior');
+};
+
+const assertManagerEligibleForPromote = async ({ managerId } = {}) => {
+  const user = await fetchUserById(managerId);
+  if (!user) throw createApiError(404, 'Manager not found in user-service');
+
+  if (!isEligibleManagerRole(user)) {
+    throw createApiError(400, 'Provided user is not a MANAGER');
+  }
+
+  if (!isDepartmentMatch(user.department, REQUIRED_PROMOTE_MANAGER_DEPARTMENT)) {
+    throw createApiError(400, `Manager department must be ${REQUIRED_PROMOTE_MANAGER_DEPARTMENT}`);
+  }
+
+  if (!isAssignedRoleEligible(user.assignedRole)) {
+    throw createApiError(400, 'Manager assignedRole must be JUNIOR or SENIOR');
+  }
+
+  if (user.isActive === false) {
+    throw createApiError(400, 'Manager is not active');
+  }
+};
+
+const assertManagerAvailable = async ({ managerId, eventIdToExclude } = {}) => {
+  if (!isValidObjectId(managerId)) {
+    throw createApiError(400, 'managerId must be a valid id');
+  }
+
+  const activeAssignmentQuery = {
+    assignedManagerId: managerId,
+    eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+    'adminDecision.status': { $ne: DECISION_STATUS.REJECTED },
+  };
+  if (eventIdToExclude) {
+    activeAssignmentQuery.eventId = { $ne: String(eventIdToExclude).trim() };
+  }
+
+  const existing = await Promote.findOne(activeAssignmentQuery).select('eventId').lean();
+  if (existing) {
+    throw createApiError(409, 'Manager is already assigned to another event');
+  }
+
+  const existingPlanning = await Planning.findOne({
+    assignedManagerId: managerId,
+    status: { $nin: [PLANNING_STATUS.COMPLETED, PLANNING_STATUS.REJECTED] },
+  })
+    .select('eventId')
+    .lean();
+
+  if (existingPlanning) {
+    throw createApiError(409, 'Manager is already assigned to another event');
+  }
+};
 
 // ─── Create ───────────────────────────────────────────────────────────────────
 
@@ -187,7 +269,28 @@ const updatePromoteStatus = async (eventId, eventStatus, assignedManagerId = nul
   }
 
   promote.eventStatus = eventStatus;
-  if (assignedManagerId) promote.assignedManagerId = assignedManagerId;
+  if (assignedManagerId) {
+    await assertManagerEligibleForPromote({ managerId: assignedManagerId });
+    await assertManagerAvailable({ managerId: assignedManagerId, eventIdToExclude: promote.eventId });
+
+    const now = new Date();
+    promote.assignedManagerId = assignedManagerId;
+    promote.managerAssignment = {
+      assignedAt: now,
+      assignedByAuthId: null,
+      autoAssigned: false,
+    };
+
+    // Backward-compatible behavior: assigning a manager implies approval.
+    if (promote.adminDecision?.status !== DECISION_STATUS.APPROVED) {
+      promote.adminDecision = {
+        status: DECISION_STATUS.APPROVED,
+        decidedAt: now,
+        decidedByAuthId: null,
+        rejectionReason: null,
+      };
+    }
+  }
 
   await promote.save();
   logger.info(`Promote status updated: ${eventId} → ${eventStatus}`);
@@ -197,16 +300,226 @@ const updatePromoteStatus = async (eventId, eventStatus, assignedManagerId = nul
 // ─── Assign manager (admin only) ─────────────────────────────────────────────
 
 const assignManager = async (eventId, managerId) => {
+  return assignManagerWithMetadata(eventId, managerId, { assignedByAuthId: null, autoAssigned: false });
+};
+
+const assignManagerWithMetadata = async (
+  eventId,
+  managerId,
+  { assignedByAuthId = null, autoAssigned = false } = {}
+) => {
   if (!eventId) throw createApiError(400, 'Event ID is required');
   if (!managerId) throw createApiError(400, 'Manager ID is required');
 
-  const promote = await Promote.findOne({ eventId: eventId.trim() });
+  const promote = await Promote.findOne({ eventId: String(eventId).trim() });
   if (!promote) throw createApiError(404, 'Promote record not found');
 
+  if (promote.adminDecision?.status === DECISION_STATUS.REJECTED) {
+    throw createApiError(400, 'Cannot assign a manager to a rejected event');
+  }
+
+  await assertManagerEligibleForPromote({ managerId });
+
+  await assertManagerAvailable({ managerId, eventIdToExclude: promote.eventId });
+
+  const now = new Date();
   promote.assignedManagerId = managerId;
-  await promote.save(); // status recalculated in pre-validate
-  logger.info(`Manager ${managerId} assigned to promote ${eventId}`);
+  promote.managerAssignment = {
+    assignedAt: now,
+    assignedByAuthId: assignedByAuthId || null,
+    autoAssigned: Boolean(autoAssigned),
+  };
+
+  if (promote.adminDecision?.status !== DECISION_STATUS.APPROVED) {
+    promote.adminDecision = {
+      status: DECISION_STATUS.APPROVED,
+      decidedAt: now,
+      decidedByAuthId: assignedByAuthId || null,
+      rejectionReason: null,
+    };
+  }
+
+  await promote.save();
+  logger.info(`Manager ${managerId} assigned to promote ${eventId} (auto=${Boolean(autoAssigned)})`);
   return promote;
+};
+
+/**
+ * Auto-assign helper used by the background job.
+ * - Idempotent: will NOT overwrite an existing assignment.
+ * - Does NOT call user-service (eligibility is enforced by the job's manager cache).
+ */
+const tryAutoAssignManager = async (
+  eventId,
+  managerId,
+  { assignedByAuthId = 'system:autoassign' } = {}
+) => {
+  if (!eventId) throw createApiError(400, 'Event ID is required');
+  if (!managerId) throw createApiError(400, 'Manager ID is required');
+
+  await assertManagerAvailable({ managerId, eventIdToExclude: String(eventId).trim() });
+
+  const now = new Date();
+  const updateResult = await Promote.updateOne(
+    {
+      eventId: String(eventId).trim(),
+      assignedManagerId: null,
+      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      'adminDecision.status': DECISION_STATUS.APPROVED,
+      'adminDecision.decidedAt': { $ne: null },
+    },
+    {
+      $set: {
+        assignedManagerId: managerId,
+        managerAssignment: {
+          assignedAt: now,
+          assignedByAuthId: assignedByAuthId || null,
+          autoAssigned: true,
+        },
+      },
+    }
+  );
+
+  return {
+    assigned: updateResult?.modifiedCount === 1,
+  };
+};
+
+const unassignPromoteManager = async (eventId, { unassignedByAuthId = null } = {}) => {
+  if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
+
+  const promote = await Promote.findOne({ eventId: String(eventId).trim() });
+  if (!promote) throw createApiError(404, 'Promote record not found');
+
+  promote.assignedManagerId = null;
+  promote.managerAssignment = {
+    assignedAt: null,
+    assignedByAuthId: unassignedByAuthId || null,
+    autoAssigned: false,
+  };
+
+  await promote.save();
+  logger.info(`Promote manager unassigned: ${promote.eventId}`);
+  return promote;
+};
+
+const decidePromote = async (
+  eventId,
+  {
+    decision,
+    rejectionReason = null,
+    managerId = null,
+    decidedByAuthId = null,
+  } = {}
+) => {
+  if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
+  if (!decision) throw createApiError(400, 'decision is required');
+
+  const normalizedDecision = String(decision).trim().toUpperCase();
+  const now = new Date();
+
+  const promote = await Promote.findOne({ eventId: String(eventId).trim() });
+  if (!promote) throw createApiError(404, 'Promote record not found');
+
+  if (normalizedDecision === 'REJECT') {
+    promote.adminDecision = {
+      status: DECISION_STATUS.REJECTED,
+      decidedAt: now,
+      decidedByAuthId: decidedByAuthId || null,
+      rejectionReason: rejectionReason ? String(rejectionReason).trim().slice(0, 500) : null,
+    };
+    promote.assignedManagerId = null;
+    promote.managerAssignment = {
+      assignedAt: null,
+      assignedByAuthId: null,
+      autoAssigned: false,
+    };
+
+    await promote.save();
+    logger.info(`Promote ${eventId} rejected by ${decidedByAuthId || 'admin'}`);
+    return promote;
+  }
+
+  if (normalizedDecision !== 'APPROVE') {
+    throw createApiError(400, 'decision must be APPROVE or REJECT');
+  }
+
+  promote.adminDecision = {
+    status: DECISION_STATUS.APPROVED,
+    decidedAt: now,
+    decidedByAuthId: decidedByAuthId || null,
+    rejectionReason: null,
+  };
+  await promote.save();
+
+  if (managerId) {
+    return assignManagerWithMetadata(promote.eventId, managerId, {
+      assignedByAuthId: decidedByAuthId || null,
+      autoAssigned: false,
+    });
+  }
+
+  logger.info(`Promote ${eventId} approved by ${decidedByAuthId || 'admin'}`);
+  return promote;
+};
+
+const getUnavailableManagerIds = async () => {
+  const [promoteIds, planningIds] = await Promise.all([
+    Promote.distinct('assignedManagerId', {
+      assignedManagerId: { $ne: null },
+      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      'adminDecision.status': { $ne: DECISION_STATUS.REJECTED },
+    }),
+    Planning.distinct('assignedManagerId', {
+      assignedManagerId: { $ne: null },
+      status: { $nin: [PLANNING_STATUS.COMPLETED, PLANNING_STATUS.REJECTED] },
+    }),
+  ]);
+
+  const merged = [...(promoteIds || []), ...(planningIds || [])]
+    .filter(Boolean)
+    .map((id) => String(id));
+
+  return Array.from(new Set(merged));
+};
+
+const getAdminDashboard = async ({ limit = 200 } = {}) => {
+  const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
+
+  const baseSelect =
+    'eventId eventTitle eventCategory customCategory eventField eventBanner schedule createdAt authId assignedManagerId adminDecision managerAssignment eventStatus platformFeePaid';
+
+  const [assigned, applications, rejected] = await Promise.all([
+    Promote.find({
+      assignedManagerId: { $ne: null },
+      'adminDecision.status': { $ne: DECISION_STATUS.REJECTED },
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+    Promote.find({
+      assignedManagerId: null,
+      'adminDecision.status': { $ne: DECISION_STATUS.REJECTED },
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+    Promote.find({
+      'adminDecision.status': DECISION_STATUS.REJECTED,
+    })
+      .sort({ createdAt: -1 })
+      .limit(safeLimit)
+      .select(baseSelect)
+      .lean(),
+  ]);
+
+  return {
+    assigned: assigned || [],
+    applications: applications || [],
+    rejected: rejected || [],
+  };
 };
 
 // ─── Delete ───────────────────────────────────────────────────────────────────
@@ -229,5 +542,11 @@ module.exports = {
   markPromotePaid,
   updatePromoteStatus,
   assignManager,
+  assignManagerWithMetadata,
+  tryAutoAssignManager,
+  unassignPromoteManager,
+  decidePromote,
+  getUnavailableManagerIds,
+  getAdminDashboard,
   deletePromote,
 };

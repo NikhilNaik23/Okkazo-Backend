@@ -76,6 +76,49 @@ const ensureAccessToPlanning = async ({ eventId, user }) => {
   return planning;
 };
 
+/**
+ * Unassign planning manager (Admin only)
+ * PATCH /planning/:eventId/unassign-manager
+ */
+const unassignPlanningManager = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const planning = await planningService.unassignPlanningManager(eventId);
+
+    try {
+      await publishEvent('PLANNING_STATUS_UPDATED', {
+        eventId: planning.eventId,
+        authId: planning.authId,
+        status: planning.status,
+        assignedManagerId: planning.assignedManagerId,
+        updatedBy: req.user?.authId || null,
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish PLANNING_STATUS_UPDATED event:', kafkaError);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Manager unassigned successfully',
+      data: planning,
+    });
+  } catch (error) {
+    logger.error('Error in unassignPlanningManager:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
 const fetchAllVendorsBasedOnService = async ({
   serviceCategory,
   latitude,
@@ -339,14 +382,16 @@ const updatePlanningStatus = async (req, res) => {
       });
     }
 
-    if (!status) {
+    if (!status && !assignedManagerId) {
       return res.status(400).json({
         success: false,
-        message: 'Status is required',
+        message: 'Either status or assignedManagerId is required',
       });
     }
 
-    const planning = await planningService.updatePlanningStatus(eventId, status, assignedManagerId);
+    const planning = status
+      ? await planningService.updatePlanningStatus(eventId, status, assignedManagerId)
+      : await planningService.assignPlanningManager(eventId, assignedManagerId);
 
     // Publish Kafka event
     try {
@@ -371,6 +416,28 @@ const updatePlanningStatus = async (req, res) => {
     res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
+    });
+  }
+};
+
+/**
+ * Admin dashboard lists for Planning requests
+ * GET /planning/admin/dashboard
+ */
+const getAdminDashboard = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+    const result = await planningService.getAdminDashboard({ limit });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in getPlanningAdminDashboard:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch planning dashboard',
     });
   }
 };
@@ -722,6 +789,8 @@ module.exports = {
   getPlanningByEventId,
   getAllPlannings,
   updatePlanningStatus,
+  unassignPlanningManager,
+  getAdminDashboard,
   confirmPlanning,
   deletePlanning,
   getPlanningStats,

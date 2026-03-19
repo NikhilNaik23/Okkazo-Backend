@@ -227,6 +227,25 @@ const PromoteSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Admin decision workflow (separate from eventStatus)
+    adminDecision: {
+      status: {
+        type: String,
+        enum: ['PENDING', 'APPROVED', 'REJECTED'],
+        default: 'PENDING',
+        index: true,
+      },
+      decidedAt: { type: Date, default: null },
+      decidedByAuthId: { type: String, trim: true, default: null },
+      rejectionReason: { type: String, trim: true, maxlength: 500, default: null },
+    },
+
+    managerAssignment: {
+      assignedAt: { type: Date, default: null },
+      assignedByAuthId: { type: String, trim: true, default: null },
+      autoAssigned: { type: Boolean, default: false },
+    },
+
     // Event status
     eventStatus: {
       type: String,

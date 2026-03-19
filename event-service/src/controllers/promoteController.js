@@ -213,11 +213,101 @@ const assignManager = async (req, res) => {
       return res.status(400).json({ success: false, message: 'managerId is required' });
     }
 
-    const promote = await promoteService.assignManager(eventId, managerId);
+    const promote = await promoteService.assignManagerWithMetadata(eventId, managerId, {
+      assignedByAuthId: req.user?.authId || null,
+      autoAssigned: false,
+    });
 
     return res.status(200).json({ success: true, message: 'Manager assigned', data: promote });
   } catch (error) {
     logger.error('Error in assignManager:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Unassign manager (admin only) ──────────────────────────────────────────
+/**
+ * PATCH /promote/:eventId/unassign-manager
+ */
+const unassignManager = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const promote = await promoteService.unassignPromoteManager(eventId, {
+      unassignedByAuthId: req.user?.authId || null,
+    });
+
+    // Publish Kafka (best-effort)
+    try {
+      await publishEvent('PROMOTE_STATUS_UPDATED', {
+        eventId: promote.eventId,
+        authId: promote.authId,
+        eventStatus: promote.eventStatus,
+        updatedBy: req.user?.authId || null,
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish PROMOTE_STATUS_UPDATED:', kafkaError.message);
+    }
+
+    return res.status(200).json({ success: true, message: 'Manager unassigned', data: promote });
+  } catch (error) {
+    logger.error('Error in unassignManager:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Admin dashboard (assigned / applications / rejected) ───────────────────
+/**
+ * GET /promote/admin/dashboard
+ */
+const getAdminDashboard = async (req, res) => {
+  try {
+    const { limit } = req.query;
+    const data = await promoteService.getAdminDashboard({ limit });
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    logger.error('Error in getAdminDashboard:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Admin decision (approve / reject) ──────────────────────────────────────
+/**
+ * PATCH /promote/:eventId/decision
+ * Body: { decision: 'APPROVE'|'REJECT', rejectionReason?, managerId? }
+ */
+const decidePromote = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { decision, rejectionReason, managerId } = req.body || {};
+
+    const promote = await promoteService.decidePromote(eventId, {
+      decision,
+      rejectionReason,
+      managerId,
+      decidedByAuthId: req.user?.authId || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Decision updated',
+      data: promote,
+    });
+  } catch (error) {
+    logger.error('Error in decidePromote:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * GET /promote/admin/unavailable-managers
+ */
+const getUnavailableManagers = async (req, res) => {
+  try {
+    const managerIds = await promoteService.getUnavailableManagerIds();
+    return res.status(200).json({ success: true, data: { managerIds } });
+  } catch (error) {
+    logger.error('Error in getUnavailableManagers:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };
@@ -298,5 +388,9 @@ module.exports = {
   getAllPromotes,
   updatePromoteStatus,
   assignManager,
+  unassignManager,
+  getAdminDashboard,
+  decidePromote,
+  getUnavailableManagers,
   deletePromote,
 };

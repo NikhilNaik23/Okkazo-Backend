@@ -1,6 +1,6 @@
 const express = require('express');
 const planningController = require('../controllers/planningController');
-const { authorizeRoles, isAdminOrManager } = require('../middleware/authorization');
+const { authorizeRoles, isAdminOrManager, isAdmin } = require('../middleware/authorization');
 const { validateCreatePlanning } = require('../middleware/planningValidation');
 const { upload } = require('../middleware/upload');
 
@@ -24,6 +24,13 @@ router.get(
   '/planning/stats',
   isAdminOrManager,
   planningController.getPlanningStats
+);
+
+// GET /planning/admin/dashboard - Planning admin dashboard lists (Admin only)
+router.get(
+  '/planning/admin/dashboard',
+  isAdmin,
+  planningController.getAdminDashboard
 );
 
 // GET /planning/me - Get current user's plannings
@@ -66,6 +73,13 @@ router.patch(
   '/planning/:eventId/status',
   isAdminOrManager,
   planningController.updatePlanningStatus
+);
+
+// PATCH /planning/:eventId/unassign-manager - Unassign manager (Admin only)
+router.patch(
+  '/planning/:eventId/unassign-manager',
+  isAdmin,
+  planningController.unassignPlanningManager
 );
 
 // DELETE /planning/:eventId - Delete a planning
