@@ -113,6 +113,13 @@ const PromoteSchema = new mongoose.Schema(
       index: true,
       trim: true,
     },
+    // Domain / industry focus of the event (UI calls this "Field")
+    eventField: {
+      type: String,
+      trim: true,
+      maxlength: 120,
+      default: null,
+    },
     customCategory: {
       type: String,
       trim: true,

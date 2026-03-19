@@ -2,6 +2,22 @@ const Joi = require('joi');
 const { PROMOTE_EVENT_CATEGORIES, PROMOTION_PACKAGES } = require('../utils/promoteConstants');
 const logger = require('../utils/logger');
 
+const deriveEventField = (body) => {
+  if (!body || typeof body !== 'object') return undefined;
+
+  const direct = body.eventField ?? body.field;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+
+  const interests = body.interests;
+  if (Array.isArray(interests)) {
+    const first = interests.find((v) => typeof v === 'string' && v.trim());
+    return first ? first.trim() : undefined;
+  }
+  if (typeof interests === 'string' && interests.trim()) return interests.trim();
+
+  return undefined;
+};
+
 // ─── Tier sub-schema ──────────────────────────────────────────────────────────
 
 const tierSchema = Joi.object({
@@ -36,6 +52,9 @@ const createPromoteSchema = Joi.object({
       'any.only': `eventCategory must be one of: ${PROMOTE_EVENT_CATEGORIES.join(', ')}`,
       'any.required': 'eventCategory is required',
     }),
+
+  // Domain / industry focus of the event (UI calls this "Field")
+  eventField: Joi.string().trim().max(120).allow(null, '').optional(),
   customCategory: Joi.when('eventCategory', {
     is: 'Other',
     then: Joi.string().trim().max(120).required().messages({
@@ -130,6 +149,14 @@ const validateCreatePromote = (req, res, next) => {
       }
     }
   }
+
+  // Normalize to a single persisted field name.
+  const eventField = deriveEventField(req.body);
+  if (eventField) {
+    req.body.eventField = eventField;
+  }
+  delete req.body.field;
+  delete req.body.interests;
 
   const { error, value } = createPromoteSchema.validate(req.body, {
     abortEarly: false,

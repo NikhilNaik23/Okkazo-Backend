@@ -8,6 +8,22 @@ const {
 } = require('../utils/planningConstants');
 const logger = require('../utils/logger');
 
+const deriveEventField = (body) => {
+  if (!body || typeof body !== 'object') return undefined;
+
+  const direct = body.eventField ?? body.field;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+
+  const interests = body.interests;
+  if (Array.isArray(interests)) {
+    const first = interests.find((v) => typeof v === 'string' && v.trim());
+    return first ? first.trim() : undefined;
+  }
+  if (typeof interests === 'string' && interests.trim()) return interests.trim();
+
+  return undefined;
+};
+
 /**
  * Common fields shared by both private and public plannings
  */
@@ -20,6 +36,9 @@ const commonFields = {
   eventTitle: Joi.string().trim().min(2).max(200).required(),
 
   eventType: Joi.string().trim().required(),
+
+  // Domain / industry focus of the event (UI calls this "Field")
+  eventField: Joi.string().trim().max(120).allow(null, ''),
 
   customEventType: Joi.string().trim().max(120).allow(null, ''),
 
@@ -118,6 +137,16 @@ const publicPlanningSchema = Joi.object({
 const validateCreatePlanning = (req, res, next) => {
   // Parse JSON string fields that arrive via multipart/form-data
   parseJsonFields(req);
+
+  // Normalize the various possible frontend names into one persisted field.
+  // Frontend may send: eventField (string) OR field (string) OR interests ([string] or string).
+  const eventField = deriveEventField(req.body);
+  if (eventField) {
+    req.body.eventField = eventField;
+  }
+  // Keep payload tidy; stripUnknown will also remove them.
+  delete req.body.field;
+  delete req.body.interests;
 
   const { category } = req.body;
 

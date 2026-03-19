@@ -112,6 +112,13 @@ const PlanningSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    // Domain / industry focus of the event (UI calls this "Field")
+    eventField: {
+      type: String,
+      trim: true,
+      maxlength: 120,
+      default: null,
+    },
     customEventType: {
       type: String,
       trim: true,
