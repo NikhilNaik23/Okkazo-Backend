@@ -28,6 +28,15 @@ const PROMOTE_STATUS = {
 
 const PROMOTE_STATUS_VALUES = Object.values(PROMOTE_STATUS);
 
+// Promote approval workflow (adminDecision.status)
+const ADMIN_DECISION_STATUS = {
+  PENDING: 'PENDING',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+};
+
+const ADMIN_DECISION_STATUS_VALUES = Object.values(ADMIN_DECISION_STATUS);
+
 const TICKET_STATUS = {
   READY: 'READY',           // sale window not started yet
   LIVE: 'LIVE',             // currently on sale
@@ -42,6 +51,8 @@ module.exports = {
   PROMOTION_PACKAGES,
   PROMOTE_STATUS,
   PROMOTE_STATUS_VALUES,
+  ADMIN_DECISION_STATUS,
+  ADMIN_DECISION_STATUS_VALUES,
   TICKET_STATUS,
   SERVICE_CHARGE_RATE,
 };
