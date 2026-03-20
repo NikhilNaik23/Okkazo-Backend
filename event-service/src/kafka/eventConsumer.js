@@ -72,7 +72,9 @@ const startConsuming = async () => {
               await publishEvent('PLANNING_PAYMENT_CONFIRMED', {
                 eventId: planning.eventId,
                 authId: planning.authId,
-                isPaid: planning.isPaid,
+                platformFeePaid: Boolean(planning.platformFeePaid) || Boolean(planning.isPaid),
+                depositPaid: Boolean(planning.depositPaid),
+                fullPaymentPaid: Boolean(planning.fullPaymentPaid),
                 paymentOrderId: payload.paymentOrderId,
                 razorpayOrderId: payload.razorpayOrderId,
                 razorpayPaymentId: payload.razorpayPaymentId,

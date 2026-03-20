@@ -56,7 +56,7 @@ const commonFields = {
     .required()
     .messages({ 'array.min': 'At least one service must be selected' }),
 
-  isPaid: Joi.boolean().default(false),
+  platformFeePaid: Joi.boolean().default(false),
 };
 
 /**
@@ -206,8 +206,25 @@ const parseJsonFields = (req) => {
   }
 
   // Parse simple type coercions for multipart
+  if (typeof req.body.platformFeePaid === 'string') {
+    req.body.platformFeePaid = req.body.platformFeePaid === 'true';
+  }
+  // Backward-compat: older clients might still send `isPaid`
   if (typeof req.body.isPaid === 'string') {
-    req.body.isPaid = req.body.isPaid === 'true';
+    const legacyPaid = req.body.isPaid === 'true';
+    // Payment should only ever move forward (false -> true). Do not let legacy `false`
+    // overwrite an existing paid flag.
+    if (legacyPaid && req.body.platformFeePaid === undefined) {
+      req.body.platformFeePaid = true;
+    }
+    delete req.body.isPaid;
+  }
+  if (typeof req.body.isPaid === 'boolean') {
+    const legacyPaid = req.body.isPaid === true;
+    if (legacyPaid && req.body.platformFeePaid === undefined) {
+      req.body.platformFeePaid = true;
+    }
+    delete req.body.isPaid;
   }
   if (typeof req.body.guestCount === 'string') {
     req.body.guestCount = Number(req.body.guestCount);

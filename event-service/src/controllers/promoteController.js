@@ -1,4 +1,5 @@
 const promoteService = require('../services/promoteService');
+const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
@@ -166,6 +167,133 @@ const getAllPromotes = async (req, res) => {
   }
 };
 
+/**
+ * Manager events list
+ * GET /promote/manager/events
+ */
+const getManagerPromoteEvents = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+
+    // Manager should fetch their own events by default.
+    // Admin may optionally supply ?managerId=... to inspect a specific manager.
+    const isAdminOverride = req.user?.role === 'ADMIN' && req.query?.managerId;
+    const managerId = isAdminOverride
+      ? String(req.query.managerId).trim()
+      : await resolveUserServiceIdFromAuthId(req.user?.authId);
+
+    if (!managerId) {
+      return res
+        .status(isAdminOverride ? 400 : 404)
+        .json({ success: false, message: isAdminOverride ? 'managerId is required' : 'Manager not found' });
+    }
+
+    const events = await promoteService.getPromotesForManager({ managerId, limit });
+    return res.status(200).json({
+      success: true,
+      data: { events },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPromoteEvents:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch manager promote events',
+    });
+  }
+};
+
+/**
+ * Update promote core details (Manager/Admin)
+ * PATCH /promote/:eventId
+ */
+const updatePromoteDetails = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await promoteService.updatePromoteDetails({
+      eventId,
+      updates: {
+        eventTitle: req.body?.eventTitle,
+        eventDescription: req.body?.eventDescription,
+        locationName: req.body?.locationName,
+      },
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Promote updated successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in updatePromoteDetails:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to update promote',
+    });
+  }
+};
+
+/**
+ * Add CORE staff to promote event (Manager/Admin)
+ * POST /promote/:eventId/core-staff
+ */
+const addPromoteCoreStaff = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const staffId = req.body?.staffId;
+
+    const updated = await promoteService.addPromoteCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff assigned successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in addPromoteCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to assign staff',
+    });
+  }
+};
+
+/**
+ * Remove CORE staff from promote event (Manager/Admin)
+ * DELETE /promote/:eventId/core-staff/:staffId
+ */
+const removePromoteCoreStaff = async (req, res) => {
+  try {
+    const { eventId, staffId } = req.params;
+
+    const updated = await promoteService.removePromoteCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff removed successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in removePromoteCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to remove staff',
+    });
+  }
+};
+
 // ─── Update promote status (manager / admin) ──────────────────────────────────
 /**
  * PATCH /promote/:eventId/status
@@ -213,11 +341,101 @@ const assignManager = async (req, res) => {
       return res.status(400).json({ success: false, message: 'managerId is required' });
     }
 
-    const promote = await promoteService.assignManager(eventId, managerId);
+    const promote = await promoteService.assignManagerWithMetadata(eventId, managerId, {
+      assignedByAuthId: req.user?.authId || null,
+      autoAssigned: false,
+    });
 
     return res.status(200).json({ success: true, message: 'Manager assigned', data: promote });
   } catch (error) {
     logger.error('Error in assignManager:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Unassign manager (admin only) ──────────────────────────────────────────
+/**
+ * PATCH /promote/:eventId/unassign-manager
+ */
+const unassignManager = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const promote = await promoteService.unassignPromoteManager(eventId, {
+      unassignedByAuthId: req.user?.authId || null,
+    });
+
+    // Publish Kafka (best-effort)
+    try {
+      await publishEvent('PROMOTE_STATUS_UPDATED', {
+        eventId: promote.eventId,
+        authId: promote.authId,
+        eventStatus: promote.eventStatus,
+        updatedBy: req.user?.authId || null,
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish PROMOTE_STATUS_UPDATED:', kafkaError.message);
+    }
+
+    return res.status(200).json({ success: true, message: 'Manager unassigned', data: promote });
+  } catch (error) {
+    logger.error('Error in unassignManager:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Admin dashboard (assigned / applications / rejected) ───────────────────
+/**
+ * GET /promote/admin/dashboard
+ */
+const getAdminDashboard = async (req, res) => {
+  try {
+    const { limit } = req.query;
+    const data = await promoteService.getAdminDashboard({ limit });
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    logger.error('Error in getAdminDashboard:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Admin decision (approve / reject) ──────────────────────────────────────
+/**
+ * PATCH /promote/:eventId/decision
+ * Body: { decision: 'APPROVE'|'REJECT', rejectionReason?, managerId? }
+ */
+const decidePromote = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { decision, rejectionReason, managerId } = req.body || {};
+
+    const promote = await promoteService.decidePromote(eventId, {
+      decision,
+      rejectionReason,
+      managerId,
+      decidedByAuthId: req.user?.authId || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Decision updated',
+      data: promote,
+    });
+  } catch (error) {
+    logger.error('Error in decidePromote:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * GET /promote/admin/unavailable-managers
+ */
+const getUnavailableManagers = async (req, res) => {
+  try {
+    const managerIds = await promoteService.getUnavailableManagerIds();
+    return res.status(200).json({ success: true, data: { managerIds } });
+  } catch (error) {
+    logger.error('Error in getUnavailableManagers:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 };
@@ -295,8 +513,16 @@ module.exports = {
   },
   getMyPromotes,
   getPromoteByEventId,
+  updatePromoteDetails,
+  addPromoteCoreStaff,
+  removePromoteCoreStaff,
   getAllPromotes,
+  getManagerPromoteEvents,
   updatePromoteStatus,
   assignManager,
+  unassignManager,
+  getAdminDashboard,
+  decidePromote,
+  getUnavailableManagers,
   deletePromote,
 };

@@ -94,6 +94,12 @@ const PlanningSchema = new mongoose.Schema(
       index: true,
       trim: true,
     },
+    // Assigned CORE staff (user-service _id values) for this event.
+    coreStaffIds: {
+      type: [String],
+      default: [],
+      index: true,
+    },
     category: {
       type: String,
       required: true,
@@ -214,6 +220,14 @@ const PlanningSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    // New canonical flag for platform fee payment.
+    // NOTE: `isPaid` is kept for backward compatibility with existing DB rows.
+    platformFeePaid: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    // Legacy field (do not use in new code).
     isPaid: {
       type: Boolean,
       default: false,
@@ -223,6 +237,12 @@ const PlanningSchema = new mongoose.Schema(
       type: Number,
       default: null,
       min: 0,
+    },
+    // New fields for multi-step payment flows.
+    depositPaid: {
+      type: Boolean,
+      default: false,
+      index: true,
     },
     fullPaymentPaid: {
       type: Boolean,
@@ -241,7 +261,8 @@ const PlanningSchema = new mongoose.Schema(
       index: true,
     },
     assignedManagerId: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: String,
+      trim: true,
       default: null,
       index: true,
     },
@@ -258,16 +279,26 @@ const PlanningSchema = new mongoose.Schema(
   }
 );
 
+PlanningSchema.set('toJSON', {
+  transform: (doc, ret) => {
+    // Hide legacy name from API responses.
+    delete ret.isPaid;
+    return ret;
+  },
+});
+
+// Backward-compatible payment detection.
+// IMPORTANT: do NOT use nullish-coalescing here. A stored `platformFeePaid: false`
+// would incorrectly mask legacy `isPaid: true` on older records.
+const isPlatformFeePaid = (doc) => Boolean(doc?.platformFeePaid) || Boolean(doc?.isPaid);
+
 const computeDefaultStatus = (doc) => {
-  if (doc.isPaid) {
-    return STATUS.IMMEDIATE_ACTION;
-  }
+  // Payment is the first gate; unpaid should remain in PAYMENT_PENDING even if a managerId exists.
+  if (!isPlatformFeePaid(doc)) return STATUS.PAYMENT_PENDING;
 
-  if (doc.assignedManagerId) {
-    return STATUS.PENDING_APPROVAL;
-  }
-
-  return STATUS.PAYMENT_PENDING;
+  // Once paid, the next stage depends on manager assignment.
+  if (doc.assignedManagerId) return STATUS.PENDING_APPROVAL;
+  return STATUS.IMMEDIATE_ACTION;
 };
 
 PlanningSchema.pre('validate', function preValidate(next) {
@@ -361,8 +392,8 @@ PlanningSchema.pre('validate', function preValidate(next) {
   if (this.isNew) {
     this.status = computeDefaultStatus(this);
   } else if (
-    (this.isModified('isPaid') || this.isModified('assignedManagerId')) &&
-    [STATUS.IMMEDIATE_ACTION, STATUS.PENDING_APPROVAL].includes(this.status)
+    (this.isModified('platformFeePaid') || this.isModified('isPaid') || this.isModified('assignedManagerId')) &&
+    [STATUS.PAYMENT_PENDING, STATUS.IMMEDIATE_ACTION, STATUS.PENDING_APPROVAL].includes(this.status)
   ) {
     this.status = computeDefaultStatus(this);
   }

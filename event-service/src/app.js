@@ -13,12 +13,14 @@ const eventConsumer = require('./kafka/eventConsumer');
 const logger = require('./utils/logger');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { extractUser } = require('./middleware/extractUser');
+const { startManagerAutoAssignJob, stopManagerAutoAssignJob } = require('./jobs/managerAutoAssignJob');
 
 // Import routes
 const planningRoutes = require('./routes/planningRoutes');
 const promoteRoutes  = require('./routes/promoteRoutes');
 const vendorSelectionRoutes = require('./routes/vendorSelectionRoutes');
 const configRoutes = require('./routes/configRoutes');
+const staffRoutes = require('./routes/staffRoutes');
 
 // Initialize Express app
 const app = express();
@@ -48,6 +50,7 @@ app.use('/', planningRoutes);
 app.use('/', promoteRoutes);
 app.use('/', vendorSelectionRoutes);
 app.use('/', configRoutes);
+app.use('/', staffRoutes);
 
 // 404 handler
 app.use(notFound);
@@ -87,6 +90,9 @@ const startServer = async () => {
       logger.info(`Service: ${process.env.SERVICE_NAME || 'event-service'}`);
     });
 
+    // Background jobs
+    startManagerAutoAssignJob();
+
     // Graceful shutdown
     const gracefulShutdown = async (signal) => {
       logger.info(`${signal} received. Starting graceful shutdown...`);
@@ -106,6 +112,9 @@ const startServer = async () => {
           // Stop Eureka client
           eurekaClient.stop();
           logger.info('Eureka client stopped');
+
+          // Stop background jobs
+          stopManagerAutoAssignJob();
 
           // Close MongoDB connection
           const mongoose = require('mongoose');

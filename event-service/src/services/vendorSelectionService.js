@@ -5,6 +5,18 @@ const logger = require('../utils/logger');
 const { SERVICE_OPTIONS, VENDOR_STATUS } = require('../utils/vendorSelectionConstants');
 const vendorReservationService = require('./vendorReservationService');
 
+const normalizeVendorAuthId = (vendorAuthId) => {
+  const v = String(vendorAuthId || '').trim();
+  if (!v) throw createApiError(400, 'vendorAuthId is required');
+  return v;
+};
+
+const normalizeEventId = (eventId) => {
+  const eid = String(eventId || '').trim();
+  if (!eid) throw createApiError(400, 'Event ID is required');
+  return eid;
+};
+
 const normalizeServices = (selectedServices) => {
   if (!Array.isArray(selectedServices)) {
     throw createApiError(400, 'selectedServices must be an array');
@@ -40,6 +52,7 @@ const ensureForPlanning = async (planning) => {
       eventId: planning.eventId,
       authId: planning.authId,
       planningId: planning._id,
+      managerId: planning.assignedManagerId ? planning.assignedManagerId : null,
       selectedServices,
       vendors: selectedServices.map((service) => ({
         service,
@@ -71,6 +84,14 @@ const ensureForPlanning = async (planning) => {
   }
   if (!planning.vendorSelectionId) {
     planningChanged = true;
+  }
+
+  // Keep manager assignment aligned (planning is source-of-truth)
+  const nextManagerId = planning.assignedManagerId ? String(planning.assignedManagerId).trim() : null;
+  const currentManagerId = selection.managerId ? String(selection.managerId).trim() : null;
+  if (currentManagerId !== nextManagerId) {
+    selection.managerId = nextManagerId;
+    await selection.save();
   }
 
   // Keep selectedServices aligned to planning by default (but do not overwrite if selection was already customized)
@@ -238,9 +259,118 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
   return selection.toObject();
 };
 
+// ─── Vendor-facing workflows ───────────────────────────────────────────────
+
+const listSelectionsForVendor = async ({ vendorAuthId }) => {
+  const vendor = normalizeVendorAuthId(vendorAuthId);
+
+  const selections = await VendorSelection.find({ 'vendors.vendorAuthId': vendor })
+    .select('eventId status vendorsAccepted managerId vendors')
+    .lean();
+
+  return (selections || []).map((sel) => {
+    const vendorItems = Array.isArray(sel.vendors)
+      ? sel.vendors.filter((v) => v?.vendorAuthId && String(v.vendorAuthId).trim() === vendor)
+      : [];
+
+    return {
+      _id: sel._id,
+      eventId: sel.eventId,
+      status: sel.status,
+      vendorsAccepted: Boolean(sel.vendorsAccepted),
+      managerId: sel.managerId || null,
+      vendorItems,
+    };
+  });
+};
+
+const getSelectionForVendorEvent = async ({ eventId, vendorAuthId }) => {
+  const eid = normalizeEventId(eventId);
+  const vendor = normalizeVendorAuthId(vendorAuthId);
+
+  const selection = await VendorSelection.findOne({ eventId: eid }).lean();
+  if (!selection) throw createApiError(404, 'Vendor selection not found');
+
+  const vendorItems = Array.isArray(selection.vendors)
+    ? selection.vendors.filter((v) => v?.vendorAuthId && String(v.vendorAuthId).trim() === vendor)
+    : [];
+
+  if (vendorItems.length === 0) {
+    throw createApiError(403, 'Access denied');
+  }
+
+  return {
+    _id: selection._id,
+    eventId: selection.eventId,
+    status: selection.status,
+    vendorsAccepted: Boolean(selection.vendorsAccepted),
+    managerId: selection.managerId || null,
+    vendorItems,
+  };
+};
+
+const respondForVendor = async ({ eventId, vendorAuthId, action, service, rejectionReason }) => {
+  const eid = normalizeEventId(eventId);
+  const vendor = normalizeVendorAuthId(vendorAuthId);
+
+  const selection = await VendorSelection.findOne({ eventId: eid });
+  if (!selection) throw createApiError(404, 'Vendor selection not found');
+
+  const vendors = Array.isArray(selection.vendors) ? selection.vendors : [];
+  const matchingItems = vendors.filter((v) => v?.vendorAuthId && String(v.vendorAuthId).trim() === vendor);
+  if (matchingItems.length === 0) throw createApiError(403, 'Access denied');
+
+  const requestedService = service != null && String(service).trim() ? String(service).trim() : null;
+  let targetItems = matchingItems;
+  if (requestedService) {
+    targetItems = matchingItems.filter((v) => v?.service === requestedService);
+    if (targetItems.length === 0) throw createApiError(404, 'Request not found for given service');
+  }
+
+  // Default: operate only on pending items for safety
+  if (!requestedService) {
+    const pending = targetItems.filter((v) => v?.status === VENDOR_STATUS.YET_TO_SELECT);
+    if (pending.length > 0) targetItems = pending;
+  }
+
+  if (action !== 'accept' && action !== 'reject') {
+    throw createApiError(400, 'Invalid action');
+  }
+
+  if (action === 'reject') {
+    const reason = String(rejectionReason || '').trim();
+    if (!reason) throw createApiError(400, 'rejectionReason is required');
+    for (const item of targetItems) {
+      item.status = VENDOR_STATUS.REJECTED;
+      item.rejectionReason = reason;
+      item.alternativeNeeded = true;
+    }
+  } else {
+    for (const item of targetItems) {
+      item.status = VENDOR_STATUS.ACCEPTED;
+      item.rejectionReason = null;
+      item.alternativeNeeded = false;
+    }
+  }
+
+  selection.vendors = vendors;
+  await selection.save();
+
+  // After save, compute if vendor still accepted any service for this event
+  const afterItems = (selection.vendors || []).filter(
+    (v) => v?.vendorAuthId && String(v.vendorAuthId).trim() === vendor
+  );
+  const vendorAcceptedAnyServiceAfter = afterItems.some((v) => v?.status === VENDOR_STATUS.ACCEPTED);
+
+  return { selection: selection.toObject(), vendorAcceptedAnyServiceAfter };
+};
+
 module.exports = {
   ensureForPlanning,
   getByEventId,
   updateSelectedServices,
   upsertVendor,
+  listSelectionsForVendor,
+  getSelectionForVendorEvent,
+  respondForVendor,
 };

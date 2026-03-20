@@ -84,6 +84,12 @@ const PromoteSchema = new mongoose.Schema(
       index: true,
       trim: true,
     },
+    // Assigned CORE staff (user-service _id values) for this event.
+    coreStaffIds: {
+      type: [String],
+      default: [],
+      index: true,
+    },
     eventId: {
       type: String,
       required: true,
@@ -222,9 +228,29 @@ const PromoteSchema = new mongoose.Schema(
 
     // Manager
     assignedManagerId: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: String,
+      trim: true,
       default: null,
       index: true,
+    },
+
+    // Admin decision workflow (separate from eventStatus)
+    adminDecision: {
+      status: {
+        type: String,
+        enum: ['PENDING', 'APPROVED', 'REJECTED'],
+        default: 'PENDING',
+        index: true,
+      },
+      decidedAt: { type: Date, default: null },
+      decidedByAuthId: { type: String, trim: true, default: null },
+      rejectionReason: { type: String, trim: true, maxlength: 500, default: null },
+    },
+
+    managerAssignment: {
+      assignedAt: { type: Date, default: null },
+      assignedByAuthId: { type: String, trim: true, default: null },
+      autoAssigned: { type: Boolean, default: false },
     },
 
     // Event status
