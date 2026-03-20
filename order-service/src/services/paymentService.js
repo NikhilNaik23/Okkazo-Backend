@@ -149,7 +149,7 @@ const createOrder = async (payload, user) => {
   const alreadyPaid =
     orderType === 'PROMOTE EVENT'
       ? Boolean(upstreamRecord.platformFeePaid)
-      : Boolean(upstreamRecord.isPaid);
+      : Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
 
   if (alreadyPaid) {
     throw createApiError(409, 'Payment is already completed for this event');

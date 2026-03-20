@@ -20,6 +20,7 @@ const planningRoutes = require('./routes/planningRoutes');
 const promoteRoutes  = require('./routes/promoteRoutes');
 const vendorSelectionRoutes = require('./routes/vendorSelectionRoutes');
 const configRoutes = require('./routes/configRoutes');
+const staffRoutes = require('./routes/staffRoutes');
 
 // Initialize Express app
 const app = express();
@@ -49,6 +50,7 @@ app.use('/', planningRoutes);
 app.use('/', promoteRoutes);
 app.use('/', vendorSelectionRoutes);
 app.use('/', configRoutes);
+app.use('/', staffRoutes);
 
 // 404 handler
 app.use(notFound);

@@ -84,6 +84,12 @@ const PromoteSchema = new mongoose.Schema(
       index: true,
       trim: true,
     },
+    // Assigned CORE staff (user-service _id values) for this event.
+    coreStaffIds: {
+      type: [String],
+      default: [],
+      index: true,
+    },
     eventId: {
       type: String,
       required: true,
@@ -222,7 +228,8 @@ const PromoteSchema = new mongoose.Schema(
 
     // Manager
     assignedManagerId: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: String,
+      trim: true,
       default: null,
       index: true,
     },

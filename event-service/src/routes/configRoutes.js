@@ -18,4 +18,18 @@ router.patch(
   configController.updateFees
 );
 
+// GET /config/manager-autoassign — admin only
+router.get(
+  '/config/manager-autoassign',
+  isAdmin,
+  configController.getManagerAutoAssign
+);
+
+// PATCH /config/manager-autoassign — admin only
+router.patch(
+  '/config/manager-autoassign',
+  isAdmin,
+  configController.updateManagerAutoAssign
+);
+
 module.exports = router;

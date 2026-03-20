@@ -19,6 +19,9 @@ router.get('/api/vendor/services/search', vendorController.searchVendorServices)
 // Public vendor profiles (sanitized, no auth required)
 router.get('/api/vendor/public/vendors', vendorController.getPublicVendors);
 
+// Public service lookup (sanitized, no auth required)
+router.get('/api/vendor/public/services/:serviceId', vendorController.getPublicServiceById);
+
 // Protected routes - user context extracted from API Gateway headers
 router.use('/api/vendor', extractUser);
 

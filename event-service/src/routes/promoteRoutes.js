@@ -57,6 +57,13 @@ router.get(
   promoteController.getUnavailableManagers
 );
 
+// GET /promote/manager/events - Manager's assigned promote events (Manager/Admin)
+router.get(
+  '/promote/manager/events',
+  isAdminOrManager,
+  promoteController.getManagerPromoteEvents
+);
+
 // PATCH /promote/:eventId/decision — Approve/Reject application (Admin only)
 router.patch(
   '/promote/:eventId/decision',
@@ -69,6 +76,27 @@ router.get(
   '/promote/:eventId',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
   promoteController.getPromoteByEventId
+);
+
+// PATCH /promote/:eventId — Update promote details (Manager/Admin)
+router.patch(
+  '/promote/:eventId',
+  isAdminOrManager,
+  promoteController.updatePromoteDetails
+);
+
+// POST /promote/:eventId/core-staff - Assign a CORE staff member (Manager/Admin)
+router.post(
+  '/promote/:eventId/core-staff',
+  authorizeRoles(['MANAGER']),
+  promoteController.addPromoteCoreStaff
+);
+
+// DELETE /promote/:eventId/core-staff/:staffId - Unassign a CORE staff member (Manager/Admin)
+router.delete(
+  '/promote/:eventId/core-staff/:staffId',
+  authorizeRoles(['MANAGER']),
+  promoteController.removePromoteCoreStaff
 );
 
 // PATCH /promote/:eventId/status — Update event status (Manager/Admin)

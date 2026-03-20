@@ -1,4 +1,5 @@
 const planningService = require('../services/planningService');
+const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
@@ -515,6 +516,168 @@ const getPlanningStats = async (req, res) => {
 };
 
 /**
+ * Manager events list
+ * GET /planning/manager/events
+ */
+const getManagerPlanningEvents = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+
+    // Manager should fetch their own events by default.
+    // Admin may optionally supply ?managerId=... to inspect a specific manager.
+    const isAdminOverride = req.user?.role === 'ADMIN' && req.query?.managerId;
+    const managerId = isAdminOverride
+      ? String(req.query.managerId).trim()
+      : await resolveUserServiceIdFromAuthId(req.user?.authId);
+
+    if (!managerId) {
+      return res.status(isAdminOverride ? 400 : 404).json({
+        success: false,
+        message: isAdminOverride ? 'managerId is required' : 'Manager not found',
+      });
+    }
+
+    const events = await planningService.getPlanningsForManager({ managerId, limit });
+    return res.status(200).json({
+      success: true,
+      data: { events },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPlanningEvents:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch manager planning events',
+    });
+  }
+};
+
+/**
+ * Manager applications (planning events awaiting approval)
+ * GET /planning/manager/applications
+ */
+const getManagerPlanningApplications = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+
+    const isAdminOverride = req.user?.role === 'ADMIN' && req.query?.managerId;
+    const managerId = isAdminOverride
+      ? String(req.query.managerId).trim()
+      : await resolveUserServiceIdFromAuthId(req.user?.authId);
+
+    if (!managerId) {
+      return res.status(isAdminOverride ? 400 : 404).json({
+        success: false,
+        message: isAdminOverride ? 'managerId is required' : 'Manager not found',
+      });
+    }
+
+    const applications = await planningService.getPlanningApplicationsForManager({ managerId, limit });
+    return res.status(200).json({
+      success: true,
+      data: { applications },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPlanningApplications:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch planning applications',
+    });
+  }
+};
+
+/**
+ * Update planning core details (Manager/Admin)
+ * PATCH /planning/:eventId
+ */
+const updatePlanningDetails = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await planningService.updatePlanningDetails({
+      eventId,
+      updates: {
+        eventTitle: req.body?.eventTitle,
+        eventDescription: req.body?.eventDescription,
+        locationName: req.body?.locationName,
+      },
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Planning updated successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in updatePlanningDetails:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to update planning',
+    });
+  }
+};
+
+/**
+ * Add CORE staff to planning event (Manager/Admin)
+ * POST /planning/:eventId/core-staff
+ */
+const addPlanningCoreStaff = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const staffId = req.body?.staffId;
+
+    const updated = await planningService.addPlanningCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff assigned successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in addPlanningCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to assign staff',
+    });
+  }
+};
+
+/**
+ * Remove CORE staff from planning event (Manager/Admin)
+ * DELETE /planning/:eventId/core-staff/:staffId
+ */
+const removePlanningCoreStaff = async (req, res) => {
+  try {
+    const { eventId, staffId } = req.params;
+
+    const updated = await planningService.removePlanningCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff removed successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in removePlanningCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to remove staff',
+    });
+  }
+};
+
+/**
  * Confirm a planning selection (Owner)
  * POST /planning/:eventId/confirm
  */
@@ -795,4 +958,9 @@ module.exports = {
   deletePlanning,
   getPlanningStats,
   getVendorsForPlanning,
+  getManagerPlanningEvents,
+  getManagerPlanningApplications,
+  updatePlanningDetails,
+  addPlanningCoreStaff,
+  removePlanningCoreStaff,
 };

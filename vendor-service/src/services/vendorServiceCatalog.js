@@ -558,11 +558,37 @@ const getPublicVendorsByAuthIds = async (authIds) => {
   return vendors;
 };
 
+/**
+ * Public service lookup by id (sanitized).
+ * Only returns Active services.
+ */
+const getPublicServiceById = async (serviceId) => {
+  const id = String(serviceId || '').trim();
+  if (!id) {
+    throw new ApiError(400, 'Service ID is required');
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw new ApiError(400, 'Invalid service ID');
+  }
+
+  const service = await VendorService.findOne({ _id: id, status: 'Active' })
+    .select('businessName serviceCategory categoryId name price tier description details latitude longitude')
+    .lean();
+
+  if (!service) {
+    throw new ApiError(404, 'Service not found');
+  }
+
+  return service;
+};
+
 module.exports = {
   createService,
   getMyServices,
   searchServices,
   getPublicVendorsByAuthIds,
+  getPublicServiceById,
   updateService,
   deleteService,
   addVenueServiceImages,

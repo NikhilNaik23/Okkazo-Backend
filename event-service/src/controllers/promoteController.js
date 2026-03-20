@@ -1,4 +1,5 @@
 const promoteService = require('../services/promoteService');
+const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
@@ -163,6 +164,133 @@ const getAllPromotes = async (req, res) => {
   } catch (error) {
     logger.error('Error in getAllPromotes:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * Manager events list
+ * GET /promote/manager/events
+ */
+const getManagerPromoteEvents = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+
+    // Manager should fetch their own events by default.
+    // Admin may optionally supply ?managerId=... to inspect a specific manager.
+    const isAdminOverride = req.user?.role === 'ADMIN' && req.query?.managerId;
+    const managerId = isAdminOverride
+      ? String(req.query.managerId).trim()
+      : await resolveUserServiceIdFromAuthId(req.user?.authId);
+
+    if (!managerId) {
+      return res
+        .status(isAdminOverride ? 400 : 404)
+        .json({ success: false, message: isAdminOverride ? 'managerId is required' : 'Manager not found' });
+    }
+
+    const events = await promoteService.getPromotesForManager({ managerId, limit });
+    return res.status(200).json({
+      success: true,
+      data: { events },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPromoteEvents:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch manager promote events',
+    });
+  }
+};
+
+/**
+ * Update promote core details (Manager/Admin)
+ * PATCH /promote/:eventId
+ */
+const updatePromoteDetails = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await promoteService.updatePromoteDetails({
+      eventId,
+      updates: {
+        eventTitle: req.body?.eventTitle,
+        eventDescription: req.body?.eventDescription,
+        locationName: req.body?.locationName,
+      },
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Promote updated successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in updatePromoteDetails:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to update promote',
+    });
+  }
+};
+
+/**
+ * Add CORE staff to promote event (Manager/Admin)
+ * POST /promote/:eventId/core-staff
+ */
+const addPromoteCoreStaff = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const staffId = req.body?.staffId;
+
+    const updated = await promoteService.addPromoteCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff assigned successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in addPromoteCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to assign staff',
+    });
+  }
+};
+
+/**
+ * Remove CORE staff from promote event (Manager/Admin)
+ * DELETE /promote/:eventId/core-staff/:staffId
+ */
+const removePromoteCoreStaff = async (req, res) => {
+  try {
+    const { eventId, staffId } = req.params;
+
+    const updated = await promoteService.removePromoteCoreStaff({
+      eventId,
+      staffId,
+      actorRole: req.user?.role,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Staff removed successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in removePromoteCoreStaff:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to remove staff',
+    });
   }
 };
 
@@ -385,7 +513,11 @@ module.exports = {
   },
   getMyPromotes,
   getPromoteByEventId,
+  updatePromoteDetails,
+  addPromoteCoreStaff,
+  removePromoteCoreStaff,
   getAllPromotes,
+  getManagerPromoteEvents,
   updatePromoteStatus,
   assignManager,
   unassignManager,

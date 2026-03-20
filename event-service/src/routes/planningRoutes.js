@@ -33,6 +33,20 @@ router.get(
   planningController.getAdminDashboard
 );
 
+// GET /planning/manager/events - Manager's assigned planning events (Manager/Admin)
+router.get(
+  '/planning/manager/events',
+  isAdminOrManager,
+  planningController.getManagerPlanningEvents
+);
+
+// GET /planning/manager/applications - Manager's assigned planning applications awaiting approval (Manager/Admin)
+router.get(
+  '/planning/manager/applications',
+  isAdminOrManager,
+  planningController.getManagerPlanningApplications
+);
+
 // GET /planning/me - Get current user's plannings
 router.get(
   '/planning/me',
@@ -52,6 +66,27 @@ router.get(
   '/planning/:eventId',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
   planningController.getPlanningByEventId
+);
+
+// PATCH /planning/:eventId - Update planning details (Manager/Admin)
+router.patch(
+  '/planning/:eventId',
+  isAdminOrManager,
+  planningController.updatePlanningDetails
+);
+
+// POST /planning/:eventId/core-staff - Assign a CORE staff member (Manager/Admin)
+router.post(
+  '/planning/:eventId/core-staff',
+  authorizeRoles(['MANAGER']),
+  planningController.addPlanningCoreStaff
+);
+
+// DELETE /planning/:eventId/core-staff/:staffId - Unassign a CORE staff member (Manager/Admin)
+router.delete(
+  '/planning/:eventId/core-staff/:staffId',
+  authorizeRoles(['MANAGER']),
+  planningController.removePlanningCoreStaff
 );
 
 // GET /planning/:eventId/vendors - Fetch vendors for a service category

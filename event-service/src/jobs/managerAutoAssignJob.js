@@ -4,6 +4,9 @@ const logger = require('../utils/logger');
 const { fetchActiveManagers } = require('../services/userServiceClient');
 const { CATEGORY, STATUS } = require('../utils/planningConstants');
 const { PROMOTE_STATUS } = require('../utils/promoteConstants');
+const { getState: getManagerAutoAssignState } = require('./managerAutoAssignRuntimeConfig');
+const vendorSelectionService = require('../services/vendorSelectionService');
+const promoteService = require('../services/promoteService');
 
 const DEPARTMENT_PUBLIC = 'Public Event';
 const DEPARTMENT_PRIVATE = 'Private Event';
@@ -25,10 +28,11 @@ const promoteCandidateFilter = {
 const planningCandidateFilter = {
   assignedManagerId: null,
   status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
-  $or: [{ vendorSelectionId: { $ne: null } }, { isPaid: true }],
+  $or: [{ vendorSelectionId: { $ne: null } }, { platformFeePaid: true }, { isPaid: true }],
 };
 
 let intervalHandle = null;
+let startupTimeoutHandle = null;
 let running = false;
 
 const cursorByDepartment = new Map();
@@ -40,7 +44,7 @@ const isAssignedRoleEligible = (assignedRole) => {
 };
 
 const getConfig = () => {
-  const enabled = normalizeLoose(process.env.ENABLE_MANAGER_AUTOASSIGN || 'true') !== 'false';
+  const enabled = Boolean(getManagerAutoAssignState()?.enabled);
   const intervalMs = Math.max(10_000, Number(process.env.MANAGER_AUTOASSIGN_INTERVAL_MS || 60_000));
   const queryLimitPerType = Math.min(200, Math.max(1, Number(process.env.MANAGER_AUTOASSIGN_QUERY_LIMIT || 30)));
   const maxAssignmentsPerRun = Math.min(200, Math.max(1, Number(process.env.MANAGER_AUTOASSIGN_MAX_ASSIGNMENTS_PER_RUN || 40)));
@@ -223,28 +227,11 @@ const runOnce = async () => {
         if (!managerId) break;
 
         try {
-          const now = new Date();
-          const updateResult = await Promote.updateOne(
-            {
-              eventId: String(candidate.eventId).trim(),
-              assignedManagerId: null,
-              eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
-              'adminDecision.status': 'APPROVED',
-              'adminDecision.decidedAt': { $ne: null },
-            },
-            {
-              $set: {
-                assignedManagerId: managerId,
-                managerAssignment: {
-                  assignedAt: now,
-                  assignedByAuthId: config.assignedByAuthId || null,
-                  autoAssigned: true,
-                },
-              },
-            }
-          );
+          const result = await promoteService.tryAutoAssignManager(candidate.eventId, managerId, {
+            assignedByAuthId: config.assignedByAuthId || null,
+          });
 
-          if (updateResult?.modifiedCount === 1) {
+          if (result?.assigned) {
             assignedTotal += 1;
             logger.info(`Auto-assigned manager ${managerId} to promote ${candidate.eventId}`);
           }
@@ -292,7 +279,7 @@ const runOnce = async () => {
               eventId: String(candidate.eventId).trim(),
               assignedManagerId: null,
               status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
-              $or: [{ vendorSelectionId: { $ne: null } }, { isPaid: true }],
+              $or: [{ vendorSelectionId: { $ne: null } }, { platformFeePaid: true }, { isPaid: true }],
             },
             {
               $set: {
@@ -304,6 +291,16 @@ const runOnce = async () => {
           if (updateResult?.modifiedCount === 1) {
             assignedTotal += 1;
             logger.info(`Auto-assigned manager ${managerId} to planning ${candidate.eventId}`);
+
+            // Best-effort: keep VendorSelection manager fields aligned.
+            try {
+              const planning = await Planning.findOne({ eventId: String(candidate.eventId).trim() });
+              if (planning) {
+                await vendorSelectionService.ensureForPlanning(planning);
+              }
+            } catch (error) {
+              logger.warn(`VendorSelection sync after auto-assign (planning) failed for ${candidate.eventId}: ${error.message}`);
+            }
           }
         } catch (error) {
           logger.warn(`Auto-assign (planning) failed for ${candidate.eventId}: ${error.message}`);
@@ -335,12 +332,17 @@ const startManagerAutoAssignJob = () => {
   }, config.intervalMs);
 
   // Run soon after startup.
-  setTimeout(() => {
+  startupTimeoutHandle = setTimeout(() => {
     runOnce().catch(() => null);
   }, 5_000);
 };
 
 const stopManagerAutoAssignJob = () => {
+  if (!intervalHandle && !startupTimeoutHandle) return;
+  if (startupTimeoutHandle) {
+    clearTimeout(startupTimeoutHandle);
+    startupTimeoutHandle = null;
+  }
   if (!intervalHandle) return;
   clearInterval(intervalHandle);
   intervalHandle = null;
