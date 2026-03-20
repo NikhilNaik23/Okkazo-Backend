@@ -50,10 +50,20 @@ const getOrderByEventId = async (req, res) => {
   });
 };
 
+const getOrdersByEventIdForAdmin = async (req, res) => {
+  const result = await paymentService.getOrdersByEventIdForAdmin(req.params.eventId);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
 module.exports = {
   createOrder,
   verifyPayment,
   refundPayment,
   webhook,
   getOrderByEventId,
+  getOrdersByEventIdForAdmin,
 };

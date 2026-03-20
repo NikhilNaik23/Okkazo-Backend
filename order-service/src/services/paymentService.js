@@ -149,7 +149,7 @@ const createOrder = async (payload, user) => {
   const alreadyPaid =
     orderType === 'PROMOTE EVENT'
       ? Boolean(upstreamRecord.platformFeePaid)
-      : Boolean(upstreamRecord.isPaid);
+      : Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
 
   if (alreadyPaid) {
     throw createApiError(409, 'Payment is already completed for this event');
@@ -466,6 +466,36 @@ const getOrderByEventId = async (eventId, user) => {
   };
 };
 
+const getOrdersByEventIdForAdmin = async (eventId) => {
+  if (!eventId || !String(eventId).trim()) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const orders = await PaymentOrder.find({ eventId: String(eventId).trim() })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  return {
+    eventId: String(eventId).trim(),
+    orders: orders.map((order) => ({
+      eventId: order.eventId,
+      authId: order.authId,
+      transactionId: order.transactionId,
+      orderType: order.orderType,
+      status: order.status,
+      amount: order.amount,
+      currency: order.currency,
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: order.razorpayPaymentId,
+      razorpayRefundId: order.razorpayRefundId,
+      paidAt: order.paidAt,
+      refundedAt: order.refundedAt,
+      refundedAmount: order.refundedAmount,
+      createdAt: order.createdAt,
+    })),
+  };
+};
+
 const refundPayment = async (payload, user) => {
   if (!user?.authId) {
     throw createApiError(401, 'User authentication information missing');
@@ -563,4 +593,5 @@ module.exports = {
   refundPayment,
   handleWebhook,
   getOrderByEventId,
+  getOrdersByEventIdForAdmin,
 };

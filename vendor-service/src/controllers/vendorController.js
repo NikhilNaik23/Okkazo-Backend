@@ -632,6 +632,28 @@ const getPublicVendors = async (req, res) => {
 };
 
 /**
+ * Public service lookup (sanitized)
+ * GET /api/vendor/public/services/:serviceId
+ */
+const getPublicServiceById = async (req, res) => {
+  try {
+    const { serviceId } = req.params;
+    const service = await vendorServiceCatalog.getPublicServiceById(serviceId);
+    return res.status(200).json(formatSuccessResponse({ service }));
+  } catch (error) {
+    logger.error('Error in getPublicServiceById:', error);
+    const status = error.statusCode || 500;
+    const code =
+      status === 400
+        ? 'VALIDATION_ERROR'
+        : status === 404
+          ? 'SERVICE_NOT_FOUND'
+          : 'INTERNAL_ERROR';
+    return res.status(status).json(formatErrorResponse(code, error.message));
+  }
+};
+
+/**
  * Update a vendor service (owned by calling vendor)
  * PATCH /api/vendor/services/:serviceId
  */
@@ -890,6 +912,7 @@ module.exports = {
   createVendorService,
   searchVendorServices,
   getPublicVendors,
+  getPublicServiceById,
   getMyServices,
   updateVendorService,
   deleteVendorService,
