@@ -140,9 +140,13 @@ const computeVenueLocationFromService = (service) => {
     service.name,
     service.businessName,
   ];
-  const name = nameCandidates
+  const normalizedCandidates = nameCandidates
     .map((v) => (v == null ? '' : String(v).trim()))
-    .find((v) => v.length > 0);
+    .filter((v) => v.length > 0);
+
+  // Avoid showing a raw URL as a location label when possible.
+  const nonUrlName = normalizedCandidates.find((v) => !/^https?:\/\//i.test(v));
+  const name = nonUrlName || normalizedCandidates[0] || '';
 
   if (!name) return null;
 
@@ -249,6 +253,8 @@ const listAlternativesForService = async (req, res) => {
 
     const radiusKm = hasGeo ? ALTERNATIVES_RADIUS_KM : undefined;
 
+    const isVenue = service === 'Venue';
+
     let services = await searchPublicVendorServices({
       serviceCategory: service,
       latitude: hasGeo ? lat : undefined,
@@ -260,7 +266,8 @@ const listAlternativesForService = async (req, res) => {
 
     // Best-effort fallback: if geo-constrained search yields nothing, retry without geo.
     // This avoids a "no alternatives" result when the stored radius is too strict.
-    if (hasGeo && (!Array.isArray(services) || services.length === 0)) {
+    // For Venue, never drop geo constraints, otherwise we can suggest venues in other cities.
+    if (!isVenue && hasGeo && (!Array.isArray(services) || services.length === 0)) {
       logger.info('No vendor services found with geo filter; retrying without geo', {
         eventId,
         service,
@@ -278,21 +285,28 @@ const listAlternativesForService = async (req, res) => {
     const reservedSet = new Set((reservedByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
     if (currentVendorAuthId) reservedSet.add(currentVendorAuthId);
 
-    const isVenue = service === 'Venue';
-
     // Filter by availability and build alternatives
-    // - Venue: return individual services (keep cheapest option per vendor)
+    // - Venue: return individual services (venues) using *service* location coordinates
     // - Non-Venue: group by vendor and include vendor.services[] so the client can choose a specific package
     let alternatives = [];
 
     if (isVenue) {
-      const byVendor = new Map();
+      const rows = [];
       for (const svc of services) {
         const vendorAuthId = String(svc?.authId || '').trim();
         if (!vendorAuthId) continue;
         if (reservedSet.has(vendorAuthId)) continue;
 
-        const next = {
+        const venueLocation = computeVenueLocationFromService(svc);
+        if (!venueLocation) continue;
+
+        const distanceKm = hasGeo
+          ? haversineKm({ lat1: lat, lon1: lng, lat2: venueLocation.latitude, lon2: venueLocation.longitude })
+          : null;
+
+        if (hasGeo && radiusKm && Number.isFinite(distanceKm) && distanceKm > radiusKm) continue;
+
+        rows.push({
           vendorAuthId,
           serviceId: svc?._id || null,
           businessName: svc?.businessName || null,
@@ -301,18 +315,14 @@ const listAlternativesForService = async (req, res) => {
           tier: svc?.tier || null,
           price: Number(svc?.price || 0),
           description: svc?.description || null,
-          latitude: typeof svc?.latitude === 'number' ? svc.latitude : null,
-          longitude: typeof svc?.longitude === 'number' ? svc.longitude : null,
-        };
-
-        const prev = byVendor.get(vendorAuthId);
-        if (!prev || (Number.isFinite(next.price) && next.price > 0 && next.price < Number(prev.price || Infinity))) {
-          byVendor.set(vendorAuthId, next);
-        }
+          latitude: venueLocation.latitude,
+          longitude: venueLocation.longitude,
+          location: venueLocation.name,
+        });
       }
 
-      alternatives = Array.from(byVendor.values())
-        .filter((a) => a && a.vendorAuthId)
+      alternatives = rows
+        .filter((a) => a && a.vendorAuthId && a.serviceId)
         .sort((a, b) => (Number(a.price || 0) - Number(b.price || 0)))
         .slice(0, limit);
     } else {
@@ -384,6 +394,21 @@ const listAlternativesForService = async (req, res) => {
 
     // Fallback: if vendors haven't created services yet, search vendor profiles directly
     if (alternatives.length === 0) {
+      // Venue alternatives must be selected from concrete venue services (each with its own location).
+      // Never fall back to vendor profiles for Venue.
+      if (isVenue) {
+        return res.status(200).json({
+          success: true,
+          data: {
+            eventId: String(eventId || '').trim(),
+            service,
+            day,
+            alternatives: [],
+            vendorProfiles: [],
+          },
+        });
+      }
+
       let vendorApps = await searchPublicVendors({
         serviceCategory: service,
         latitude: hasGeo ? lat : undefined,
@@ -679,6 +704,17 @@ const acceptVendorRequest = async (req, res) => {
           message: err?.message,
         });
       }
+atusUpdated = true;
+      nextPlanningStatus = PLANNING_STATUS.APPROVED;
+
+      try {
+        await planningQuoteService.lockQuoteAtApproved({ eventId, lockedByAuthId: vendorAuthId });
+      } catch (err) {
+        logger.warn('Failed to lock quote after vendors accepted', {
+          eventId,
+          message: err?.message,
+        });
+      }
     }
 
     return res.status(200).json({
@@ -817,7 +853,8 @@ const rejectVendorRequest = async (req, res) => {
             skip: 0,
           });
 
-          if (hasGeo && (!Array.isArray(services) || services.length === 0)) {
+          // For Venue alternatives, do not drop geo constraints, otherwise we can suggest venues in other cities.
+          if (!isVenue && hasGeo && (!Array.isArray(services) || services.length === 0)) {
             logger.info('No vendor services found with geo filter for rejection auto-send; retrying without geo', {
               eventId,
               service: serviceLabel,
@@ -834,13 +871,22 @@ const rejectVendorRequest = async (req, res) => {
 
           const buildAlternatives = () => {
             if (isVenue) {
-              const byVendor = new Map();
+              const rows = [];
               for (const svc of services) {
                 const nextVendorAuthId = String(svc?.authId || '').trim();
                 if (!nextVendorAuthId) continue;
                 if (reservedSet.has(nextVendorAuthId)) continue;
 
-                const next = {
+                const venueLocation = computeVenueLocationFromService(svc);
+                if (!venueLocation) continue;
+
+                const distanceKm = hasGeo
+                  ? haversineKm({ lat1: lat, lon1: lng, lat2: venueLocation.latitude, lon2: venueLocation.longitude })
+                  : null;
+
+                if (hasGeo && radiusKm && Number.isFinite(distanceKm) && distanceKm > radiusKm) continue;
+
+                rows.push({
                   vendorAuthId: nextVendorAuthId,
                   serviceId: svc?._id || null,
                   businessName: svc?.businessName || null,
@@ -849,18 +895,14 @@ const rejectVendorRequest = async (req, res) => {
                   tier: svc?.tier || null,
                   price: Number(svc?.price || 0),
                   description: svc?.description || null,
-                  latitude: typeof svc?.latitude === 'number' ? svc.latitude : null,
-                  longitude: typeof svc?.longitude === 'number' ? svc.longitude : null,
-                };
-
-                const prev = byVendor.get(nextVendorAuthId);
-                if (!prev || (Number.isFinite(next.price) && next.price > 0 && next.price < Number(prev.price || Infinity))) {
-                  byVendor.set(nextVendorAuthId, next);
-                }
+                  latitude: venueLocation.latitude,
+                  longitude: venueLocation.longitude,
+                  location: venueLocation.name,
+                });
               }
 
-              return Array.from(byVendor.values())
-                .filter((a) => a && a.vendorAuthId)
+              return rows
+                .filter((a) => a && a.vendorAuthId && a.serviceId)
                 .sort((a, b) => (Number(a.price || 0) - Number(b.price || 0)))
                 .slice(0, limit);
             }
@@ -934,6 +976,16 @@ const rejectVendorRequest = async (req, res) => {
 
           let vendorProfiles = [];
           if (alternatives.length === 0) {
+            if (isVenue) {
+              logger.info('No Venue alternatives available to auto-send after rejection', {
+                eventId,
+                service: serviceLabel,
+                hasGeo,
+                radiusKm: radiusKm || null,
+              });
+              continue;
+            }
+
             let vendorApps = await searchPublicVendors({
               serviceCategory: serviceLabel,
               latitude: hasGeo ? lat : undefined,
@@ -1013,6 +1065,7 @@ const rejectVendorRequest = async (req, res) => {
               return {
                 vendorAuthId: optVendorAuthId || null,
                 serviceId: a?.serviceId || null,
+                name: a?.name || null,
                 businessName: a?.businessName || profile?.businessName || 'Vendor',
                 tier: a?.tier || null,
                 price: Number(a?.price || 0) || null,
@@ -1020,7 +1073,7 @@ const rejectVendorRequest = async (req, res) => {
                 priceMax: derivedPriceMax,
                 services: Array.isArray(a?.services) ? a.services : [],
                 serviceCategory: a?.serviceCategory || profile?.serviceCategory || null,
-                location: profile?.location || profile?.place || null,
+                location: a?.location || profile?.location || profile?.place || null,
                 country: profile?.country || null,
                 description: profile?.description || a?.description || null,
                 distanceKm,

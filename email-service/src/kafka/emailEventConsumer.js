@@ -330,6 +330,7 @@ const handleVendorRequestRejectedAlternatives = async (event) => {
   const safeLocation = planning?.location?.name || planning?.location?.location || null;
 
   const topOptions = opts.slice(0, 8).map((o) => ({
+    name: o?.name || null,
     businessName: o?.businessName || 'Vendor',
     tier: o?.tier || null,
     serviceCategory: o?.serviceCategory || service,

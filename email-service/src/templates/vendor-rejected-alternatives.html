@@ -50,7 +50,7 @@
           <tbody>
             {{#each options}}
               <tr>
-                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #111827; font-weight: bold;">{{businessName}}</td>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #111827; font-weight: bold;">{{#if name}}{{name}}{{else}}{{businessName}}{{/if}}</td>
                 <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{#if tier}}{{tier}}{{else}}—{{/if}}</td>
                 <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{priceRange}}</td>
                 <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{#if location}}{{location}}{{else}}—{{/if}}{{#if country}}, {{country}}{{/if}}</td>
