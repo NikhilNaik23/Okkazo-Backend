@@ -486,7 +486,8 @@ const decidePromote = async (req, res) => {
  */
 const getUnavailableManagers = async (req, res) => {
   try {
-    const managerIds = await promoteService.getUnavailableManagerIds();
+    const eventId = String(req.query?.eventId || '').trim() || null;
+    const managerIds = await promoteService.getUnavailableManagerIds({ eventId });
     return res.status(200).json({ success: true, data: { managerIds } });
   } catch (error) {
     logger.error('Error in getUnavailableManagers:', error);

@@ -25,6 +25,49 @@ const isAssignedRoleEligible = (assignedRole) => {
   return role.includes('junior') || role.includes('senior');
 };
 
+const toDateOrNull = (value) => {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+const normalizeRange = (range) => {
+  const start = toDateOrNull(range?.start);
+  const end = toDateOrNull(range?.end) || start;
+  if (!start || !end) return null;
+  if (end < start) return { start, end: start };
+  return { start, end };
+};
+
+const rangesOverlap = (a, b) => {
+  const ra = normalizeRange(a);
+  const rb = normalizeRange(b);
+
+  // If either side is malformed/missing schedule, keep conservative behavior and block.
+  if (!ra || !rb) return true;
+  return ra.start <= rb.end && rb.start <= ra.end;
+};
+
+const planningToRange = (planning) => {
+  const category = String(planning?.category || '').trim().toLowerCase();
+  if (category === 'public') {
+    return {
+      start: planning?.schedule?.startAt,
+      end: planning?.schedule?.endAt,
+    };
+  }
+
+  return {
+    start: planning?.eventDate,
+    end: planning?.eventDate,
+  };
+};
+
+const promoteToRange = (promote) => ({
+  start: promote?.schedule?.startAt,
+  end: promote?.schedule?.endAt,
+});
+
 const assertManagerEligibleForPlanning = async ({ managerId, planningCategory } = {}) => {
   const user = await fetchUserById(managerId);
   if (!user) throw createApiError(404, 'Manager not found in user-service');
@@ -52,14 +95,28 @@ const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdTo
     throw createApiError(400, 'assignedManagerId is required');
   }
 
-  const existingPromote = await Promote.findOne({
+  let targetRange = null;
+  if (planningEventIdToExclude) {
+    const targetPlanning = await Planning.findOne({ eventId: String(planningEventIdToExclude).trim() })
+      .select('category schedule eventDate')
+      .lean();
+    targetRange = targetPlanning ? planningToRange(targetPlanning) : null;
+  }
+
+  const existingPromotes = await Promote.find({
     assignedManagerId: String(managerId).trim(),
     eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
     'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
   })
-    .select('eventId')
+    .select('eventId schedule')
     .lean();
-  if (existingPromote) throw createApiError(409, 'Manager is already assigned to another event');
+
+  if (!targetRange) {
+    if ((existingPromotes || []).length > 0) throw createApiError(409, 'Manager is already assigned to another event');
+  } else {
+    const hasPromoteConflict = (existingPromotes || []).some((row) => rangesOverlap(targetRange, promoteToRange(row)));
+    if (hasPromoteConflict) throw createApiError(409, 'Manager is already assigned to another event for overlapping dates');
+  }
 
   const planningQuery = {
     assignedManagerId: String(managerId).trim(),
@@ -69,8 +126,16 @@ const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdTo
     planningQuery.eventId = { $ne: String(planningEventIdToExclude).trim() };
   }
 
-  const existingPlanning = await Planning.findOne(planningQuery).select('eventId').lean();
-  if (existingPlanning) throw createApiError(409, 'Manager is already assigned to another event');
+  const existingPlannings = await Planning.find(planningQuery)
+    .select('eventId category schedule eventDate')
+    .lean();
+
+  if (!targetRange) {
+    if ((existingPlannings || []).length > 0) throw createApiError(409, 'Manager is already assigned to another event');
+  } else {
+    const hasPlanningConflict = (existingPlannings || []).some((row) => rangesOverlap(targetRange, planningToRange(row)));
+    if (hasPlanningConflict) throw createApiError(409, 'Manager is already assigned to another event for overlapping dates');
+  }
 };
 
 const normalizePlanningForApi = (planning, platformFeeFallback) => {

@@ -1,5 +1,5 @@
 const logger = require('../utils/logger');
-const ApiError = require('../utils/ApiError');
+const createApiError = require('../utils/ApiError');
 
 /**
  * Middleware to authorize based on user roles
@@ -8,7 +8,7 @@ const authorizeRoles = (allowedRoles) => {
   return (req, res, next) => {
     try {
       if (!req.user) {
-        throw new ApiError(401, 'Authentication required');
+        throw createApiError(401, 'Authentication required');
       }
 
       const userRole = req.user.role;
@@ -20,7 +20,7 @@ const authorizeRoles = (allowedRoles) => {
           allowedRoles,
         });
 
-        throw new ApiError(
+        throw createApiError(
           403,
           'Access denied. Insufficient permissions.'
         );
@@ -62,7 +62,7 @@ const isOwner = (resourceAuthIdParam = 'authId') => {
   return (req, res, next) => {
     try {
       if (!req.user) {
-        throw new ApiError(401, 'Authentication required');
+        throw createApiError(401, 'Authentication required');
       }
 
       const requestedAuthId = req.params[resourceAuthIdParam];
@@ -75,7 +75,7 @@ const isOwner = (resourceAuthIdParam = 'authId') => {
 
       // Check ownership
       if (requestedAuthId !== userAuthId) {
-        throw new ApiError(403, 'Access denied. You can only access your own resources.');
+        throw createApiError(403, 'Access denied. You can only access your own resources.');
       }
 
       next();

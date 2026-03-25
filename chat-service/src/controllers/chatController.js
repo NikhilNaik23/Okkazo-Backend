@@ -6,6 +6,97 @@ const Message = require('../models/Message');
 const { emitToConversation } = require('../socket');
 const { isCloudinaryEnabled, uploadLocalFileToCloudinary } = require('../services/cloudinaryService');
 
+const USER_SERVICE_BASE_URLS = (() => {
+  const explicit = String(process.env.USER_SERVICE_URL || '').trim().replace(/\/$/, '');
+  if (explicit) return [explicit];
+  return ['http://localhost:8082', 'http://user-service:8082'];
+})();
+
+const STAFF_ALLOWED_ROLES = new Set(['ADMIN', 'MANAGER']);
+
+const normalizeDepartmentLabel = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return 'CORE OPERATIONS';
+  if (raw === 'private event') return 'PRIVATE EVENT';
+  if (raw === 'public event') return 'PUBLIC EVENT';
+  if (raw === 'core operation' || raw === 'core operations') return 'CORE OPERATIONS';
+  return 'CORE OPERATIONS';
+};
+
+const assertStaffRole = (req) => {
+  const role = String(req.user?.role || '').trim().toUpperCase();
+  if (!STAFF_ALLOWED_ROLES.has(role)) {
+    throw new ApiError(403, 'Only admin and manager users can access staff chat');
+  }
+  return role;
+};
+
+const buildUserHeaders = (req) => ({
+  'Content-Type': 'application/json',
+  'x-auth-id': String(req.user?.authId || ''),
+  'x-user-id': String(req.user?.userId || ''),
+  'x-user-email': String(req.user?.email || ''),
+  'x-user-username': String(req.user?.username || ''),
+  'x-user-role': String(req.user?.role || ''),
+});
+
+const fetchJson = async (url, options = {}) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new ApiError(res.status, json?.message || `Failed upstream request: ${url}`);
+    }
+    return json;
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new ApiError(504, 'Upstream user-service request timed out');
+    }
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(502, error?.message || 'Unable to reach user-service');
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const fetchUserServiceJson = async (path, options = {}) => {
+  let lastError = null;
+
+  for (const baseUrl of USER_SERVICE_BASE_URLS) {
+    try {
+      return await fetchJson(`${baseUrl}${path}`, options);
+    } catch (error) {
+      lastError = error;
+      // Retry next base URL only for upstream connectivity/timeouts.
+      const isUpstreamConnectivityIssue =
+        error instanceof ApiError && (error.statusCode === 502 || error.statusCode === 504);
+      if (!isUpstreamConnectivityIssue) throw error;
+    }
+  }
+
+  throw lastError || new ApiError(502, 'Unable to reach user-service');
+};
+
+const fetchUsersByRole = async (req, role) => {
+  const qs = new URLSearchParams({ role, page: '1', limit: '100' });
+  const json = await fetchUserServiceJson(`/?${qs.toString()}`, {
+    method: 'GET',
+    headers: buildUserHeaders(req),
+  });
+  return Array.isArray(json?.data) ? json.data : [];
+};
+
+const fetchUserByAuthId = async (req, authId) => {
+  const json = await fetchUserServiceJson(`/auth/${encodeURIComponent(String(authId))}`, {
+    method: 'GET',
+    headers: buildUserHeaders(req),
+  });
+  return json?.data || null;
+};
+
 const ensureConversationForEvent = async (req, res) => {
   const eventId = String(req.params.eventId || '').trim();
   if (!eventId) throw new ApiError(400, 'eventId is required');
@@ -49,6 +140,115 @@ const ensureDmConversationForEvent = async (req, res) => {
     { eventId, kind },
     {
       $setOnInsert: { eventId, kind },
+      $addToSet: { participants: { $each: [meParticipant, otherParticipant] } },
+    },
+    { new: true, upsert: true }
+  ).lean();
+
+  return res.status(200).json({ success: true, data: convo });
+};
+
+const listStaffContacts = async (req, res) => {
+  assertStaffRole(req);
+
+  const meAuthId = String(req.user?.authId || '').trim();
+  if (!meAuthId) throw new ApiError(401, 'Authentication required');
+
+  const [managerUsers, adminUsers] = await Promise.all([
+    fetchUsersByRole(req, 'MANAGER'),
+    fetchUsersByRole(req, 'ADMIN'),
+  ]);
+
+  const managerGroups = new Map([
+    ['PRIVATE EVENT', []],
+    ['PUBLIC EVENT', []],
+    ['CORE OPERATIONS', []],
+  ]);
+
+  for (const user of managerUsers) {
+    const authId = String(user?.authId || '').trim();
+    if (!authId || authId === meAuthId) continue;
+
+    const departmentLabel = normalizeDepartmentLabel(user?.department);
+    const group = managerGroups.get(departmentLabel) || managerGroups.get('CORE OPERATIONS');
+
+    group.push({
+      authId,
+      name: String(user?.name || user?.fullName || user?.email || 'Manager').trim(),
+      role: 'MANAGER',
+      department: departmentLabel,
+      assignedRole: String(user?.assignedRole || '').trim(),
+      email: String(user?.email || '').trim(),
+    });
+  }
+
+  const administration = [];
+  for (const user of adminUsers) {
+    const authId = String(user?.authId || '').trim();
+    if (!authId || authId === meAuthId) continue;
+    administration.push({
+      authId,
+      name: String(user?.name || user?.fullName || user?.email || 'Administrator').trim(),
+      role: 'ADMIN',
+      department: 'ADMINISTRATION',
+      assignedRole: 'ADMIN',
+      email: String(user?.email || '').trim(),
+    });
+  }
+
+  const groups = [
+    {
+      key: 'PRIVATE_EVENT',
+      label: 'PRIVATE EVENT',
+      contacts: managerGroups.get('PRIVATE EVENT') || [],
+    },
+    {
+      key: 'PUBLIC_EVENT',
+      label: 'PUBLIC EVENT',
+      contacts: managerGroups.get('PUBLIC EVENT') || [],
+    },
+    {
+      key: 'CORE_OPERATIONS',
+      label: 'CORE OPERATIONS',
+      contacts: managerGroups.get('CORE OPERATIONS') || [],
+    },
+    {
+      key: 'ADMINISTRATION',
+      label: 'ADMINISTRATION',
+      contacts: administration,
+    },
+  ];
+
+  return res.status(200).json({ success: true, data: { groups } });
+};
+
+const ensureStaffDmConversation = async (req, res) => {
+  assertStaffRole(req);
+
+  const meAuthId = String(req.user?.authId || '').trim();
+  const meRole = String(req.user?.role || '').trim().toUpperCase();
+  if (!meAuthId) throw new ApiError(401, 'Authentication required');
+
+  const otherAuthId = String(req.params.otherAuthId || '').trim();
+  if (!otherAuthId) throw new ApiError(400, 'otherAuthId is required');
+  if (otherAuthId === meAuthId) throw new ApiError(400, 'Cannot create DM with self');
+
+  const otherUser = await fetchUserByAuthId(req, otherAuthId);
+  const otherRole = String(otherUser?.role || '').trim().toUpperCase();
+  if (!STAFF_ALLOWED_ROLES.has(otherRole)) {
+    throw new ApiError(403, 'Staff chat supports only admin and manager users');
+  }
+
+  const pairKey = [meAuthId, otherAuthId].sort().join(':');
+  const kind = `STAFF_DM:${pairKey}`;
+
+  const meParticipant = { authId: meAuthId, role: meRole };
+  const otherParticipant = { authId: otherAuthId, role: otherRole };
+
+  const convo = await Conversation.findOneAndUpdate(
+    { eventId: 'STAFF_DM', kind },
+    {
+      $setOnInsert: { eventId: 'STAFF_DM', kind },
       $addToSet: { participants: { $each: [meParticipant, otherParticipant] } },
     },
     { new: true, upsert: true }
@@ -174,6 +374,8 @@ const markConversationRead = async (req, res) => {
 module.exports = {
   ensureConversationForEvent,
   ensureDmConversationForEvent,
+  listStaffContacts,
+  ensureStaffDmConversation,
   listMessages,
   sendMessage,
   markConversationRead,

@@ -29,6 +29,75 @@ const isAssignedRoleEligible = (assignedRole) => {
   return role.includes('junior') || role.includes('senior');
 };
 
+const toDateOrNull = (value) => {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+const normalizeRange = (range) => {
+  const start = toDateOrNull(range?.start);
+  const end = toDateOrNull(range?.end) || start;
+  if (!start || !end) return null;
+  if (end < start) return { start, end: start };
+  return { start, end };
+};
+
+const rangesOverlap = (a, b) => {
+  const ra = normalizeRange(a);
+  const rb = normalizeRange(b);
+
+  // If either side is malformed/missing schedule, keep conservative behavior and block.
+  if (!ra || !rb) return true;
+  return ra.start <= rb.end && rb.start <= ra.end;
+};
+
+const promoteToRange = (promote) => ({
+  start: promote?.schedule?.startAt,
+  end: promote?.schedule?.endAt,
+});
+
+let immediateAutoAssignCursor = 0;
+
+const rotateListFromCursor = (ids = []) => {
+  const list = Array.isArray(ids) ? ids : [];
+  if (list.length <= 1) return list;
+
+  const start = Math.max(0, Number(immediateAutoAssignCursor || 0)) % list.length;
+  immediateAutoAssignCursor = (start + 1) % list.length;
+
+  return [...list.slice(start), ...list.slice(0, start)];
+};
+
+const getEventRangeByEventId = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return null;
+
+  const [promote, planning] = await Promise.all([
+    Promote.findOne({ eventId: normalizedEventId }).select('eventId schedule').lean(),
+    Planning.findOne({ eventId: normalizedEventId }).select('eventId category schedule eventDate').lean(),
+  ]);
+
+  if (promote) return promoteToRange(promote);
+  if (planning) return planningToRange(planning);
+  return null;
+};
+
+const planningToRange = (planning) => {
+  const category = String(planning?.category || '').trim().toLowerCase();
+  if (category === 'public') {
+    return {
+      start: planning?.schedule?.startAt,
+      end: planning?.schedule?.endAt,
+    };
+  }
+
+  return {
+    start: planning?.eventDate,
+    end: planning?.eventDate,
+  };
+};
+
 const autoAssignManagerImmediately = async (promote, { decidedByAuthId = null } = {}) => {
   if (!promote?.eventId) return { assigned: false, managerId: null };
   if (promote.assignedManagerId) return { assigned: false, managerId: String(promote.assignedManagerId) };
@@ -54,7 +123,9 @@ const autoAssignManagerImmediately = async (promote, { decidedByAuthId = null } 
     )
   ).sort();
 
-  for (const managerId of candidateIds) {
+  const candidateOrder = rotateListFromCursor(candidateIds);
+
+  for (const managerId of candidateOrder) {
     try {
       const result = await tryAutoAssignManager(promote.eventId, managerId, {
         assignedByAuthId: decidedByAuthId || 'system:autoassign',
@@ -94,6 +165,14 @@ const assertManagerAvailable = async ({ managerId, eventIdToExclude } = {}) => {
   const normalizedManagerId = normalizeId(managerId);
   if (!normalizedManagerId) throw createApiError(400, 'managerId is required');
 
+  let targetRange = null;
+  if (eventIdToExclude) {
+    const targetPromote = await Promote.findOne({ eventId: String(eventIdToExclude).trim() })
+      .select('schedule')
+      .lean();
+    targetRange = targetPromote ? promoteToRange(targetPromote) : null;
+  }
+
   const activeAssignmentQuery = {
     assignedManagerId: normalizedManagerId,
     eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
@@ -103,20 +182,37 @@ const assertManagerAvailable = async ({ managerId, eventIdToExclude } = {}) => {
     activeAssignmentQuery.eventId = { $ne: String(eventIdToExclude).trim() };
   }
 
-  const existing = await Promote.findOne(activeAssignmentQuery).select('eventId').lean();
-  if (existing) {
-    throw createApiError(409, 'Manager is already assigned to another event');
+  const existingPromotes = await Promote.find(activeAssignmentQuery)
+    .select('eventId schedule')
+    .lean();
+
+  if (!targetRange) {
+    if ((existingPromotes || []).length > 0) {
+      throw createApiError(409, 'Manager is already assigned to another event');
+    }
+  } else {
+    const hasPromoteConflict = (existingPromotes || []).some((row) => rangesOverlap(targetRange, promoteToRange(row)));
+    if (hasPromoteConflict) {
+      throw createApiError(409, 'Manager is already assigned to another event for overlapping dates');
+    }
   }
 
-  const existingPlanning = await Planning.findOne({
+  const existingPlannings = await Planning.find({
     assignedManagerId: normalizedManagerId,
     status: { $nin: [PLANNING_STATUS.COMPLETED, PLANNING_STATUS.REJECTED] },
   })
-    .select('eventId')
+    .select('eventId category schedule eventDate')
     .lean();
 
-  if (existingPlanning) {
-    throw createApiError(409, 'Manager is already assigned to another event');
+  if (!targetRange) {
+    if ((existingPlannings || []).length > 0) {
+      throw createApiError(409, 'Manager is already assigned to another event');
+    }
+  } else {
+    const hasPlanningConflict = (existingPlannings || []).some((row) => rangesOverlap(targetRange, planningToRange(row)));
+    if (hasPlanningConflict) {
+      throw createApiError(409, 'Manager is already assigned to another event for overlapping dates');
+    }
   }
 };
 
@@ -670,24 +766,49 @@ const decidePromote = async (
   return promote;
 };
 
-const getUnavailableManagerIds = async () => {
-  const [promoteIds, planningIds] = await Promise.all([
-    Promote.distinct('assignedManagerId', {
+const getUnavailableManagerIds = async ({ eventId = null } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+
+  const [existingPromotes, existingPlannings, targetRange] = await Promise.all([
+    Promote.find({
       assignedManagerId: { $ne: null },
       eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
-    }),
-    Planning.distinct('assignedManagerId', {
+      ...(normalizedEventId ? { eventId: { $ne: normalizedEventId } } : {}),
+    })
+      .select('assignedManagerId schedule')
+      .lean(),
+    Planning.find({
       assignedManagerId: { $ne: null },
       status: { $nin: [PLANNING_STATUS.COMPLETED, PLANNING_STATUS.REJECTED] },
-    }),
+      ...(normalizedEventId ? { eventId: { $ne: normalizedEventId } } : {}),
+    })
+      .select('assignedManagerId category schedule eventDate')
+      .lean(),
+    normalizedEventId ? getEventRangeByEventId(normalizedEventId) : null,
   ]);
 
-  const merged = [...(promoteIds || []), ...(planningIds || [])]
-    .filter(Boolean)
-    .map((id) => String(id));
+  const unavailable = new Set();
 
-  return Array.from(new Set(merged));
+  for (const row of existingPromotes || []) {
+    const managerId = normalizeId(row?.assignedManagerId);
+    if (!managerId) continue;
+
+    if (!targetRange || rangesOverlap(targetRange, promoteToRange(row))) {
+      unavailable.add(managerId);
+    }
+  }
+
+  for (const row of existingPlannings || []) {
+    const managerId = normalizeId(row?.assignedManagerId);
+    if (!managerId) continue;
+
+    if (!targetRange || rangesOverlap(targetRange, planningToRange(row))) {
+      unavailable.add(managerId);
+    }
+  }
+
+  return Array.from(unavailable);
 };
 
 const getAdminDashboard = async ({ limit = 200 } = {}) => {

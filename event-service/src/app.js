@@ -22,6 +22,7 @@ const vendorSelectionRoutes = require('./routes/vendorSelectionRoutes');
 const configRoutes = require('./routes/configRoutes');
 const staffRoutes = require('./routes/staffRoutes');
 const commissionRoutes = require('./routes/commissionRoutes');
+const ticketMarketplaceRoutes = require('./routes/ticketMarketplaceRoutes');
 
 // Initialize Express app
 const app = express();
@@ -53,6 +54,7 @@ app.use('/', vendorSelectionRoutes);
 app.use('/', configRoutes);
 app.use('/', staffRoutes);
 app.use('/', commissionRoutes);
+app.use('/', ticketMarketplaceRoutes);
 
 // 404 handler
 app.use(notFound);

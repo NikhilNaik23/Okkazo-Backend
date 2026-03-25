@@ -300,8 +300,8 @@ const createOrder = async (payload, user) => {
       throw err;
     }
 
-    const vendorMinPaise = Number(quote?.vendorSubtotal?.minPaise ?? 0);
-    if (!Number.isFinite(vendorMinPaise) || vendorMinPaise <= 0) {
+    const clientGrandTotalMinPaise = Number(quote?.clientGrandTotal?.minPaise ?? 0);
+    if (!Number.isFinite(clientGrandTotalMinPaise) || clientGrandTotalMinPaise <= 0) {
       throw createApiError(409, 'Cannot compute vendor confirmation amount without a locked quote');
     }
 
@@ -310,7 +310,9 @@ const createOrder = async (payload, user) => {
       throw createApiError(409, 'Deposit amount is invalid for this event');
     }
 
-    const confirmationDuePaise = Math.max(0, Math.round((vendorMinPaise * 25) / 100) - depositPaidAmountPaise);
+    // Business rule: vendor confirmation = 25% of (client total min - already paid deposit).
+    const payableBasePaise = Math.max(0, clientGrandTotalMinPaise - depositPaidAmountPaise);
+    const confirmationDuePaise = Math.max(0, Math.round((payableBasePaise * 25) / 100));
     if (!Number.isFinite(confirmationDuePaise) || confirmationDuePaise <= 0) {
       throw createApiError(409, 'No vendor confirmation amount is due for this event');
     }
@@ -396,7 +398,7 @@ const createOrder = async (payload, user) => {
           : {}),
         ...(orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE'
           ? {
-              computedFrom: 'planning-quote.vendorSubtotal.minPaise',
+              computedFrom: 'planning-quote.clientGrandTotal.minPaise',
               vendorConfirmationPercent: 25,
               depositPaidAmountPaise: upstreamRecord.depositPaidAmountPaise,
             }
