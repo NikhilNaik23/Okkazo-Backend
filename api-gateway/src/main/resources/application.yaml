@@ -152,12 +152,19 @@ spring:
                   args:
                     roles: USER,VENDOR,ADMIN,MANAGER
 
+            # Chat Socket.IO WebSocket/long-polling upgrade route
+            # Auth is validated by chat-service during socket handshake (auth.token).
+            - id: chat-service-socket
+              uri: lb:ws://chat-service
+              predicates:
+                - Path=/socket.io/**
+
           globalcors:
             cors-configurations:
               '[/**]':
                 allowedOrigins:
-                  - "http://localhost:3000"
-                  - "http://localhost:5173"
+                  - ${FRONTEND_URL:http://localhost:5173}
+                  - ${FRONTEND_URL_FALLBACK:http://localhost:3000}
                 allowedMethods:
                   - GET
                   - POST

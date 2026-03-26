@@ -1,9 +1,9 @@
 package com.okkazo.authservice.services;
 
 import com.okkazo.authservice.dtos.CheckEmailExistsResponseDto;
+import com.okkazo.authservice.dtos.GoogleLoginRequestDto;
 import com.okkazo.authservice.dtos.LoginRequestDto;
 import com.okkazo.authservice.dtos.LoginResponseDto;
-import com.okkazo.authservice.dtos.CheckEmailExistsResponseDto;
 import com.okkazo.authservice.dtos.PromoteUserRequestDto;
 import com.okkazo.authservice.dtos.PromoteUserResponseDto;
 import com.okkazo.authservice.dtos.RegisterRequestDto;
@@ -11,6 +11,7 @@ import com.okkazo.authservice.dtos.RegisterResponseDto;
 import com.okkazo.authservice.exceptions.*;
 import com.okkazo.authservice.kafka.AuthEventProducer;
 import com.okkazo.authservice.models.Auth;
+import com.okkazo.authservice.models.AuthProvider;
 import com.okkazo.authservice.models.EmailVerificationToken;
 import com.okkazo.authservice.models.RefreshToken;
 import com.okkazo.authservice.models.Role;
@@ -18,14 +19,20 @@ import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
 import com.okkazo.authservice.repositories.EmailVerificationTokenRepository;
 import com.okkazo.authservice.utils.JwtUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.modelmapper.ModelMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -35,18 +42,23 @@ import java.util.UUID;
 public class AuthService {
     private final AuthRepository repository;
     private final PasswordEncoder passwordEncoder;
-    private final ModelMapper modelMapper;
     private final AuthEventProducer authEvent;
     private final EmailVerificationTokenRepository emailVerificationTokenRepository;
     private final JwtUtil jwtUtil;
     private final RefreshTokenService refreshTokenService;
+        private final ObjectMapper objectMapper;
+        private final HttpClient httpClient = HttpClient.newHttpClient();
     
     @Value("${admin.promote-key}")
     private String adminPromoteKey;
 
+        @Value("${google.oauth.user-info-url:https://openidconnect.googleapis.com/v1/userinfo}")
+        private String googleUserInfoUrl;
+
     @Transactional
     public RegisterResponseDto register(RegisterRequestDto requestDto){
-        Auth existingUser = repository.findByEmail(requestDto.email()).orElse(null);
+                String normalizedEmail = normalizeEmail(requestDto.email());
+                Auth existingUser = repository.findByEmailIgnoreCase(normalizedEmail).orElse(null);
 
         if (existingUser != null) {
 
@@ -78,11 +90,12 @@ public class AuthService {
 
         Auth user = new Auth();
         user.setUsername(requestDto.username());
-        user.setEmail(requestDto.email());
+        user.setEmail(normalizedEmail);
         user.setHashedPassword(passwordEncoder.encode(requestDto.password()));
         user.setIsVerified(false);
         user.setStatus(Status.UNVERIFIED);
         user.setRole(Role.USER);
+        user.setAuthProvider(AuthProvider.EMAIL);
 
         repository.save(user);
 
@@ -126,7 +139,7 @@ public class AuthService {
 
     @Transactional
     public LoginResponseDto login(LoginRequestDto requestDto) {
-        Auth user = repository.findByEmail(requestDto.email())
+                Auth user = repository.findByEmailIgnoreCase(normalizeEmail(requestDto.email()))
                 .orElseThrow(() -> new InvalidCredentialsException("Invalid email or password"));
 
         if (user.getStatus() == Status.BLOCKED) {
@@ -147,9 +160,74 @@ public class AuthService {
             }
         }
 
-        if (!passwordEncoder.matches(requestDto.password(), user.getHashedPassword())) {
+                if (user.getAuthProvider() == AuthProvider.SIGN_IN_WITH_GOOGLE) {
+                        throw new InvalidCredentialsException("This account is linked to Google. Please sign in with Google.");
+                }
+
+                if (!passwordEncoder.matches(requestDto.password(), user.getHashedPassword())) {
             throw new InvalidCredentialsException("Invalid email or password");
         }
+
+                return issueLoginResponse(user);
+        }
+
+        @Transactional
+        public LoginResponseDto loginWithGoogle(GoogleLoginRequestDto requestDto) {
+                JsonNode userInfo = fetchGoogleUserInfo(requestDto.accessToken());
+                String email = normalizeEmail(userInfo.path("email").asText(""));
+                String name = userInfo.path("name").asText("");
+                boolean verified = userInfo.path("email_verified").asBoolean(false);
+
+                if (email.isBlank() || !verified) {
+                        throw new InvalidCredentialsException("Google account email is missing or not verified");
+                }
+
+                Auth user = repository.findByEmailIgnoreCase(email).orElse(null);
+
+                if (user != null) {
+                        if (user.getStatus() == Status.BLOCKED) {
+                                throw new AccountBlockedException("Your account has been blocked. Please contact support.");
+                        }
+
+                        AuthProvider currentProvider = user.getAuthProvider() == null
+                                        ? AuthProvider.EMAIL
+                                        : user.getAuthProvider();
+                        if (currentProvider == AuthProvider.EMAIL) {
+                                user.setAuthProvider(AuthProvider.BOTH);
+                        } else if (currentProvider == AuthProvider.SIGN_IN_WITH_GOOGLE) {
+                                user.setAuthProvider(AuthProvider.SIGN_IN_WITH_GOOGLE);
+                        } else {
+                                user.setAuthProvider(AuthProvider.BOTH);
+                        }
+
+                        if (!Boolean.TRUE.equals(user.getIsVerified())) {
+                                user.setIsVerified(true);
+                        }
+                        if (user.getStatus() == Status.UNVERIFIED) {
+                                user.setStatus(Status.ACTIVE);
+                        }
+
+                        repository.save(user);
+                        return issueLoginResponse(user);
+                }
+
+                Auth newUser = new Auth();
+                newUser.setUsername(generateUsernameFromGoogle(name, email));
+                newUser.setEmail(email);
+                newUser.setHashedPassword(passwordEncoder.encode(UUID.randomUUID().toString()));
+                newUser.setIsVerified(true);
+                newUser.setStatus(Status.ACTIVE);
+                newUser.setRole(Role.USER);
+                newUser.setAuthProvider(AuthProvider.SIGN_IN_WITH_GOOGLE);
+
+                repository.save(newUser);
+                authEvent.userGoogleRegistered(newUser.getAuthId(), newUser.getEmail(), newUser.getUsername());
+
+                log.info("User signed up via Google successfully: {}", newUser.getEmail());
+                return issueLoginResponse(newUser);
+        }
+
+        private LoginResponseDto issueLoginResponse(Auth user) {
 
         String accessToken = jwtUtil.generateAccessToken(
                 user.getAuthId(),
@@ -174,10 +252,52 @@ public class AuthService {
                 accessToken,
                 refreshTokenJwt,
                 user.getRole().name(),
+                user.getAuthProvider() == null ? AuthProvider.EMAIL.name() : user.getAuthProvider().name(),
                 "Login successful",
                 true
         );
     }
+
+        private JsonNode fetchGoogleUserInfo(String accessToken) {
+                try {
+                        HttpRequest request = HttpRequest.newBuilder()
+                                        .uri(URI.create(googleUserInfoUrl))
+                                        .header("Authorization", "Bearer " + accessToken)
+                                        .GET()
+                                        .build();
+
+                        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                                throw new InvalidCredentialsException("Invalid Google token");
+                        }
+
+                        return objectMapper.readTree(response.body());
+                } catch (InvalidCredentialsException ex) {
+                        throw ex;
+                } catch (Exception ex) {
+                        log.error("Failed to validate Google token", ex);
+                        throw new InvalidCredentialsException("Google sign-in failed");
+                }
+        }
+
+        private String generateUsernameFromGoogle(String name, String email) {
+                String preferred = (name == null || name.isBlank()) ? email.split("@")[0] : name;
+                String base = preferred.toLowerCase().replaceAll("[^a-z0-9_]", "_").replaceAll("_+", "_");
+                if (base.length() < 3) {
+                        base = "user_" + UUID.randomUUID().toString().substring(0, 8);
+                }
+                String candidate = base;
+                int suffix = 1;
+                while (repository.existsByUsername(candidate)) {
+                        candidate = base + "_" + suffix;
+                        suffix++;
+                }
+                return candidate;
+        }
+
+        private String normalizeEmail(String email) {
+                return email == null ? "" : email.trim().toLowerCase();
+        }
 
     @Transactional
     public PromoteUserResponseDto promoteUserToAdmin(PromoteUserRequestDto requestDto) {
@@ -237,7 +357,7 @@ public class AuthService {
     }
 
     public CheckEmailExistsResponseDto checkEmailExists(String email) {
-        return repository.findByEmail(email)
+        return repository.findByEmailIgnoreCase(normalizeEmail(email))
                 .map(user -> new CheckEmailExistsResponseDto(
                         true,
                         user.getRole().name(),

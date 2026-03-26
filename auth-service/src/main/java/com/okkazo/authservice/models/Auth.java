@@ -40,6 +40,10 @@ public class Auth {
     @Enumerated(EnumType.STRING)
     private Role role;
 
+    @Column(nullable = false, length = 30)
+    @Enumerated(EnumType.STRING)
+    private AuthProvider authProvider;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
@@ -52,6 +56,7 @@ public class Auth {
     public void prePersist(){
         if(status == null) status = Status.UNVERIFIED;
         if(role == null) role = Role.USER;
+        if(authProvider == null) authProvider = AuthProvider.EMAIL;
     }
 
 }

@@ -179,6 +179,23 @@
     .signoff-name { font-family: 'Playfair Display', serif; font-size: 17px; color: #111827; }
     .signoff-title { font-size: 11.5px; color: #9ca3af; font-weight: 500; letter-spacing: 0.04em; margin-top: 3px; }
 
+    .cta-wrap {
+      padding: 0 48px 24px;
+      text-align: center;
+    }
+    .cta-link {
+      display: inline-block;
+      text-decoration: none;
+      background: #111827;
+      color: #ffffff !important;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 12px 20px;
+      border-radius: 999px;
+    }
+
     /* Footer */
     .footer {
       background: #f9fafb;
@@ -306,8 +323,32 @@
             <td style="font-weight:700;color:#111827;">{{currencySymbol}}{{amountRupees}} {{currency}}</td>
           </tr>
           {{/if}}
+          {{#if ticketId}}
+          <tr>
+            <td>Ticket ID</td>
+            <td><span class="mono-id">{{ticketId}}</span></td>
+          </tr>
+          {{/if}}
+          {{#if ticketQuantity}}
+          <tr>
+            <td>Ticket Quantity</td>
+            <td>{{ticketQuantity}}</td>
+          </tr>
+          {{/if}}
+          {{#if ticketTierSummary}}
+          <tr>
+            <td>Ticket Tier(s)</td>
+            <td>{{ticketTierSummary}}</td>
+          </tr>
+          {{/if}}
         </table>
       </div>
+
+      {{#if ticketLink}}
+      <div class="cta-wrap">
+        <a class="cta-link" href="{{ticketLink}}">Open Ticket & QR</a>
+      </div>
+      {{/if}}
 
       <!-- ── Security Notice ── -->
       <div class="notice-wrap">

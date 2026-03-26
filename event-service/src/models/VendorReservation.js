@@ -8,6 +8,20 @@ const VendorReservationSchema = new mongoose.Schema(
       trim: true,
       index: true,
     },
+    // Original vendor owner (needed when reservation key is service-based).
+    ownerVendorAuthId: {
+      type: String,
+      default: null,
+      trim: true,
+      index: true,
+    },
+    // For Venue reservations we lock a concrete service (location), not the whole vendor.
+    serviceId: {
+      type: String,
+      default: null,
+      trim: true,
+      index: true,
+    },
     // YYYY-MM-DD
     day: {
       type: String,
@@ -34,6 +48,13 @@ const VendorReservationSchema = new mongoose.Schema(
       default: null,
       trim: true,
     },
+    // Null means sticky reservation (paid/accepted/confirmed flow).
+    // Non-null means temporary hold and will auto-expire.
+    expiresAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
   },
   {
     timestamps: true,
@@ -41,8 +62,10 @@ const VendorReservationSchema = new mongoose.Schema(
   }
 );
 
-// One vendor can only be reserved for one event per day.
+// Reservation uniqueness key (vendor-level for most services, service-level for Venue).
 VendorReservationSchema.index({ vendorAuthId: 1, day: 1 }, { unique: true });
+// Expire temporary holds automatically. Null values are ignored by TTL.
+VendorReservationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const VendorReservation = mongoose.model('VendorReservation', VendorReservationSchema);
 

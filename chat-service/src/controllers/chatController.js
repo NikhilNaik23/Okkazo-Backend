@@ -4,7 +4,7 @@ const ApiError = require('../utils/ApiError');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const { emitToConversation } = require('../socket');
-const { isCloudinaryEnabled, uploadLocalFileToCloudinary } = require('../services/cloudinaryService');
+const { isCloudinaryEnabled, uploadLocalFileToCloudinary, deleteCloudinaryAsset } = require('../services/cloudinaryService');
 
 const USER_SERVICE_BASE_URLS = (() => {
   const explicit = String(process.env.USER_SERVICE_URL || '').trim().replace(/\/$/, '');
@@ -304,6 +304,7 @@ const sendMessage = async (req, res) => {
 
         attachments.push({
           url: uploaded.url,
+          publicId: String(uploaded.publicId || ''),
           filename: f.originalname,
           mimetype: f.mimetype,
           size: f.size,
@@ -321,6 +322,7 @@ const sendMessage = async (req, res) => {
     } else {
       attachments.push({
         url: `/api/chat/uploads/${encodeURIComponent(f.filename)}`,
+        publicId: '',
         filename: f.originalname,
         mimetype: f.mimetype,
         size: f.size,
@@ -352,6 +354,93 @@ const sendMessage = async (req, res) => {
   return res.status(201).json({ success: true, data: payload });
 };
 
+const updateMessage = async (req, res) => {
+  const conversationId = String(req.params.conversationId || '').trim();
+  const messageId = String(req.params.messageId || '').trim();
+  if (!conversationId) throw new ApiError(400, 'conversationId is required');
+  if (!messageId) throw new ApiError(400, 'messageId is required');
+
+  const convo = await Conversation.findById(conversationId).lean();
+  if (!convo) throw new ApiError(404, 'Conversation not found');
+
+  const meAuthId = String(req.user?.authId || '').trim();
+  if (!meAuthId) throw new ApiError(401, 'Authentication required');
+
+  const meRole = String(req.user?.role || '').trim().toUpperCase();
+  const msg = await Message.findOne({ _id: messageId, conversationId });
+  if (!msg) throw new ApiError(404, 'Message not found');
+
+  const senderAuthId = String(msg?.senderAuthId || '').trim();
+  const canEdit = senderAuthId === meAuthId || meRole === 'ADMIN';
+  if (!canEdit) throw new ApiError(403, 'Not allowed to edit this message');
+
+  const text = String(req.body?.text || '').trim();
+  if (!text) throw new ApiError(400, 'Message text is required');
+
+  msg.text = text;
+  msg.editedAt = new Date();
+  await msg.save();
+
+  const payload = msg.toObject ? msg.toObject() : msg;
+  emitToConversation(conversationId, 'message:updated', payload);
+
+  return res.status(200).json({ success: true, data: payload });
+};
+
+const deleteMessage = async (req, res) => {
+  const conversationId = String(req.params.conversationId || '').trim();
+  const messageId = String(req.params.messageId || '').trim();
+  if (!conversationId) throw new ApiError(400, 'conversationId is required');
+  if (!messageId) throw new ApiError(400, 'messageId is required');
+
+  const convo = await Conversation.findById(conversationId).lean();
+  if (!convo) throw new ApiError(404, 'Conversation not found');
+
+  const meAuthId = String(req.user?.authId || '').trim();
+  if (!meAuthId) throw new ApiError(401, 'Authentication required');
+
+  const meRole = String(req.user?.role || '').trim().toUpperCase();
+
+  const msg = await Message.findOne({ _id: messageId, conversationId }).lean();
+  if (!msg) throw new ApiError(404, 'Message not found');
+
+  const senderAuthId = String(msg?.senderAuthId || '').trim();
+  const canDelete = senderAuthId === meAuthId || meRole === 'ADMIN';
+  if (!canDelete) throw new ApiError(403, 'Not allowed to delete this message');
+
+  const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
+
+  await Promise.allSettled(
+    attachments.map(async (attachment) => {
+      const url = String(attachment?.url || '').trim();
+      if (!url) return;
+
+      if (url.startsWith('http')) {
+        await deleteCloudinaryAsset({ publicId: attachment?.publicId, url });
+        return;
+      }
+
+      const prefix = '/api/chat/uploads/';
+      if (!url.startsWith(prefix)) return;
+
+      const filename = decodeURIComponent(url.slice(prefix.length));
+      const safeName = path.basename(filename);
+      if (!safeName) return;
+
+      try {
+        await fs.unlink(path.join(process.cwd(), 'uploads', safeName));
+      } catch {
+        // Ignore missing local files during cleanup
+      }
+    })
+  );
+
+  await Message.deleteOne({ _id: messageId, conversationId });
+
+  emitToConversation(conversationId, 'message:deleted', { conversationId, messageId });
+  return res.status(200).json({ success: true, data: { messageId } });
+};
+
 const markConversationRead = async (req, res) => {
   const conversationId = String(req.params.conversationId || '').trim();
   const convo = await Conversation.findById(conversationId).lean();
@@ -378,5 +467,7 @@ module.exports = {
   ensureStaffDmConversation,
   listMessages,
   sendMessage,
+  updateMessage,
+  deleteMessage,
   markConversationRead,
 };

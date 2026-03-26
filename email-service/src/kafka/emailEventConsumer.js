@@ -403,8 +403,25 @@ const fetchPromoteByEventIdForUser = async (eventId, user) => {
   return response.data?.data;
 };
 
+const fetchTicketByIdForUser = async (ticketId, user) => {
+  const response = await axios.get(`${eventServiceUrl}/tickets/my/${encodeURIComponent(ticketId)}`, {
+    timeout: httpTimeoutMs,
+    headers: {
+      'x-auth-id': user?.authId || '',
+      'x-user-id': user?._id?.toString?.() || user?.id || '',
+      'x-user-email': user?.email || '',
+      'x-user-username': user?.name || '',
+      'x-user-role': user?.role || 'USER',
+    },
+  });
+
+  return response.data?.data;
+};
+
 const handlePaymentSuccessEvent = async (payload) => {
   const { eventId, authId, razorpayPaymentId, transactionId, paidAt, amount, currency, orderType } = payload || {};
+  const normalizedOrderType = String(orderType || '').trim().toUpperCase();
+  const notes = payload?.notes || {};
 
   if (!eventId || !authId) {
     logger.error('PAYMENT_SUCCESS event missing required fields', { eventId, authId });
@@ -432,8 +449,12 @@ const handlePaymentSuccessEvent = async (payload) => {
   let eventTitle = 'your event';
   let eventLocation = 'TBA';
   let eventStatus = 'CONFIRMED';
+  let ticketId = String(notes?.ticketId || payload?.ticketId || '').trim() || null;
+  let ticketQuantity = null;
+  let ticketTierSummary = null;
+  let ticketLink = null;
 
-  if ((orderType || '').toUpperCase() === 'PROMOTE EVENT') {
+  if (normalizedOrderType === 'PROMOTE EVENT') {
     const promote = await fetchPromoteByEventIdForUser(eventId, user);
     if (!promote) {
       logger.error('Unable to send payment email: promote record not found', { authId, eventId, orderType });
@@ -443,6 +464,52 @@ const handlePaymentSuccessEvent = async (payload) => {
     eventTitle = promote?.eventTitle || eventTitle;
     eventLocation = promote?.venue?.locationName || eventLocation;
     eventStatus = promote?.eventStatus || eventStatus;
+  } else if (normalizedOrderType === 'TICKET SALE') {
+    const frontendBaseUrl = String(process.env.FRONTEND_URL || '').replace(/\/$/, '');
+    if (ticketId) {
+      try {
+        const ticket = await fetchTicketByIdForUser(ticketId, user);
+        if (ticket) {
+          eventTitle = ticket?.eventTitle || eventTitle;
+          eventLocation = ticket?.venue?.locationName || eventLocation;
+          eventStatus = ticket?.ticketStatus || 'TICKET CONFIRMED';
+          ticketQuantity = Number(ticket?.tickets?.noOfTickets || 0) || null;
+          const tiers = Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [];
+          ticketTierSummary = tiers.length
+            ? tiers.map((tier) => `${tier?.name || 'Tier'} x${Number(tier?.noOfTickets || 0)}`).join(', ')
+            : null;
+        }
+      } catch (error) {
+        logger.warn('Unable to fetch ticket details for payment email', {
+          ticketId,
+          eventId,
+          authId,
+          message: error?.message || String(error),
+        });
+      }
+    }
+
+    eventTitle = notes?.eventTitle || eventTitle;
+    eventLocation = notes?.eventLocation || eventLocation;
+    ticketQuantity = ticketQuantity || Number(notes?.ticketQuantity || 0) || null;
+
+    if (!ticketTierSummary && notes?.ticketTiers) {
+      try {
+        const parsedTiers = JSON.parse(notes.ticketTiers);
+        if (Array.isArray(parsedTiers) && parsedTiers.length > 0) {
+          ticketTierSummary = parsedTiers
+            .map((tier) => `${tier?.name || 'Tier'} x${Number(tier?.noOfTickets || tier?.quantity || 0)}`)
+            .join(', ');
+        }
+      } catch (_) {
+        ticketTierSummary = null;
+      }
+    }
+
+    ticketLink = notes?.ticketLink || (ticketId && frontendBaseUrl
+      ? `${frontendBaseUrl}/user/ticket/${encodeURIComponent(ticketId)}`
+      : null);
+    eventStatus = 'TICKET CONFIRMED';
   } else {
     const planning = await fetchPlanningByEventIdForUser(eventId, user);
     if (!planning) {
@@ -465,6 +532,10 @@ const handlePaymentSuccessEvent = async (payload) => {
     currency,
     transactionId,
     paidAt,
+    ticketId,
+    ticketQuantity,
+    ticketTierSummary,
+    ticketLink,
   });
 
   sentPaymentEmails.set(dedupeKey, Date.now());

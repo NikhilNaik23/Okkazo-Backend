@@ -1,6 +1,7 @@
 const kafkaConfig = require('../config/kafka');
 const planningService = require('../services/planningService');
 const promoteService  = require('../services/promoteService');
+const ticketMarketplaceService = require('../services/ticketMarketplaceService');
 const { publishEvent } = require('./eventProducer');
 const logger = require('../utils/logger');
 
@@ -110,6 +111,27 @@ const startConsuming = async () => {
               });
             } catch (publishError) {
               logger.error('Failed to publish PLANNING_VENDOR_CONFIRMATION_PAYMENT_CONFIRMED event:', publishError.message);
+            }
+          } else if (orderType === 'TICKET SALE') {
+            const ticket = await ticketMarketplaceService.markTicketSalePaid(payload);
+
+            if (ticket) {
+              try {
+                await publishEvent('TICKET_PURCHASE_CONFIRMED', {
+                  eventId: ticket.eventId,
+                  authId: payload.authId,
+                  ticketId: ticket.ticketId,
+                  paymentOrderId: payload.paymentOrderId,
+                  razorpayOrderId: payload.razorpayOrderId,
+                  razorpayPaymentId: payload.razorpayPaymentId,
+                  paidAt: payload.paidAt,
+                  quantity: ticket?.tickets?.noOfTickets || 0,
+                  tiers: ticket?.tickets?.tiers || [],
+                  ticketStatus: ticket.ticketStatus,
+                });
+              } catch (publishError) {
+                logger.error('Failed to publish TICKET_PURCHASE_CONFIRMED event:', publishError.message);
+              }
             }
           } else {
             // ── Planning payment confirmed (default: platform fee) ──────────

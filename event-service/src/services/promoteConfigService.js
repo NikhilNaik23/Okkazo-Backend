@@ -6,7 +6,7 @@ const CONFIG_KEY = 'default';
 const getDefaultPlatformFee = () => {
   const fromEnv = Number(process.env.PROMOTE_PLATFORM_FEE || process.env.PROMOTE_PLATFORM_FEE_DEFAULT);
   if (Number.isFinite(fromEnv) && fromEnv >= 0) return fromEnv;
-  return 15000;
+  return 150;
 };
 
 const getDefaultServiceChargePercent = () => {

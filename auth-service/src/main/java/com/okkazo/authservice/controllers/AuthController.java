@@ -10,7 +10,6 @@ import com.okkazo.authservice.services.VendorRegistrationService;
 import com.okkazo.authservice.validators.VendorRegistrationValidator;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -43,6 +42,11 @@ public class AuthController {
         return ResponseEntity.ok(
                 authService.login(loginDto)
         );
+    }
+
+    @PostMapping("/google/login")
+    public ResponseEntity<LoginResponseDto> googleLogin(@Valid @RequestBody GoogleLoginRequestDto googleLoginRequestDto) {
+        return ResponseEntity.ok(authService.loginWithGoogle(googleLoginRequestDto));
     }
 
     @PostMapping("/verify-email")

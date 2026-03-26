@@ -1027,16 +1027,65 @@ const getVendorsForPlanning = async (req, res) => {
       return true;
     });
 
-    // Exclude vendors reserved by other events on the same day (prevents double-booking via selection)
+    // Exclude reserved resources by other events on the same day.
+    // - Venue: lock is service-level (serviceId)
+    // - Other categories: lock is vendor-level (vendorAuthId)
     if (effectiveDay) {
-      const reserved = await vendorReservationService.listReservedVendorAuthIdsForDay({
-        day: effectiveDay,
-        excludeEventId: eventId.trim(),
-      });
+      if (isVenueCategory) {
+        const reservedServiceIds = await vendorReservationService.listReservedServiceIdsForDay({
+          day: effectiveDay,
+          excludeEventId: eventId.trim(),
+        });
 
-      if (reserved.length > 0) {
-        const reservedSet = new Set(reserved);
-        items = items.filter((v) => !reservedSet.has(v.vendorAuthId));
+        if (reservedServiceIds.length > 0) {
+          const reservedServiceSet = new Set(
+            reservedServiceIds
+              .map((id) => String(id || '').trim())
+              .filter(Boolean)
+          );
+
+          items = items
+            .map((v) => {
+              const services = Array.isArray(v?.services) ? v.services : [];
+              const filteredServices = services.filter((s) => {
+                const sid = String(s?.serviceId || '').trim();
+                if (!sid) return false;
+                return !reservedServiceSet.has(sid);
+              });
+
+              if (filteredServices.length === 0) return null;
+
+              const prices = filteredServices
+                .map((s) => toNumber(s.price, null))
+                .filter((p) => p != null);
+
+              return {
+                ...v,
+                services: filteredServices,
+                priceMin: prices.length ? Math.min(...prices) : v.priceMin,
+                priceMax: prices.length ? Math.max(...prices) : v.priceMax,
+              };
+            })
+            .filter(Boolean);
+        }
+      } else {
+        const reserved = await vendorReservationService.listReservedVendorAuthIdsForDay({
+          day: effectiveDay,
+          excludeEventId: eventId.trim(),
+        });
+
+        if (reserved.length > 0) {
+          const reservedSet = new Set(
+            reserved
+              .map((id) => String(id || '').trim())
+              .filter(Boolean)
+          );
+          items = items.filter((v) => {
+            const vendorAuthId = String(v?.vendorAuthId || '').trim();
+            if (!vendorAuthId) return false;
+            return !reservedSet.has(vendorAuthId);
+          });
+        }
       }
     }
 

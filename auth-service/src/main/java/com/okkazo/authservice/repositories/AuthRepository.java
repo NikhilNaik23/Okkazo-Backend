@@ -11,4 +11,6 @@ import java.util.UUID;
 
 public interface AuthRepository extends JpaRepository<Auth, UUID> {
     Optional<Auth> findByEmail(@NotBlank(message = "Email is required") @Email(message = "Invalid Email Format") String email);
+    Optional<Auth> findByEmailIgnoreCase(String email);
+    boolean existsByUsername(String username);
 }

@@ -84,6 +84,10 @@ const handleEvent = async (event) => {
         await handleUserRegistered(event);
         break;
 
+      case 'USER_GOOGLE_REGISTERED':
+        await handleUserGoogleRegistered(event);
+        break;
+
       case 'PASSWORD_RESET_REQUESTED':
         logger.info('Password reset requested event received', {
           authId: event.authId,
@@ -115,6 +119,52 @@ const handleEvent = async (event) => {
     }
   } catch (error) {
     logger.error(`Error handling event ${event.type}:`, error);
+    throw error;
+  }
+};
+
+const handleUserGoogleRegistered = async (event) => {
+  try {
+    const { authId, email, username } = event;
+
+    if (!authId || !email || !username) {
+      logger.error('USER_GOOGLE_REGISTERED event missing required fields', { event });
+      throw new Error('Invalid event data: authId, email, and username are required');
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      logger.error('USER_GOOGLE_REGISTERED event has invalid email format', { email });
+      throw new Error('Invalid email format');
+    }
+
+    logger.info('Processing USER_GOOGLE_REGISTERED event', { authId, email, username });
+
+    const userData = {
+      authId: authId,
+      name: username,
+      email: email,
+      role: 'USER',
+      profileIsComplete: false,
+      memberSince: new Date(),
+      isActive: true,
+    };
+
+    const user = await userService.createUser(userData);
+
+    logger.info('Google user profile created successfully', {
+      authId,
+      userId: user.id,
+      email: user.email,
+    });
+
+    return user;
+  } catch (error) {
+    if (error.code === 11000) {
+      logger.warn('Google user already exists', { authId: event.authId });
+      return null;
+    }
+    logger.error('Error handling USER_GOOGLE_REGISTERED event:', error);
     throw error;
   }
 };

@@ -28,6 +28,8 @@ router.get('/api/chat/contacts/staff', requireUser, chatController.listStaffCont
 router.post('/api/chat/conversations/staff/dm/:otherAuthId/ensure', requireUser, chatController.ensureStaffDmConversation);
 router.get('/api/chat/conversations/:conversationId/messages', requireUser, chatController.listMessages);
 router.post('/api/chat/conversations/:conversationId/messages', requireUser, upload.array('files', 5), chatController.sendMessage);
+router.put('/api/chat/conversations/:conversationId/messages/:messageId', requireUser, chatController.updateMessage);
+router.delete('/api/chat/conversations/:conversationId/messages/:messageId', requireUser, chatController.deleteMessage);
 router.post('/api/chat/conversations/:conversationId/read', requireUser, chatController.markConversationRead);
 
 module.exports = router;

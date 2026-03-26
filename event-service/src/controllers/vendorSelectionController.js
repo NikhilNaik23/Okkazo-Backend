@@ -241,7 +241,11 @@ const listAlternativesForService = async (req, res) => {
       ? String(currentVendorForService.vendorAuthId).trim()
       : '';
 
-    const reservedByOthers = await vendorReservationService.listReservedVendorAuthIdsForDay({
+    const reservedVendorByOthers = await vendorReservationService.listReservedVendorAuthIdsForDay({
+      day,
+      excludeEventId: eventId,
+    });
+    const reservedServiceByOthers = await vendorReservationService.listReservedServiceIdsForDay({
       day,
       excludeEventId: eventId,
     });
@@ -282,8 +286,14 @@ const listAlternativesForService = async (req, res) => {
       });
     }
 
-    const reservedSet = new Set((reservedByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
-    if (currentVendorAuthId) reservedSet.add(currentVendorAuthId);
+    const reservedVendorSet = new Set((reservedVendorByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
+    const reservedServiceSet = new Set((reservedServiceByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
+    const currentServiceId = currentVendorForService?.serviceId != null
+      ? String(currentVendorForService.serviceId).trim()
+      : '';
+
+    if (currentVendorAuthId) reservedVendorSet.add(currentVendorAuthId);
+    if (currentServiceId) reservedServiceSet.add(currentServiceId);
 
     // Filter by availability and build alternatives
     // - Venue: return individual services (venues) using *service* location coordinates
@@ -295,7 +305,9 @@ const listAlternativesForService = async (req, res) => {
       for (const svc of services) {
         const vendorAuthId = String(svc?.authId || '').trim();
         if (!vendorAuthId) continue;
-        if (reservedSet.has(vendorAuthId)) continue;
+        const nextServiceId = svc?._id != null ? String(svc._id).trim() : '';
+        if (!nextServiceId) continue;
+        if (reservedServiceSet.has(nextServiceId)) continue;
 
         const venueLocation = computeVenueLocationFromService(svc);
         if (!venueLocation) continue;
@@ -308,7 +320,7 @@ const listAlternativesForService = async (req, res) => {
 
         rows.push({
           vendorAuthId,
-          serviceId: svc?._id || null,
+          serviceId: nextServiceId,
           businessName: svc?.businessName || null,
           serviceCategory: svc?.serviceCategory || null,
           name: svc?.name || null,
@@ -330,7 +342,7 @@ const listAlternativesForService = async (req, res) => {
       for (const svc of services) {
         const vendorAuthId = String(svc?.authId || '').trim();
         if (!vendorAuthId) continue;
-        if (reservedSet.has(vendorAuthId)) continue;
+        if (reservedVendorSet.has(vendorAuthId)) continue;
 
         const entry = byVendor.get(vendorAuthId) || {
           vendorAuthId,
@@ -437,7 +449,7 @@ const listAlternativesForService = async (req, res) => {
         .map((v) => {
           const vendorAuthId = v?.authId != null ? String(v.authId).trim() : '';
           if (!vendorAuthId) return null;
-          if (reservedSet.has(vendorAuthId)) return null;
+          if (reservedVendorSet.has(vendorAuthId)) return null;
 
           const vLat = toNumberOrNull(v?.latitude);
           const vLon = toNumberOrNull(v?.longitude);
@@ -783,11 +795,40 @@ const rejectVendorRequest = async (req, res) => {
       nextPlanningStatus = PLANNING_STATUS.PENDING_APPROVAL;
     }
 
-    // If vendor is no longer participating in any service for this event, release reservation (best-effort)
+    // If vendor is no longer participating in any service for this event, release reservation(s) (best-effort).
+    // Venue locks are service-level, so release per serviceId.
     if (!vendorAcceptedAnyServiceAfter && planningDay) {
-      vendorReservationService
-        .release({ vendorAuthId, day: planningDay, eventId })
-        .catch((e) => logger.warn('Failed to release vendor reservation after rejection', { eventId, vendorAuthId, error: e.message }));
+      const vendorItems = Array.isArray(selection?.vendors)
+        ? selection.vendors.filter((v) => String(v?.vendorAuthId || '').trim() === vendorAuthId)
+        : [];
+
+      if (vendorItems.length > 0) {
+        await Promise.all(
+          vendorItems.map((item) =>
+            vendorReservationService
+              .release({
+                vendorAuthId,
+                day: planningDay,
+                eventId,
+                service: item?.service,
+                serviceId: item?.serviceId,
+              })
+              .catch((e) => {
+                logger.warn('Failed to release vendor reservation after rejection', {
+                  eventId,
+                  vendorAuthId,
+                  service: item?.service || null,
+                  serviceId: item?.serviceId || null,
+                  error: e.message,
+                });
+              })
+          )
+        );
+      } else {
+        vendorReservationService
+          .release({ vendorAuthId, day: planningDay, eventId })
+          .catch((e) => logger.warn('Failed to release vendor reservation after rejection', { eventId, vendorAuthId, error: e.message }));
+      }
     }
 
     // Best-effort automation: when a vendor rejects service(s), send alternatives to client via chat + email.
@@ -817,7 +858,11 @@ const rejectVendorRequest = async (req, res) => {
         // Find alternatives (reuse same logic as GET /vendor-selection/:eventId/alternatives).
         const selectionDoc = await vendorSelectionService.ensureForPlanning(planning);
 
-        const reservedByOthers = await vendorReservationService.listReservedVendorAuthIdsForDay({
+        const reservedVendorByOthers = await vendorReservationService.listReservedVendorAuthIdsForDay({
+          day: planningDay,
+          excludeEventId: eventId,
+        });
+        const reservedServiceByOthers = await vendorReservationService.listReservedServiceIdsForDay({
           day: planningDay,
           excludeEventId: eventId,
         });
@@ -826,7 +871,8 @@ const rejectVendorRequest = async (req, res) => {
         const lng = planning?.location?.longitude;
         const hasGeo = typeof lat === 'number' && typeof lng === 'number' && Number.isFinite(lat) && Number.isFinite(lng);
         const radiusKm = hasGeo ? ALTERNATIVES_RADIUS_KM : undefined;
-        const baseReservedSet = new Set((reservedByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
+        const baseReservedVendorSet = new Set((reservedVendorByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
+        const baseReservedServiceSet = new Set((reservedServiceByOthers || []).map((v) => String(v || '').trim()).filter(Boolean));
 
         for (const rejectedService of servicesToAutoSend) {
           const serviceLabel = vendorSelectionService.canonicalizeService(String(rejectedService));
@@ -840,8 +886,15 @@ const rejectVendorRequest = async (req, res) => {
             ? String(currentVendorForService.vendorAuthId).trim()
             : '';
 
-          const reservedSet = new Set(baseReservedSet);
-          if (currentVendorAuthId) reservedSet.add(currentVendorAuthId);
+          const currentServiceId = currentVendorForService?.serviceId != null
+            ? String(currentVendorForService.serviceId).trim()
+            : '';
+
+          const reservedVendorSet = new Set(baseReservedVendorSet);
+          const reservedServiceSet = new Set(baseReservedServiceSet);
+
+          if (currentVendorAuthId) reservedVendorSet.add(currentVendorAuthId);
+          if (currentServiceId) reservedServiceSet.add(currentServiceId);
 
           const limit = 50;
           let services = await searchPublicVendorServices({
@@ -875,7 +928,9 @@ const rejectVendorRequest = async (req, res) => {
               for (const svc of services) {
                 const nextVendorAuthId = String(svc?.authId || '').trim();
                 if (!nextVendorAuthId) continue;
-                if (reservedSet.has(nextVendorAuthId)) continue;
+                const nextServiceId = svc?._id != null ? String(svc._id).trim() : '';
+                if (!nextServiceId) continue;
+                if (reservedServiceSet.has(nextServiceId)) continue;
 
                 const venueLocation = computeVenueLocationFromService(svc);
                 if (!venueLocation) continue;
@@ -888,7 +943,7 @@ const rejectVendorRequest = async (req, res) => {
 
                 rows.push({
                   vendorAuthId: nextVendorAuthId,
-                  serviceId: svc?._id || null,
+                  serviceId: nextServiceId,
                   businessName: svc?.businessName || null,
                   serviceCategory: svc?.serviceCategory || null,
                   name: svc?.name || null,
@@ -911,7 +966,7 @@ const rejectVendorRequest = async (req, res) => {
             for (const svc of services) {
               const nextVendorAuthId = String(svc?.authId || '').trim();
               if (!nextVendorAuthId) continue;
-              if (reservedSet.has(nextVendorAuthId)) continue;
+              if (reservedVendorSet.has(nextVendorAuthId)) continue;
 
               const entry = byVendor.get(nextVendorAuthId) || {
                 vendorAuthId: nextVendorAuthId,
@@ -1015,7 +1070,7 @@ const rejectVendorRequest = async (req, res) => {
               .map((v) => {
                 const nextVendorAuthId = v?.authId != null ? String(v.authId).trim() : '';
                 if (!nextVendorAuthId) return null;
-                if (reservedSet.has(nextVendorAuthId)) return null;
+                if (reservedVendorSet.has(nextVendorAuthId)) return null;
                 return {
                   vendorAuthId: nextVendorAuthId,
                   serviceId: null,
@@ -1088,8 +1143,8 @@ const rejectVendorRequest = async (req, res) => {
               service: serviceLabel,
               hasGeo,
               radiusKm: radiusKm || null,
-              reservedByOthersCount: Array.isArray(reservedByOthers) ? reservedByOthers.length : 0,
-              reservedSetCount: reservedSet.size,
+              reservedByOthersCount: Array.isArray(reservedVendorByOthers) ? reservedVendorByOthers.length : 0,
+              reservedSetCount: isVenue ? reservedServiceSet.size : reservedVendorSet.size,
               servicesCount: Array.isArray(services) ? services.length : 0,
               alternativesAfterFilterCount: Array.isArray(alternatives) ? alternatives.length : 0,
               vendorProfilesCount: Array.isArray(vendorProfiles) ? vendorProfiles.length : 0,

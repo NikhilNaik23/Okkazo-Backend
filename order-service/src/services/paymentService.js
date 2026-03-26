@@ -31,7 +31,7 @@ const createOrderSchema = Joi.object({
   currency: Joi.string().trim().uppercase().length(3).optional(),
   // Razorpay receipt has a hard 40-character limit
   receipt: Joi.string().trim().max(40).optional(),
-  notes: Joi.object().optional(),
+  notes: Joi.object().unknown(true).optional(),
 });
 
 const buildRazorpayReceipt = ({ eventId, authId }) => {
@@ -40,6 +40,14 @@ const buildRazorpayReceipt = ({ eventId, authId }) => {
     .createHash('sha1')
     .update(`${eventId}:${authId}:${Date.now()}:${crypto.randomBytes(8).toString('hex')}`)
     .digest('hex');
+};
+
+const buildTicketLink = (ticketId) => {
+  const normalizedTicketId = String(ticketId || '').trim();
+  if (!normalizedTicketId) return null;
+
+  const frontendBaseUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+  return `${frontendBaseUrl}/user/ticket/${encodeURIComponent(normalizedTicketId)}`;
 };
 
 const verifyPaymentSchema = Joi.object({
@@ -171,71 +179,78 @@ const createOrder = async (payload, user) => {
   }
 
   const orderType = value.orderType;
+  const isTicketSale = orderType === 'TICKET SALE';
 
   let upstreamRecord;
-  try {
+  if (!isTicketSale) {
+    try {
+      if (orderType === 'PROMOTE EVENT') {
+        upstreamRecord = await getPromoteForUser(value.eventId, user);
+      } else {
+        upstreamRecord = await getPlanningForUser(value.eventId, user);
+      }
+    } catch (err) {
+      if (isAxiosLikeError(err)) {
+        throw normalizeAxiosError(err, { upstreamName: 'event-service' });
+      }
+      throw err;
+    }
+
+    if (!upstreamRecord) {
+      throw createApiError(404, orderType === 'PROMOTE EVENT' ? 'Promote event not found' : 'Planning not found');
+    }
+
+    // Payment gating differs by order type.
     if (orderType === 'PROMOTE EVENT') {
-      upstreamRecord = await getPromoteForUser(value.eventId, user);
+      if (Boolean(upstreamRecord.platformFeePaid)) {
+        throw createApiError(409, 'Payment is already completed for this event');
+      }
+    } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
+      const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
+      if (!planningPlatformFeePaid) {
+        throw createApiError(409, 'Planning fee must be paid before paying deposit');
+      }
+      if (Boolean(upstreamRecord.depositPaid)) {
+        throw createApiError(409, 'Deposit is already paid for this event');
+      }
+    } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+      const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
+      if (!planningPlatformFeePaid) {
+        throw createApiError(409, 'Planning fee must be paid before paying vendor confirmation');
+      }
+      if (!Boolean(upstreamRecord.depositPaid)) {
+        throw createApiError(409, 'Deposit must be paid before vendor confirmation');
+      }
+
+      const depositPaidAmountPaise = upstreamRecord.depositPaidAmountPaise;
+      if (depositPaidAmountPaise == null) {
+        throw createApiError(409, 'Deposit amount is not recorded yet for this event');
+      }
+
+      const normalizedStatus = String(upstreamRecord.status || '').trim().toUpperCase();
+      if (normalizedStatus !== 'APPROVED') {
+        throw createApiError(409, 'Planning must be APPROVED before paying vendor confirmation');
+      }
+
+      if (Boolean(upstreamRecord.vendorConfirmationPaid)) {
+        throw createApiError(409, 'Vendor confirmation is already paid for this event');
+      }
     } else {
-      upstreamRecord = await getPlanningForUser(value.eventId, user);
-    }
-  } catch (err) {
-    if (isAxiosLikeError(err)) {
-      throw normalizeAxiosError(err, { upstreamName: 'event-service' });
-    }
-    throw err;
-  }
-
-  if (!upstreamRecord) {
-    throw createApiError(404, orderType === 'PROMOTE EVENT' ? 'Promote event not found' : 'Planning not found');
-  }
-
-  // Payment gating differs by order type.
-  if (orderType === 'PROMOTE EVENT') {
-    if (Boolean(upstreamRecord.platformFeePaid)) {
-      throw createApiError(409, 'Payment is already completed for this event');
-    }
-  } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
-    const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
-    if (!planningPlatformFeePaid) {
-      throw createApiError(409, 'Planning fee must be paid before paying deposit');
-    }
-    if (Boolean(upstreamRecord.depositPaid)) {
-      throw createApiError(409, 'Deposit is already paid for this event');
-    }
-  } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
-    const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
-    if (!planningPlatformFeePaid) {
-      throw createApiError(409, 'Planning fee must be paid before paying vendor confirmation');
-    }
-    if (!Boolean(upstreamRecord.depositPaid)) {
-      throw createApiError(409, 'Deposit must be paid before vendor confirmation');
-    }
-
-    const depositPaidAmountPaise = upstreamRecord.depositPaidAmountPaise;
-    if (depositPaidAmountPaise == null) {
-      throw createApiError(409, 'Deposit amount is not recorded yet for this event');
-    }
-
-    const normalizedStatus = String(upstreamRecord.status || '').trim().toUpperCase();
-    if (normalizedStatus !== 'APPROVED') {
-      throw createApiError(409, 'Planning must be APPROVED before paying vendor confirmation');
-    }
-
-    if (Boolean(upstreamRecord.vendorConfirmationPaid)) {
-      throw createApiError(409, 'Vendor confirmation is already paid for this event');
-    }
-  } else {
-    const alreadyPaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
-    if (alreadyPaid) {
-      throw createApiError(409, 'Payment is already completed for this event');
+      const alreadyPaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
+      if (alreadyPaid) {
+        throw createApiError(409, 'Payment is already completed for this event');
+      }
     }
   }
 
   // For most order types, it's fine to reuse the latest CREATED order.
   // For deposit + vendor confirmation orders, the amount is derived from upstream state,
   // so only reuse an existing order if the amount still matches.
-  if (orderType !== 'PLANNING EVENT DEPOSIT FEE' && orderType !== 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+  if (
+    orderType !== 'PLANNING EVENT DEPOSIT FEE'
+    && orderType !== 'PLANNING EVENT VENDOR CONFIRMATION FEE'
+    && orderType !== 'TICKET SALE'
+  ) {
     const activeOrder = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,
@@ -264,7 +279,14 @@ const createOrder = async (payload, user) => {
   let amountInPaiseOverride = null;
   let depositPercent = null;
   const currency = value.currency || 'INR';
-  if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
+  const orderNotes = value.notes || {};
+
+  if (isTicketSale) {
+    amountInInr = Number(value.amount);
+    if (!Number.isFinite(amountInInr) || amountInInr <= 0) {
+      throw createApiError(400, 'Amount is required for TICKET SALE orders');
+    }
+  } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
     let selection;
     try {
       selection = await getVendorSelectionForUser(value.eventId, user);
@@ -403,7 +425,7 @@ const createOrder = async (payload, user) => {
               depositPaidAmountPaise: upstreamRecord.depositPaidAmountPaise,
             }
           : {}),
-        ...(value.notes || {}),
+        ...orderNotes,
       },
     });
   } catch (err) {
@@ -423,7 +445,10 @@ const createOrder = async (payload, user) => {
     razorpayOrderId: order.id,
     receipt: order.receipt,
     status: 'CREATED',
-    notes: order.notes || {},
+    notes: {
+      ...orderNotes,
+      ...(order.notes || {}),
+    },
   });
 
   try {
@@ -463,6 +488,8 @@ const createOrder = async (payload, user) => {
     currency: order.currency,
     keyId: process.env.RAZORPAY_KEY_ID,
     status: paymentOrder.status,
+    ticketId: paymentOrder?.notes?.ticketId || null,
+    ticketLink: buildTicketLink(paymentOrder?.notes?.ticketId),
   };
 };
 
@@ -494,6 +521,8 @@ const verifyPayment = async (payload, user) => {
       status: paymentOrder.status,
       paymentId: paymentOrder.razorpayPaymentId,
       orderId: paymentOrder.razorpayOrderId,
+      ticketId: paymentOrder?.notes?.ticketId || null,
+      ticketLink: buildTicketLink(paymentOrder?.notes?.ticketId),
     };
   }
 
@@ -541,6 +570,7 @@ const verifyPayment = async (payload, user) => {
       paidAt: paymentOrder.paidAt.toISOString(),
       paymentStatus: paymentOrder.status,
       source: 'verify-endpoint',
+      notes: paymentOrder.notes || {},
     });
   } catch (kafkaError) {
     logger.error('Failed to publish PAYMENT_SUCCESS event:', kafkaError);
@@ -565,6 +595,8 @@ const verifyPayment = async (payload, user) => {
     status: paymentOrder.status,
     paymentId: paymentOrder.razorpayPaymentId,
     orderId: paymentOrder.razorpayOrderId,
+    ticketId: paymentOrder?.notes?.ticketId || null,
+    ticketLink: buildTicketLink(paymentOrder?.notes?.ticketId),
   };
 };
 
@@ -629,6 +661,7 @@ const handleWebhook = async (rawBody, signatureHeader) => {
         paidAt: paymentOrder.paidAt.toISOString(),
         paymentStatus: paymentOrder.status,
         source: 'razorpay-webhook',
+        notes: paymentOrder.notes || {},
       });
     } catch (kafkaError) {
       logger.error('Failed to publish PAYMENT_SUCCESS from webhook:', kafkaError);
@@ -662,6 +695,7 @@ const getOrderByEventId = async (eventId, user) => {
   }
 
   return {
+    paymentOrderId: order._id.toString(),
     eventId: order.eventId,
     transactionId: order.transactionId,
     orderType: order.orderType,
@@ -674,6 +708,7 @@ const getOrderByEventId = async (eventId, user) => {
     paidAt: order.paidAt,
     refundedAt: order.refundedAt,
     refundedAmount: order.refundedAmount,
+    notes: order.notes || {},
     createdAt: order.createdAt,
   };
 };

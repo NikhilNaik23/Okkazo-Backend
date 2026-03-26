@@ -90,6 +90,7 @@ public class RefreshTokenService {
             return new RefreshTokenResponseDto(
                     newAccessToken,
                     newRefreshTokenJwt,
+                    user.getAuthProvider() == null ? "EMAIL" : user.getAuthProvider().name(),
                     "Tokens refreshed successfully",
                     true
             );

@@ -10,6 +10,7 @@ import com.okkazo.authservice.exceptions.TokenExpiredException;
 import com.okkazo.authservice.exceptions.UserNotFoundException;
 import com.okkazo.authservice.kafka.AuthEventProducer;
 import com.okkazo.authservice.models.Auth;
+import com.okkazo.authservice.models.AuthProvider;
 import com.okkazo.authservice.models.PasswordResetToken;
 import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
@@ -35,7 +36,7 @@ public class PasswordResetService {
     @Transactional
     public ForgotPasswordResponseDto forgotPassword(ForgotPasswordRequestDto requestDto) {
         // Find user by email
-        Auth user = authRepository.findByEmail(requestDto.email())
+        Auth user = authRepository.findByEmailIgnoreCase(requestDto.email().trim())
                 .orElseThrow(() -> new UserNotFoundException("No account found with this email"));
 
         // Check if account is blocked
@@ -103,6 +104,10 @@ public class PasswordResetService {
 
         // Update password
         user.setHashedPassword(passwordEncoder.encode(requestDto.newPassword()));
+
+        if (user.getAuthProvider() == AuthProvider.SIGN_IN_WITH_GOOGLE) {
+            user.setAuthProvider(AuthProvider.BOTH);
+        }
         
         // Auto-verify vendors and managers when they set their password for the first time
         if ((user.getRole() == com.okkazo.authservice.models.Role.VENDOR ||

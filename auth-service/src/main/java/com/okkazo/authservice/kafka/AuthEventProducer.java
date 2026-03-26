@@ -4,6 +4,7 @@ import com.okkazo.authservice.dtos.EmailVerificationResendEvent;
 import com.okkazo.authservice.dtos.PasswordResetEvent;
 import com.okkazo.authservice.dtos.UserLoginEvent;
 import com.okkazo.authservice.dtos.UserRegistrationEvent;
+import com.okkazo.authservice.dtos.UserGoogleRegisteredEvent;
 import com.okkazo.authservice.dtos.UserRoleChangedEvent;
 import com.okkazo.authservice.dtos.ManagerAccountCreatedEvent;
 import com.okkazo.authservice.dtos.VendorAccountCreatedEvent;
@@ -61,6 +62,16 @@ public class AuthEventProducer {
                 authId,
                 email,
                 LocalDateTime.now()
+        );
+        kafkaTemplate.send(topicName, authId.toString(), event);
+    }
+
+    public void userGoogleRegistered(UUID authId, String email, String username) {
+        UserGoogleRegisteredEvent event = new UserGoogleRegisteredEvent(
+                "USER_GOOGLE_REGISTERED",
+                authId,
+                email,
+                username
         );
         kafkaTemplate.send(topicName, authId.toString(), event);
     }

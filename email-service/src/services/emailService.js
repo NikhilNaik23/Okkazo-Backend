@@ -309,6 +309,10 @@ const sendPaymentSuccessEmail = async (email, details) => {
       currency,
       transactionId,
       paidAt,
+      ticketId,
+      ticketQuantity,
+      ticketTierSummary,
+      ticketLink,
     } = details || {};
 
     if (!eventId) {
@@ -336,6 +340,10 @@ const sendPaymentSuccessEmail = async (email, details) => {
       currencySymbol,
       transactionId,
       paidAt,
+      ticketId: ticketId || null,
+      ticketQuantity: Number(ticketQuantity || 0) || null,
+      ticketTierSummary: ticketTierSummary || null,
+      ticketLink: ticketLink || null,
       platformName: 'Okkazo',
       supportEmail: process.env.FROM_EMAIL,
     });
