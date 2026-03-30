@@ -19,6 +19,13 @@ router.get(
   vendorSelectionController.getVendorRequestDetails
 );
 
+// POST /vendor/requests/:eventId/lock-price - Lock service price with commission
+router.post(
+  '/vendor/requests/:eventId/lock-price',
+  authorizeRoles(['VENDOR']),
+  vendorSelectionController.lockVendorServicePrice
+);
+
 // POST /vendor/requests/:eventId/accept - Accept request (optionally by service)
 router.post(
   '/vendor/requests/:eventId/accept',
@@ -59,6 +66,13 @@ router.patch(
   '/vendor-selection/:eventId/vendors',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
   vendorSelectionController.upsertVendor
+);
+
+// POST /vendor-selection/:eventId/unlock - Release temporary reservation locks
+router.post(
+  '/vendor-selection/:eventId/unlock',
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
+  vendorSelectionController.unlockReservations
 );
 
 module.exports = router;

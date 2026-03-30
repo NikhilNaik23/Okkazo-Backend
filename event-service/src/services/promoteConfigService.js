@@ -15,13 +15,62 @@ const getDefaultServiceChargePercent = () => {
   return 2.5;
 };
 
+const getDefaultNormalDayMinMultiplier = () => {
+  const fromEnv = Number(process.env.NORMAL_DAY_MIN_MULTIPLIER);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return 1;
+};
+
+const getDefaultNormalDayMaxMultiplier = () => {
+  const fromEnv = Number(process.env.NORMAL_DAY_MAX_MULTIPLIER);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return 1;
+};
+
+const getDefaultHighDemandMinMultiplier = () => {
+  const fromEnv = Number(process.env.HIGH_DEMAND_MIN_MULTIPLIER);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return 1.5;
+};
+
+const getDefaultHighDemandMaxMultiplier = () => {
+  const fromEnv = Number(process.env.HIGH_DEMAND_MAX_MULTIPLIER);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return 2.25;
+};
+
+const buildDemandPricingMultipliers = (cfg) => ({
+  normal: {
+    min: Number(cfg?.normalDayMinMultiplier),
+    max: Number(cfg?.normalDayMaxMultiplier),
+  },
+  highDemand: {
+    min: Number(cfg?.highDemandMinMultiplier),
+    max: Number(cfg?.highDemandMaxMultiplier),
+  },
+});
+
 const getOrCreateConfig = async () => {
   const platformFee = getDefaultPlatformFee();
   const serviceChargePercent = getDefaultServiceChargePercent();
+  const normalDayMinMultiplier = getDefaultNormalDayMinMultiplier();
+  const normalDayMaxMultiplier = getDefaultNormalDayMaxMultiplier();
+  const highDemandMinMultiplier = getDefaultHighDemandMinMultiplier();
+  const highDemandMaxMultiplier = getDefaultHighDemandMaxMultiplier();
 
   const cfg = await PromoteConfig.findOneAndUpdate(
     { key: CONFIG_KEY },
-    { $setOnInsert: { key: CONFIG_KEY, platformFee, serviceChargePercent } },
+    {
+      $setOnInsert: {
+        key: CONFIG_KEY,
+        platformFee,
+        serviceChargePercent,
+        normalDayMinMultiplier,
+        normalDayMaxMultiplier,
+        highDemandMinMultiplier,
+        highDemandMaxMultiplier,
+      },
+    },
     { new: true, upsert: true }
   ).lean();
 
@@ -30,7 +79,15 @@ const getOrCreateConfig = async () => {
     cfg.platformFee === undefined ||
     cfg.platformFee === null ||
     cfg.serviceChargePercent === undefined ||
-    cfg.serviceChargePercent === null;
+    cfg.serviceChargePercent === null ||
+    cfg.normalDayMinMultiplier === undefined ||
+    cfg.normalDayMinMultiplier === null ||
+    cfg.normalDayMaxMultiplier === undefined ||
+    cfg.normalDayMaxMultiplier === null ||
+    cfg.highDemandMinMultiplier === undefined ||
+    cfg.highDemandMinMultiplier === null ||
+    cfg.highDemandMaxMultiplier === undefined ||
+    cfg.highDemandMaxMultiplier === null;
 
   if (!needsBackfill) return cfg;
 
@@ -40,6 +97,10 @@ const getOrCreateConfig = async () => {
       $set: {
         ...(cfg.platformFee === undefined || cfg.platformFee === null ? { platformFee } : {}),
         ...(cfg.serviceChargePercent === undefined || cfg.serviceChargePercent === null ? { serviceChargePercent } : {}),
+        ...(cfg.normalDayMinMultiplier === undefined || cfg.normalDayMinMultiplier === null ? { normalDayMinMultiplier } : {}),
+        ...(cfg.normalDayMaxMultiplier === undefined || cfg.normalDayMaxMultiplier === null ? { normalDayMaxMultiplier } : {}),
+        ...(cfg.highDemandMinMultiplier === undefined || cfg.highDemandMinMultiplier === null ? { highDemandMinMultiplier } : {}),
+        ...(cfg.highDemandMaxMultiplier === undefined || cfg.highDemandMaxMultiplier === null ? { highDemandMaxMultiplier } : {}),
       },
     },
     { new: true }
@@ -51,6 +112,7 @@ const getFees = async () => {
   return {
     platformFee: cfg.platformFee,
     serviceChargePercent: cfg.serviceChargePercent,
+    demandPricingMultipliers: buildDemandPricingMultipliers(cfg),
     updatedAt: cfg.updatedAt,
   };
 };
@@ -86,7 +148,15 @@ const updatePlatformFee = async ({ platformFee, updatedByAuthId }) => {
   };
 };
 
-const updateFees = async ({ platformFee, serviceChargePercent, updatedByAuthId }) => {
+const normalizeMultiplier = (value, fieldName) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw createApiError(400, `${fieldName} must be a positive number`);
+  }
+  return n;
+};
+
+const updateFees = async ({ platformFee, serviceChargePercent, demandPricingMultipliers, updatedByAuthId }) => {
   const updates = {};
 
   if (platformFee !== undefined) {
@@ -105,8 +175,48 @@ const updateFees = async ({ platformFee, serviceChargePercent, updatedByAuthId }
     updates.serviceChargePercent = pct;
   }
 
+  if (demandPricingMultipliers !== undefined) {
+    if (!demandPricingMultipliers || typeof demandPricingMultipliers !== 'object') {
+      throw createApiError(400, 'demandPricingMultipliers must be an object');
+    }
+
+    const normal = demandPricingMultipliers.normal;
+    const highDemand = demandPricingMultipliers.highDemand;
+
+    if (normal && typeof normal === 'object') {
+      if (normal.min !== undefined) {
+        updates.normalDayMinMultiplier = normalizeMultiplier(normal.min, 'normal.min');
+      }
+      if (normal.max !== undefined) {
+        updates.normalDayMaxMultiplier = normalizeMultiplier(normal.max, 'normal.max');
+      }
+    }
+
+    if (highDemand && typeof highDemand === 'object') {
+      if (highDemand.min !== undefined) {
+        updates.highDemandMinMultiplier = normalizeMultiplier(highDemand.min, 'highDemand.min');
+      }
+      if (highDemand.max !== undefined) {
+        updates.highDemandMaxMultiplier = normalizeMultiplier(highDemand.max, 'highDemand.max');
+      }
+    }
+  }
+
   if (Object.keys(updates).length === 0) {
     throw createApiError(400, 'No updates provided');
+  }
+
+  const existing = await getOrCreateConfig();
+  const normalMin = updates.normalDayMinMultiplier ?? Number(existing?.normalDayMinMultiplier);
+  const normalMax = updates.normalDayMaxMultiplier ?? Number(existing?.normalDayMaxMultiplier);
+  const highMin = updates.highDemandMinMultiplier ?? Number(existing?.highDemandMinMultiplier);
+  const highMax = updates.highDemandMaxMultiplier ?? Number(existing?.highDemandMaxMultiplier);
+
+  if (normalMax < normalMin) {
+    throw createApiError(400, 'normal.max must be greater than or equal to normal.min');
+  }
+  if (highMax < highMin) {
+    throw createApiError(400, 'highDemand.max must be greater than or equal to highDemand.min');
   }
 
   updates.updatedByAuthId = updatedByAuthId || null;
@@ -117,6 +227,10 @@ const updateFees = async ({ platformFee, serviceChargePercent, updatedByAuthId }
   const setOnInsert = { key: CONFIG_KEY };
   if (updates.platformFee === undefined) setOnInsert.platformFee = getDefaultPlatformFee();
   if (updates.serviceChargePercent === undefined) setOnInsert.serviceChargePercent = getDefaultServiceChargePercent();
+  if (updates.normalDayMinMultiplier === undefined) setOnInsert.normalDayMinMultiplier = getDefaultNormalDayMinMultiplier();
+  if (updates.normalDayMaxMultiplier === undefined) setOnInsert.normalDayMaxMultiplier = getDefaultNormalDayMaxMultiplier();
+  if (updates.highDemandMinMultiplier === undefined) setOnInsert.highDemandMinMultiplier = getDefaultHighDemandMinMultiplier();
+  if (updates.highDemandMaxMultiplier === undefined) setOnInsert.highDemandMaxMultiplier = getDefaultHighDemandMaxMultiplier();
 
   const updated = await PromoteConfig.findOneAndUpdate(
     { key: CONFIG_KEY },
@@ -127,6 +241,7 @@ const updateFees = async ({ platformFee, serviceChargePercent, updatedByAuthId }
   return {
     platformFee: updated.platformFee,
     serviceChargePercent: updated.serviceChargePercent,
+    demandPricingMultipliers: buildDemandPricingMultipliers(updated),
     updatedAt: updated.updatedAt,
     updatedByAuthId: updated.updatedByAuthId,
   };
@@ -139,4 +254,8 @@ module.exports = {
   updatePlatformFee,
   getDefaultPlatformFee,
   getDefaultServiceChargePercent,
+  getDefaultNormalDayMinMultiplier,
+  getDefaultNormalDayMaxMultiplier,
+  getDefaultHighDemandMinMultiplier,
+  getDefaultHighDemandMaxMultiplier,
 };

@@ -82,6 +82,13 @@ router.patch(
   planningController.updatePlanningDetails
 );
 
+// PATCH /planning/:eventId/reservation-day - Sync planning day from vendor-selection flow (Owner)
+router.patch(
+  '/planning/:eventId/reservation-day',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.syncPlanningReservationDay
+);
+
 // POST /planning/:eventId/core-staff - Assign a CORE staff member (Manager/Admin)
 router.post(
   '/planning/:eventId/core-staff',

@@ -8,15 +8,14 @@
 
 const MINIMUM_DAYS_AHEAD = 6;
 const URGENT_WINDOW_DAYS = 14;
+const { startOfIstDay, addDays } = require('./istDateTime');
 
 /**
  * Returns the minimum allowed planning date (today + 6 days, start of day)
  */
 const planningMinimumDate = () => {
-  const date = new Date();
-  date.setDate(date.getDate() + MINIMUM_DAYS_AHEAD);
-  date.setHours(0, 0, 0, 0);
-  return date;
+  const todayIstStart = startOfIstDay(new Date());
+  return addDays(todayIstStart, MINIMUM_DAYS_AHEAD);
 };
 
 /**
@@ -25,8 +24,7 @@ const planningMinimumDate = () => {
 const isWithinUrgentWindow = (eventDate) => {
   if (!eventDate) return false;
   const now = new Date();
-  const deadline = new Date();
-  deadline.setDate(now.getDate() + URGENT_WINDOW_DAYS);
+  const deadline = addDays(now, URGENT_WINDOW_DAYS);
   return new Date(eventDate) <= deadline;
 };
 
@@ -34,10 +32,8 @@ const isWithinUrgentWindow = (eventDate) => {
  * Returns tomorrow at 00:00:00.000
  */
 const startOfTomorrow = () => {
-  const date = new Date();
-  date.setDate(date.getDate() + 1);
-  date.setHours(0, 0, 0, 0);
-  return date;
+  const todayIstStart = startOfIstDay(new Date());
+  return addDays(todayIstStart, 1);
 };
 
 module.exports = {

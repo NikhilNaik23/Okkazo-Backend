@@ -24,11 +24,12 @@ const getFees = async (req, res) => {
 // PATCH /config/fees (Admin only)
 const updateFees = async (req, res) => {
   try {
-    const { platformFee, serviceChargePercent } = req.body || {};
+    const { platformFee, serviceChargePercent, demandPricingMultipliers } = req.body || {};
 
     const updated = await promoteConfigService.updateFees({
       platformFee,
       serviceChargePercent,
+      demandPricingMultipliers,
       updatedByAuthId: req.user?.authId,
     });
 

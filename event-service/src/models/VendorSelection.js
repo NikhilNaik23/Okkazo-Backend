@@ -7,6 +7,8 @@ const {
   VENDOR_SELECTION_STATUS_VALUES,
 } = require('../utils/vendorSelectionConstants');
 
+const PRICING_UNIT_VALUES = ['EVENT', 'PER_PERSON', 'PER_PLATE', 'PER_KG', 'PER_100_UNITS', 'FIXED'];
+
 const MoneyRangeSchema = new mongoose.Schema(
   {
     min: { type: Number, min: 0, default: 0 },
@@ -56,6 +58,48 @@ const VendorItemSchema = new mongoose.Schema(
     servicePrice: {
       type: MoneyRangeSchema,
       default: () => ({ min: 0, max: 0 }),
+    },
+    vendorQuotedPrice: {
+      type: Number,
+      min: 0,
+      default: null,
+    },
+    commissionPercent: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: null,
+    },
+    commissionAmount: {
+      type: Number,
+      min: 0,
+      default: null,
+    },
+    priceLocked: {
+      type: Boolean,
+      default: false,
+    },
+    pricingUnit: {
+      type: String,
+      enum: PRICING_UNIT_VALUES,
+      default: null,
+      trim: true,
+      set: (value) => {
+        if (value == null) return null;
+        const raw = String(value).trim().toUpperCase();
+        return raw || null;
+      },
+    },
+    pricingQuantity: {
+      type: Number,
+      min: 0,
+      default: null,
+    },
+    pricingQuantityUnit: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 32,
     },
   },
   { _id: false }
@@ -226,6 +270,58 @@ VendorSelectionSchema.pre('validate', function preValidate(next) {
       if (Number(v.servicePrice.max) < Number(v.servicePrice.min)) {
         this.invalidate('vendors.servicePrice', 'servicePrice.max must be greater than or equal to servicePrice.min');
       }
+    }
+
+    if (v.vendorQuotedPrice != null) {
+      const quoted = Number(v.vendorQuotedPrice);
+      v.vendorQuotedPrice = Number.isFinite(quoted) && quoted > 0 ? quoted : null;
+    }
+
+    if (v.commissionPercent != null) {
+      const pct = Number(v.commissionPercent);
+      v.commissionPercent = Number.isFinite(pct) && pct >= 0 && pct <= 100 ? pct : null;
+    }
+
+    if (v.commissionAmount != null) {
+      const amt = Number(v.commissionAmount);
+      v.commissionAmount = Number.isFinite(amt) && amt >= 0 ? amt : null;
+    }
+
+    if (v.priceLocked && !v.vendorQuotedPrice) {
+      v.priceLocked = false;
+    }
+
+    if (v.priceLocked) {
+      const quoted = Number(v.vendorQuotedPrice || 0);
+      const percent = Number(v.commissionPercent || 0);
+
+      if (v.commissionAmount == null && quoted > 0 && percent >= 0) {
+        v.commissionAmount = Math.round(((quoted * percent) / 100) * 100) / 100;
+      }
+
+      if (v.commissionPercent == null) {
+        const amount = Number(v.commissionAmount || 0);
+        v.commissionPercent = quoted > 0 && amount >= 0
+          ? Math.round(((amount / quoted) * 100) * 100) / 100
+          : 0;
+      }
+    }
+
+    if (!v.priceLocked) {
+      v.vendorQuotedPrice = null;
+      v.commissionPercent = null;
+      v.commissionAmount = null;
+    }
+
+    if (v.pricingQuantity != null) {
+      const qty = Number(v.pricingQuantity);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        v.pricingQuantity = null;
+      }
+    }
+
+    if (!v.pricingQuantity && v.pricingQuantityUnit) {
+      v.pricingQuantityUnit = null;
     }
   }
 
