@@ -17,6 +17,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @RestController
@@ -201,5 +202,56 @@ public class AuthController {
     public ResponseEntity<PromoteUserResponseDto> promoteUserToAdmin(@Valid @RequestBody PromoteUserRequestDto requestDto) {
         return ResponseEntity.ok(authService.promoteUserToAdmin(requestDto));
     }
+
+    @GetMapping("/internal/account-status")
+    public ResponseEntity<Map<String, Object>> getAccountStatuses(
+            @RequestParam(value = "authIds", required = false) List<String> authIds) {
+        Map<String, String> statuses = authService.getAccountStatuses(authIds);
+        return ResponseEntity.ok(Map.of(
+                "success", true,
+                "data", statuses
+        ));
+    }
+
+            @PostMapping("/internal/team-access/block")
+            public ResponseEntity<Map<String, Object>> blockTeamAccessAccount(
+                @RequestParam("authId") String authId,
+                @RequestParam(value = "changedBy", required = false) String changedBy
+            ) {
+            authService.blockTeamAccessAccount(authId, changedBy);
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "message", "Account blocked successfully"
+            ));
+            }
+
+            @PostMapping("/internal/team-access/unblock")
+            public ResponseEntity<Map<String, Object>> unblockTeamAccessAccount(
+                @RequestParam("authId") String authId,
+                @RequestParam(value = "changedBy", required = false) String changedBy
+            ) {
+            authService.unblockTeamAccessAccount(authId, changedBy);
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "message", "Account unblocked successfully"
+            ));
+            }
+
+        @GetMapping("/admin/platform-users")
+        public ResponseEntity<Map<String, Object>> getAdminPlatformUsers(
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "limit", defaultValue = "10") int limit,
+            @RequestParam(value = "role", required = false) String role,
+            @RequestParam(value = "search", required = false) String search
+        ) {
+        Map<String, Object> result = authService.getAdminPlatformUsers(page, limit, role, search);
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "data", result.get("users"),
+            "pagination", result.get("pagination"),
+            "stats", result.get("stats")
+        ));
+        }
 
 }

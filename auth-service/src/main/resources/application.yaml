@@ -1,5 +1,7 @@
 server:
   port: 8081
+  tomcat:
+    max-part-count: 50
 
 spring:
   application:

@@ -7,6 +7,7 @@ import com.okkazo.authservice.exceptions.TokenExpiredException;
 import com.okkazo.authservice.exceptions.UserNotFoundException;
 import com.okkazo.authservice.models.Auth;
 import com.okkazo.authservice.models.RefreshToken;
+import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
 import com.okkazo.authservice.repositories.RefreshTokenRepository;
 import com.okkazo.authservice.utils.JwtUtil;
@@ -66,6 +67,12 @@ public class RefreshTokenService {
             // Verify user exists
             Auth user = authRepository.findById(userId)
                     .orElseThrow(() -> new UserNotFoundException("User not found"));
+
+            if (user.getStatus() == Status.BLOCKED || user.getStatus() == Status.DELETED) {
+                refreshToken.setRevoked(true);
+                refreshTokenRepository.save(refreshToken);
+                throw new InvalidTokenException("Account is blocked or inactive");
+            }
 
             // Revoke old refresh token
             refreshToken.setRevoked(true);

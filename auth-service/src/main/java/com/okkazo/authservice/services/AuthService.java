@@ -24,6 +24,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -34,6 +38,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Slf4j
@@ -369,4 +376,153 @@ public class AuthService {
                         "Email does not exist"
                 ));
     }
+
+    @Transactional(readOnly = true)
+    public Map<String, String> getAccountStatuses(List<String> authIds) {
+        Map<String, String> statuses = new HashMap<>();
+
+        if (authIds == null || authIds.isEmpty()) {
+            return statuses;
+        }
+
+        List<UUID> validIds = authIds.stream()
+                .filter(id -> id != null && !id.isBlank())
+                .map(id -> {
+                    try {
+                        return UUID.fromString(id);
+                    } catch (IllegalArgumentException ex) {
+                        return null;
+                    }
+                })
+                .filter(id -> id != null)
+                .toList();
+
+        if (validIds.isEmpty()) {
+            return statuses;
+        }
+
+        List<Auth> accounts = repository.findByAuthIdIn(validIds);
+        for (Auth account : accounts) {
+            statuses.put(
+                    String.valueOf(account.getAuthId()),
+                    account.getStatus() == null ? "UNVERIFIED" : account.getStatus().name()
+            );
+        }
+
+        for (UUID id : validIds) {
+            statuses.putIfAbsent(String.valueOf(id), "UNKNOWN");
+        }
+
+        return statuses;
+    }
+
+    @Transactional
+    public void blockTeamAccessAccount(String authId, String changedBy) {
+        if (authId == null || authId.isBlank()) {
+            throw new InvalidTokenException("Auth ID is required");
+        }
+
+        UUID parsedAuthId;
+        try {
+            parsedAuthId = UUID.fromString(authId);
+        } catch (IllegalArgumentException ex) {
+            throw new InvalidTokenException("Invalid auth ID");
+        }
+
+        Auth user = repository.findById(parsedAuthId)
+                .orElseThrow(() -> new UserNotFoundException("User not found"));
+
+        user.setStatus(Status.BLOCKED);
+        repository.save(user);
+        refreshTokenService.revokeAllUserTokens(user);
+
+        log.info("Account blocked via internal team access endpoint: authId={}, changedBy={}", authId, changedBy);
+    }
+
+    @Transactional
+    public void unblockTeamAccessAccount(String authId, String changedBy) {
+        if (authId == null || authId.isBlank()) {
+            throw new InvalidTokenException("Auth ID is required");
+        }
+
+        UUID parsedAuthId;
+        try {
+            parsedAuthId = UUID.fromString(authId);
+        } catch (IllegalArgumentException ex) {
+            throw new InvalidTokenException("Invalid auth ID");
+        }
+
+        Auth user = repository.findById(parsedAuthId)
+                .orElseThrow(() -> new UserNotFoundException("User not found"));
+
+        user.setStatus(Status.ACTIVE);
+        repository.save(user);
+
+        log.info("Account unblocked via internal team access endpoint: authId={}, changedBy={}", authId, changedBy);
+    }
+
+        @Transactional(readOnly = true)
+        public Map<String, Object> getAdminPlatformUsers(int page, int limit, String role, String search) {
+                int safePage = Math.max(page, 1);
+                int safeLimit = Math.min(Math.max(limit, 1), 100);
+
+                Role roleFilter = null;
+                if (role != null && !role.isBlank()) {
+                        try {
+                                roleFilter = Role.valueOf(role.trim().toUpperCase());
+                        } catch (IllegalArgumentException ignored) {
+                                roleFilter = null;
+                        }
+                }
+
+                String normalizedSearch = search == null ? "" : search.trim();
+
+                Pageable pageable = PageRequest.of(
+                                safePage - 1,
+                                safeLimit,
+                                Sort.by(Sort.Direction.DESC, "createdAt")
+                );
+
+                Page<Auth> authPage = repository.findPlatformUsers(roleFilter, normalizedSearch, pageable);
+
+                List<Map<String, Object>> users = authPage.getContent().stream().map(auth -> {
+                        Map<String, Object> item = new HashMap<>();
+                        item.put("authId", auth.getAuthId());
+                        item.put("email", auth.getEmail());
+                        item.put("name", auth.getUsername());
+                        item.put("username", auth.getUsername());
+                        item.put("role", auth.getRole() == null ? Role.USER.name() : auth.getRole().name());
+                        item.put("accountStatus", auth.getStatus() == null ? Status.UNVERIFIED.name() : auth.getStatus().name());
+                        item.put("isVerified", Boolean.TRUE.equals(auth.getIsVerified()));
+                        item.put("createdAt", auth.getCreatedAt());
+                        item.put("updatedAt", auth.getUpdatedAt());
+                        return item;
+                }).toList();
+
+                Map<String, Long> byRole = new HashMap<>();
+                for (Role enumRole : Role.values()) {
+                        byRole.put(enumRole.name(), repository.countByRole(enumRole));
+                }
+
+                long totalUsers = repository.count();
+                long activeUsers = repository.countByStatus(Status.ACTIVE);
+
+                Map<String, Object> stats = new HashMap<>();
+                stats.put("totalUsers", totalUsers);
+                stats.put("activeUsers", activeUsers);
+                stats.put("byRole", byRole);
+
+                Map<String, Object> pagination = new HashMap<>();
+                pagination.put("currentPage", safePage);
+                pagination.put("totalPages", authPage.getTotalPages());
+                pagination.put("totalUsers", authPage.getTotalElements());
+                pagination.put("limit", safeLimit);
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("users", users);
+                result.put("pagination", pagination);
+                result.put("stats", stats);
+
+                return result;
+        }
 }

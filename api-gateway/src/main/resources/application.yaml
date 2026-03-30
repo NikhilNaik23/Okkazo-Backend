@@ -18,6 +18,30 @@ spring:
               enabled: true
               lower-case-service-id: true
           routes:
+            # Auth Service Internal Routes (Admin only)
+            - id: auth-service-internal
+              uri: lb://auth-service
+              predicates:
+                - Path=/auth/internal/**
+              filters:
+                - RewritePath=/auth/(?<segment>.*), /${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: ADMIN
+
+            # Auth Service Admin Routes (Admin/Manager only)
+            - id: auth-service-admin
+              uri: lb://auth-service
+              predicates:
+                - Path=/auth/admin/**
+              filters:
+                - RewritePath=/auth/(?<segment>.*), /${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: ADMIN,MANAGER
+
             # Auth Service Routes (Public - No Authentication Required)
             - id: auth-service-public
               uri: lb://auth-service
@@ -42,7 +66,7 @@ spring:
             - id: admin-service-managers
               uri: lb://admin-service
               predicates:
-                - Path=/api/admin/managers/**
+                - Path=/api/admin/managers/**,/api/admin/ledger/**,/api/admin/reports/**,/api/admin/dashboard/**
               filters:
                 - RewritePath=/api/admin/(?<segment>.*), /${segment}
                 - name: AuthenticationFilter
