@@ -3,6 +3,7 @@ const VendorSelection = require('../models/VendorSelection');
 const PlanningQuoteSnapshot = require('../models/PlanningQuoteSnapshot');
 const createApiError = require('../utils/ApiError');
 const commissionService = require('./commissionService');
+const promoteConfigService = require('./promoteConfigService');
 const promotionConfigService = require('./promotionConfigService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
@@ -47,11 +48,25 @@ const getDemandTier = (daysUntilEvent) => {
   return d <= HIGH_DEMAND_WINDOW_DAYS ? 'HIGH_DEMAND' : 'NORMAL';
 };
 
-const getTierMultipliers = (tier) => {
+const toValidMultiplier = (value, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return n;
+};
+
+const getTierMultipliers = ({ tier, feesConfig }) => {
+  const normalMin = toValidMultiplier(feesConfig?.demandPricingMultipliers?.normal?.min, 1);
+  const normalMaxRaw = toValidMultiplier(feesConfig?.demandPricingMultipliers?.normal?.max, 1);
+  const normalMax = normalMaxRaw >= normalMin ? normalMaxRaw : normalMin;
+
+  const highMin = toValidMultiplier(feesConfig?.demandPricingMultipliers?.highDemand?.min, 1.5);
+  const highMaxRaw = toValidMultiplier(feesConfig?.demandPricingMultipliers?.highDemand?.max, 2.25);
+  const highMax = highMaxRaw >= highMin ? highMaxRaw : highMin;
+
   if (tier === 'HIGH_DEMAND') {
-    return { min: 1.5, max: 2.25 };
+    return { min: highMin, max: highMax };
   }
-  return { min: 1.0, max: 1.5 };
+  return { min: normalMin, max: normalMax };
 };
 
 const applyMultiplierPaise = (paise, multiplier) => {
@@ -104,39 +119,17 @@ const lockQuoteAtApproved = async ({ eventId, lockedByAuthId = null } = {}) => {
   if (daysUntilEvent == null) throw createApiError(409, 'Unable to compute daysUntilEvent');
 
   const demandTier = getDemandTier(daysUntilEvent);
-  const multipliers = getTierMultipliers(demandTier);
+  const feesConfig = await promoteConfigService.getFees();
+  const multipliers = getTierMultipliers({ tier: demandTier, feesConfig });
 
   const selectionDoc = await VendorSelection.findOne({ eventId: String(eventId).trim() });
   if (!selectionDoc) {
     throw createApiError(409, 'VendorSelection is required to lock quote');
   }
 
+  const selection = selectionDoc.toObject();
   const selectedServices = Array.isArray(selectionDoc.selectedServices) ? selectionDoc.selectedServices : [];
   const selectedSet = new Set(selectedServices.map(normalizeServiceKey));
-
-  // Apply repricing multipliers directly to VendorSelection so all downstream totals stay consistent.
-  if (Array.isArray(selectionDoc.vendors)) {
-    for (const v of selectionDoc.vendors) {
-      const service = normalizeServiceKey(v?.service);
-      if (!service || !selectedSet.has(service)) continue;
-
-      const minInr = v?.servicePrice?.min;
-      const maxInr = v?.servicePrice?.max;
-
-      const baseMinPaise = toPaise(minInr);
-      const baseMaxPaise = toPaise(maxInr);
-
-      const nextMinPaise = applyMultiplierPaise(baseMinPaise, multipliers.min);
-      const nextMaxPaise = applyMultiplierPaise(baseMaxPaise, multipliers.max);
-
-      if (!v.servicePrice) v.servicePrice = {};
-      v.servicePrice.min = fromPaiseToInr(nextMinPaise);
-      v.servicePrice.max = fromPaiseToInr(nextMaxPaise);
-    }
-  }
-
-  await selectionDoc.save();
-  const selection = selectionDoc.toObject();
 
   const { rates: commissionRates } = await commissionService.getCommissionConfig();
 
@@ -188,8 +181,10 @@ const lockQuoteAtApproved = async ({ eventId, lockedByAuthId = null } = {}) => {
   const items = [];
   for (const service of selectedServices.map(normalizeServiceKey)) {
     const item = byService.get(service);
-    const vendorMinPaise = toPaise(item?.servicePrice?.min);
-    const vendorMaxPaise = toPaise(item?.servicePrice?.max);
+    const baseMinPaise = toPaise(item?.servicePrice?.min);
+    const baseMaxPaise = toPaise(item?.servicePrice?.max || item?.servicePrice?.min);
+    const vendorMinPaise = applyMultiplierPaise(baseMinPaise, multipliers.min);
+    const vendorMaxPaise = applyMultiplierPaise(baseMaxPaise, multipliers.max);
 
     const percent = Number(commissionRates?.[service] ?? 0);
     const safePercent = Number.isFinite(percent) && percent >= 0 ? percent : 0;

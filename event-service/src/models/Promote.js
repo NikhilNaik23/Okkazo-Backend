@@ -8,6 +8,40 @@ const {
   SERVICE_CHARGE_RATE,
 } = require('../utils/promoteConstants');
 const { planningMinimumDate, startOfTomorrow } = require('../utils/dateRules');
+const { toIstDayString } = require('../utils/istDateTime');
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const IST_OFFSET = '+05:30';
+
+const toSafeInt = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
+};
+
+const getInclusiveIstDaysInRange = (startAt, endAt) => {
+  const startDay = toIstDayString(startAt);
+  const endDay = toIstDayString(endAt || startAt);
+  if (!startDay || !endDay) return [];
+
+  const start = new Date(`${startDay}T00:00:00${IST_OFFSET}`);
+  const end = new Date(`${endDay}T00:00:00${IST_OFFSET}`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
+
+  const min = start.getTime() <= end.getTime() ? start : end;
+  const max = start.getTime() <= end.getTime() ? end : start;
+
+  const days = [];
+  const cursor = new Date(min.getTime());
+  let guard = 0;
+  while (cursor.getTime() <= max.getTime() && guard < 400) {
+    const day = toIstDayString(cursor);
+    if (day) days.push(day);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    guard += 1;
+  }
+
+  return days;
+};
 
 // ─── Sub-schemas ──────────────────────────────────────────────────────────────
 
@@ -27,6 +61,43 @@ const TicketTierSchema = new mongoose.Schema(
       type: Number,
       required: true,
       min: 1,
+    },
+  },
+  { _id: false }
+);
+
+const TicketDayAllocationSchema = new mongoose.Schema(
+  {
+    day: {
+      type: String,
+      required: true,
+      trim: true,
+      match: DAY_RE,
+    },
+    ticketCount: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
+    tierBreakdown: {
+      type: [
+        new mongoose.Schema(
+          {
+            tierName: {
+              type: String,
+              required: true,
+              trim: true,
+            },
+            ticketCount: {
+              type: Number,
+              required: true,
+              min: 0,
+            },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
     },
   },
   { _id: false }
@@ -151,6 +222,10 @@ const PromoteSchema = new mongoose.Schema(
       },
       tiers: {
         type: [TicketTierSchema],
+        default: [],
+      },
+      dayWiseAllocations: {
+        type: [TicketDayAllocationSchema],
         default: [],
       },
     },
@@ -384,6 +459,139 @@ PromoteSchema.pre('validate', function preValidate(next) {
   }
   if (this.tickets?.ticketType === 'free' && this.tickets?.tiers?.length > 0) {
     this.invalidate('tickets.tiers', 'Tiers must be empty for free events');
+  }
+
+  const dayAllocations = Array.isArray(this.tickets?.dayWiseAllocations)
+    ? this.tickets.dayWiseAllocations
+    : [];
+
+  if (this.isNew || dayAllocations.length > 0) {
+    if (dayAllocations.length === 0) {
+      this.invalidate('tickets.dayWiseAllocations', 'tickets.dayWiseAllocations is required');
+    } else {
+    const expectedDays = getInclusiveIstDaysInRange(this.schedule?.startAt, this.schedule?.endAt);
+    const expectedSet = new Set(expectedDays);
+    const actualSet = new Set();
+
+    for (const row of dayAllocations) {
+      const day = String(row?.day || '').trim();
+      if (!DAY_RE.test(day)) {
+        this.invalidate('tickets.dayWiseAllocations.day', 'day must be in YYYY-MM-DD format');
+        continue;
+      }
+      if (actualSet.has(day)) {
+        this.invalidate('tickets.dayWiseAllocations', 'tickets.dayWiseAllocations cannot contain duplicate days');
+        continue;
+      }
+      actualSet.add(day);
+
+      const dayCount = Number(row?.ticketCount || 0);
+      if (!Number.isFinite(dayCount) || dayCount < 1) {
+        this.invalidate('tickets.dayWiseAllocations.ticketCount', 'ticketCount must be at least 1 for each day');
+      }
+      if (Number(this.tickets?.noOfTickets || 0) > 0 && dayCount > Number(this.tickets.noOfTickets)) {
+        this.invalidate('tickets.dayWiseAllocations.ticketCount', 'ticketCount cannot exceed tickets.noOfTickets');
+      }
+      if (expectedSet.size > 0 && !expectedSet.has(day)) {
+        this.invalidate('tickets.dayWiseAllocations', `day ${day} is outside the schedule range`);
+      }
+    }
+
+      if (expectedSet.size > 0) {
+        if (actualSet.size !== expectedSet.size) {
+          this.invalidate('tickets.dayWiseAllocations', 'tickets.dayWiseAllocations must include every schedule day');
+        }
+        for (const expectedDay of expectedSet) {
+          if (!actualSet.has(expectedDay)) {
+            this.invalidate('tickets.dayWiseAllocations', `tickets.dayWiseAllocations is missing schedule day ${expectedDay}`);
+            break;
+          }
+        }
+      }
+
+      const ticketType = String(this.tickets?.ticketType || '').trim().toLowerCase();
+      const tiers = Array.isArray(this.tickets?.tiers) ? this.tickets.tiers : [];
+      const tierTargets = new Map();
+      const hasAnyTierBreakdown = dayAllocations.some((row) => Array.isArray(row?.tierBreakdown) && row.tierBreakdown.length > 0);
+      const shouldValidateTierBreakdown = this.isNew || hasAnyTierBreakdown;
+
+      if (ticketType === 'paid' && shouldValidateTierBreakdown) {
+        for (const tier of tiers) {
+          const tierName = String(tier?.name || '').trim();
+          if (!tierName) {
+            this.invalidate('tickets.tiers.name', 'name is required for paid event tiers');
+            continue;
+          }
+          if (tierTargets.has(tierName)) {
+            this.invalidate('tickets.tiers', 'tickets.tiers cannot contain duplicate name values');
+            continue;
+          }
+          tierTargets.set(tierName, toSafeInt(tier?.quantity));
+        }
+
+        const tierTotals = Object.fromEntries(Array.from(tierTargets.keys()).map((name) => [name, 0]));
+
+        for (const row of dayAllocations) {
+          const day = String(row?.day || '').trim();
+          const dayCount = toSafeInt(row?.ticketCount);
+          const breakdown = Array.isArray(row?.tierBreakdown) ? row.tierBreakdown : [];
+
+          if (breakdown.length !== tierTargets.size) {
+            this.invalidate(
+              'tickets.dayWiseAllocations.tierBreakdown',
+              `tierBreakdown must include every tier for day ${day}`
+            );
+            continue;
+          }
+
+          let dayTierTotal = 0;
+          const dayTierSeen = new Set();
+          for (const item of breakdown) {
+            const tierName = String(item?.tierName || '').trim();
+            const itemCount = toSafeInt(item?.ticketCount);
+
+            if (!tierTargets.has(tierName)) {
+              this.invalidate('tickets.dayWiseAllocations.tierBreakdown', `Unknown tierName ${tierName} in tierBreakdown`);
+              continue;
+            }
+            if (dayTierSeen.has(tierName)) {
+              this.invalidate(
+                'tickets.dayWiseAllocations.tierBreakdown',
+                `Duplicate tierName ${tierName} in tierBreakdown for day ${day}`
+              );
+              continue;
+            }
+
+            dayTierSeen.add(tierName);
+            dayTierTotal += itemCount;
+            tierTotals[tierName] += itemCount;
+          }
+
+          if (dayTierTotal !== dayCount) {
+            this.invalidate(
+              'tickets.dayWiseAllocations.tierBreakdown',
+              `tierBreakdown total must equal ticketCount for day ${day}`
+            );
+          }
+        }
+
+        for (const [tierName, targetCount] of tierTargets.entries()) {
+          if (toSafeInt(tierTotals[tierName]) !== toSafeInt(targetCount)) {
+            this.invalidate(
+              'tickets.dayWiseAllocations.tierBreakdown',
+              `tierBreakdown total for ${tierName} must match tickets.tiers.quantity`
+            );
+          }
+        }
+      }
+
+      if (ticketType === 'free' && shouldValidateTierBreakdown) {
+        const hasTierBreakdown = dayAllocations.some((row) => Array.isArray(row?.tierBreakdown) && row.tierBreakdown.length > 0);
+        if (hasTierBreakdown) {
+          this.invalidate('tickets.dayWiseAllocations.tierBreakdown', 'tierBreakdown must be empty when ticketType is free');
+        }
+      }
+    }
   }
 
   // Revenue calculations

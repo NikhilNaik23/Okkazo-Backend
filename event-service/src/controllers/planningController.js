@@ -1,17 +1,26 @@
 const planningService = require('../services/planningService');
 const planningQuoteService = require('../services/planningQuoteService');
+const promoteConfigService = require('../services/promoteConfigService');
 const { resolveUserServiceIdFromAuthId, fetchUserById } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 const axios = require('axios');
 const vendorReservationService = require('../services/vendorReservationService');
+const {
+  toIstDayString,
+  normalizeIstDayInput,
+  parseIstDayStart,
+  startOfIstDay,
+} = require('../utils/istDateTime');
 
 const defaultVendorServiceUrl = process.env.SERVICE_HOST
   ? 'http://vendor-service:8084' // docker-compose service name
   : 'http://localhost:8084';
 const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceUrl;
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
+const HIGH_DEMAND_START_DAYS = 6;
+const HIGH_DEMAND_END_DAYS = 20;
 
 const toNumber = (value, fallback = null) => {
   if (value == null) return fallback;
@@ -62,6 +71,47 @@ const extractRating = (service) => {
 const buildMapsUrl = ({ latitude, longitude }) => {
   if (latitude == null || longitude == null) return null;
   return `https://www.google.com/maps?q=${encodeURIComponent(String(latitude))},${encodeURIComponent(String(longitude))}`;
+};
+
+const toValidMultiplier = (value, fallback) => {
+  const n = toNumber(value, fallback);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const parseDemandMultipliers = (feesConfig) => {
+  const normalMin = toValidMultiplier(feesConfig?.demandPricingMultipliers?.normal?.min, 1);
+  const normalMax = toValidMultiplier(feesConfig?.demandPricingMultipliers?.normal?.max, 1);
+  const highDemandMin = toValidMultiplier(feesConfig?.demandPricingMultipliers?.highDemand?.min, 1.5);
+  const highDemandMax = toValidMultiplier(feesConfig?.demandPricingMultipliers?.highDemand?.max, 2.25);
+
+  return {
+    normal: {
+      min: normalMin,
+      max: normalMax >= normalMin ? normalMax : normalMin,
+    },
+    highDemand: {
+      min: highDemandMin,
+      max: highDemandMax >= highDemandMin ? highDemandMax : highDemandMin,
+    },
+  };
+};
+
+const getDemandTierForDay = (day) => {
+  const d = normalizeIstDayInput(day);
+  if (!d) return 'NORMAL';
+
+  const selectedDate = parseIstDayStart(d);
+  if (!selectedDate || Number.isNaN(selectedDate.getTime())) return 'NORMAL';
+
+  const today = startOfIstDay(new Date());
+  if (!today) return 'NORMAL';
+
+  const diffTime = selectedDate.getTime() - today.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+  return diffDays >= HIGH_DEMAND_START_DAYS && diffDays <= HIGH_DEMAND_END_DAYS
+    ? 'HIGH_DEMAND'
+    : 'NORMAL';
 };
 
 const ensureAccessToPlanning = async ({ eventId, user }) => {
@@ -708,6 +758,41 @@ const updatePlanningDetails = async (req, res) => {
 };
 
 /**
+ * Sync planning reservation day (Owner)
+ * PATCH /planning/:eventId/reservation-day
+ */
+const syncPlanningReservationDay = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const updated = await planningService.updatePlanningReservationDayForOwner({
+      eventId,
+      authId: req.user.authId,
+      day: req.body?.day,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Planning date synced successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in syncPlanningReservationDay:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to sync planning date',
+    });
+  }
+};
+
+/**
  * Add CORE staff to planning event (Manager/Admin)
  * POST /planning/:eventId/core-staff
  */
@@ -843,15 +928,38 @@ const getVendorsForPlanning = async (req, res) => {
     const normalizedServiceCategory = String(serviceCategory).trim();
     const isVenueCategory = normalizedServiceCategory === 'Venue';
 
-    // If caller doesn't provide a day/range, fall back to planning event date if present.
-    const planningDayFallback =
-      planning?.eventDate instanceof Date
-        ? planning.eventDate.toISOString().slice(0, 10)
-        : (planning?.schedule?.startAt instanceof Date ? planning.schedule.startAt.toISOString().slice(0, 10) : null);
+    const planningReservationDays = vendorReservationService.planningToReservationDays(planning);
+    const planningFromFallback = planningReservationDays[0] || null;
+    const planningToFallback = planningReservationDays.length > 0
+      ? planningReservationDays[planningReservationDays.length - 1]
+      : null;
+    const planningDayFallback = planningFromFallback;
 
-    const effectiveDay = (day && String(day).trim()) ? String(day).trim() : planningDayFallback;
-    const effectiveFrom = (from && String(from).trim()) ? String(from).trim() : null;
-    const effectiveTo = (to && String(to).trim()) ? String(to).trim() : null;
+    const requestedDay = normalizeIstDayInput(day);
+    const requestedFrom = normalizeIstDayInput(from);
+    const requestedTo = normalizeIstDayInput(to);
+
+    const isPublicPlanning = String(planning?.category || '').trim().toLowerCase() === 'public';
+
+    const effectiveFrom = requestedFrom || (isPublicPlanning ? planningFromFallback : null);
+    const effectiveTo = requestedTo || (isPublicPlanning ? (planningToFallback || effectiveFrom) : null);
+    const effectiveDay = requestedDay || (!isPublicPlanning ? planningDayFallback : null);
+
+    const reservationDays = vendorReservationService.resolveReservationDays({
+      day: effectiveDay,
+      from: effectiveFrom,
+      to: effectiveTo,
+      days: isPublicPlanning ? planningReservationDays : [],
+    });
+
+    const effectiveDemandDay = effectiveDay || effectiveFrom || planningDayFallback;
+
+    const feesConfig = await promoteConfigService.getFees();
+    const configuredMultipliers = parseDemandMultipliers(feesConfig);
+    const demandTier = getDemandTierForDay(effectiveDemandDay);
+    const activeMultipliers = demandTier === 'HIGH_DEMAND'
+      ? configuredMultipliers.highDemand
+      : configuredMultipliers.normal;
 
     const hasRadiusParam = Object.prototype.hasOwnProperty.call(req.query, 'radiusKm');
     const rawRadiusKm = hasRadiusParam ? toNumber(radiusKm, 50) : null;
@@ -869,9 +977,9 @@ const getVendorsForPlanning = async (req, res) => {
       // Venue uses per-service coordinates (a vendor can have multiple venues across cities),
       // so we do NOT geo-filter upstream. We'll filter in this controller.
       enableGeo: !isVenueCategory && hasRadiusParam && lat1 != null && lon1 != null,
-      day: effectiveDay,
-      from: effectiveFrom,
-      to: effectiveTo,
+      day: reservationDays.length === 1 ? reservationDays[0] : null,
+      from: reservationDays.length > 1 ? reservationDays[0] : null,
+      to: reservationDays.length > 1 ? reservationDays[reservationDays.length - 1] : null,
     });
 
     const minP = toNumber(priceMin, 0);
@@ -880,6 +988,10 @@ const getVendorsForPlanning = async (req, res) => {
 
     let serviceItems = vendorServices
       .map((s) => {
+        const basePrice = toNumber(s?.price, toNumber(s?.basePrice, null));
+        const scaledPriceMin = basePrice == null ? null : Math.max(0, Math.round(basePrice * activeMultipliers.min));
+        const scaledPriceMax = basePrice == null ? null : Math.max(0, Math.round(basePrice * activeMultipliers.max));
+
         return {
           serviceId: s?._id,
           vendorAuthId: s?.authId,
@@ -887,7 +999,10 @@ const getVendorsForPlanning = async (req, res) => {
           name: s?.name,
           serviceCategory: s?.serviceCategory,
           categoryId: s?.categoryId,
-          price: s?.price,
+          basePrice,
+          price: scaledPriceMin,
+          priceMin: scaledPriceMin,
+          priceMax: scaledPriceMax,
           tier: s?.tier,
           description: s?.description,
           details: s?.details || {},
@@ -898,10 +1013,11 @@ const getVendorsForPlanning = async (req, res) => {
         };
       })
       .filter((v) => {
-        const price = toNumber(v.price, null);
-        if (price == null) return true;
-        if (price < minP) return false;
-        if (maxP != null && price > maxP) return false;
+        const minPrice = toNumber(v.priceMin, null);
+        const maxPrice = toNumber(v.priceMax, minPrice);
+        if (minPrice == null && maxPrice == null) return true;
+        if (maxP != null && minPrice != null && minPrice > maxP) return false;
+        if (minP != null && maxPrice != null && maxPrice < minP) return false;
         return true;
       });
 
@@ -974,9 +1090,10 @@ const getVendorsForPlanning = async (req, res) => {
           }
         }
 
-        const prices = services.map((s) => toNumber(s.price, null)).filter((p) => p != null);
-        const priceMin = prices.length ? Math.min(...prices) : null;
-        const priceMax = prices.length ? Math.max(...prices) : null;
+        const pricesMin = services.map((s) => toNumber(s.priceMin, null)).filter((p) => p != null);
+        const pricesMax = services.map((s) => toNumber(s.priceMax, null)).filter((p) => p != null);
+        const priceMin = pricesMin.length ? Math.min(...pricesMin) : null;
+        const priceMax = pricesMax.length ? Math.max(...pricesMax) : null;
 
         const rating = Math.max(
           0,
@@ -1006,6 +1123,9 @@ const getVendorsForPlanning = async (req, res) => {
             serviceId: s.serviceId,
             name: s.name,
             price: s.price,
+            priceMin: s.priceMin,
+            priceMax: s.priceMax,
+            basePrice: s.basePrice,
             tier: s.tier,
             description: s.description,
             details: s.details,
@@ -1030,10 +1150,10 @@ const getVendorsForPlanning = async (req, res) => {
     // Exclude reserved resources by other events on the same day.
     // - Venue: lock is service-level (serviceId)
     // - Other categories: lock is vendor-level (vendorAuthId)
-    if (effectiveDay) {
+    if (reservationDays.length > 0) {
       if (isVenueCategory) {
-        const reservedServiceIds = await vendorReservationService.listReservedServiceIdsForDay({
-          day: effectiveDay,
+        const reservedServiceIds = await vendorReservationService.listReservedServiceIdsForDays({
+          days: reservationDays,
           excludeEventId: eventId.trim(),
         });
 
@@ -1056,21 +1176,26 @@ const getVendorsForPlanning = async (req, res) => {
               if (filteredServices.length === 0) return null;
 
               const prices = filteredServices
-                .map((s) => toNumber(s.price, null))
-                .filter((p) => p != null);
+                .map((s) => ({
+                  min: toNumber(s.priceMin, null),
+                  max: toNumber(s.priceMax, null),
+                }));
+
+              const minPrices = prices.map((p) => p.min).filter((p) => p != null);
+              const maxPrices = prices.map((p) => p.max).filter((p) => p != null);
 
               return {
                 ...v,
                 services: filteredServices,
-                priceMin: prices.length ? Math.min(...prices) : v.priceMin,
-                priceMax: prices.length ? Math.max(...prices) : v.priceMax,
+                priceMin: minPrices.length ? Math.min(...minPrices) : v.priceMin,
+                priceMax: maxPrices.length ? Math.max(...maxPrices) : v.priceMax,
               };
             })
             .filter(Boolean);
         }
       } else {
-        const reserved = await vendorReservationService.listReservedVendorAuthIdsForDay({
-          day: effectiveDay,
+        const reserved = await vendorReservationService.listReservedVendorAuthIdsForDays({
+          days: reservationDays,
           excludeEventId: eventId.trim(),
         });
 
@@ -1119,6 +1244,12 @@ const getVendorsForPlanning = async (req, res) => {
       success: true,
       data: {
         serviceCategory: normalizedServiceCategory,
+        demandTier,
+        pricingMultipliers: {
+          active: activeMultipliers,
+          normal: configuredMultipliers.normal,
+          highDemand: configuredMultipliers.highDemand,
+        },
         vendors: items,
       },
     });
@@ -1147,6 +1278,7 @@ module.exports = {
   getManagerPlanningEvents,
   getManagerPlanningApplications,
   updatePlanningDetails,
+  syncPlanningReservationDay,
   addPlanningCoreStaff,
   removePlanningCoreStaff,
 };

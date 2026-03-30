@@ -20,6 +20,30 @@ const PromoteConfigSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+    normalDayMinMultiplier: {
+      type: Number,
+      required: true,
+      min: 0.01,
+      default: 1,
+    },
+    normalDayMaxMultiplier: {
+      type: Number,
+      required: true,
+      min: 0.01,
+      default: 1,
+    },
+    highDemandMinMultiplier: {
+      type: Number,
+      required: true,
+      min: 0.01,
+      default: 1.5,
+    },
+    highDemandMaxMultiplier: {
+      type: Number,
+      required: true,
+      min: 0.01,
+      default: 2.25,
+    },
     updatedByAuthId: {
       type: String,
       default: null,

@@ -45,6 +45,26 @@ const ensureEventConversation = async ({ eventId, senderAuthId, senderRole }) =>
   });
 };
 
+const ensureEventDmConversation = async ({ eventId, otherAuthId, senderAuthId, senderRole }) => {
+  const safeEventId = String(eventId || '').trim();
+  const safeOtherAuthId = String(otherAuthId || '').trim();
+  const safeAuthId = String(senderAuthId || '').trim();
+  const safeRole = String(senderRole || '').trim();
+
+  if (!safeEventId || !safeOtherAuthId || !safeAuthId || !safeRole) {
+    throw new Error('eventId, otherAuthId, senderAuthId, senderRole are required');
+  }
+
+  const baseUrl = resolveChatServiceBaseUrl();
+  const url = `${baseUrl}/api/chat/conversations/event/${encodeURIComponent(safeEventId)}/dm/${encodeURIComponent(safeOtherAuthId)}/ensure`;
+
+  return postJson({
+    url,
+    body: {},
+    headers: { 'x-auth-id': safeAuthId, 'x-user-role': safeRole },
+  });
+};
+
 const sendConversationMessage = async ({ conversationId, senderAuthId, senderRole, text }) => {
   const convoId = String(conversationId || '').trim();
   const safeAuthId = String(senderAuthId || '').trim();
@@ -83,8 +103,29 @@ const sendEventConversationMessage = async ({ eventId, senderAuthId, senderRole,
   }
 };
 
+const sendEventDmConversationMessage = async ({ eventId, otherAuthId, senderAuthId, senderRole, text }) => {
+  const convo = await ensureEventDmConversation({ eventId, otherAuthId, senderAuthId, senderRole });
+  const conversationId = String(convo?._id || convo?.id || '').trim();
+  if (!conversationId) throw new Error('Failed to resolve conversationId');
+
+  try {
+    return await sendConversationMessage({ conversationId, senderAuthId, senderRole, text });
+  } catch (err) {
+    logger.error('Failed to send chat message to event DM conversation', {
+      eventId: String(eventId || '').trim(),
+      otherAuthId: String(otherAuthId || '').trim(),
+      conversationId,
+      senderRole,
+      message: err?.message || String(err),
+    });
+    throw err;
+  }
+};
+
 module.exports = {
   ensureEventConversation,
+  ensureEventDmConversation,
   sendConversationMessage,
   sendEventConversationMessage,
+  sendEventDmConversationMessage,
 };

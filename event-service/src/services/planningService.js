@@ -6,11 +6,17 @@ const createApiError = require('../utils/ApiError');
 const { STATUS, STATUS_VALUES, CATEGORY } = require('../utils/planningConstants');
 const { PROMOTE_STATUS, ADMIN_DECISION_STATUS } = require('../utils/promoteConstants');
 const vendorSelectionService = require('./vendorSelectionService');
+const vendorReservationService = require('./vendorReservationService');
 const promoteConfigService = require('./promoteConfigService');
 const planningQuoteService = require('./planningQuoteService');
 const mongoose = require('mongoose');
 const { fetchUserById } = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
+const {
+  parseIstDayStart,
+  shiftDateKeepingIstTime,
+  toIstDayString,
+} = require('../utils/istDateTime');
 
 const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
   [CATEGORY.PUBLIC]: 'Public Event',
@@ -18,6 +24,70 @@ const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
 };
 
 const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const ensureStickyVendorReservationsForPlanning = async (planning) => {
+  const eid = String(planning?.eventId || '').trim();
+  const uid = String(planning?.authId || '').trim();
+  if (!eid || !uid) return { attempted: 0, claimed: 0, conflicts: 0, skipped: true, reason: 'missing eventId/authId' };
+
+  const reservationDays = vendorReservationService.planningToReservationDays(planning);
+  if (reservationDays.length === 0) return { attempted: 0, claimed: 0, conflicts: 0, skipped: true, reason: 'missing planning day' };
+
+  const selection = await VendorSelection.findOne({ eventId: eid })
+    .select('vendors')
+    .lean();
+
+  const vendorItems = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  if (!selection || vendorItems.length === 0) {
+    return { attempted: 0, claimed: 0, conflicts: 0, skipped: true, reason: 'missing vendor selection' };
+  }
+
+  let attempted = 0;
+  let claimed = 0;
+  let conflicts = 0;
+
+  for (const item of vendorItems) {
+    const vendorAuthId = item?.vendorAuthId != null ? String(item.vendorAuthId).trim() : '';
+    if (!vendorAuthId) continue;
+
+    attempted += 1;
+    try {
+      await vendorReservationService.claimForDays({
+        vendorAuthId,
+        days: reservationDays,
+        eventId: eid,
+        authId: uid,
+        service: item?.service || null,
+        serviceId: item?.serviceId || null,
+      });
+      claimed += 1;
+    } catch (error) {
+      if (error?.statusCode === 409 || error?.status === 409) {
+        conflicts += 1;
+        logger.warn('Sticky vendor reservation claim conflict after payment', {
+          eventId: eid,
+          days: reservationDays,
+          vendorAuthId,
+          service: item?.service || null,
+          serviceId: item?.serviceId || null,
+          message: error?.message,
+        });
+        continue;
+      }
+
+      logger.error('Failed to claim sticky vendor reservation after payment', {
+        eventId: eid,
+        day,
+        vendorAuthId,
+        service: item?.service || null,
+        serviceId: item?.serviceId || null,
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  return { attempted, claimed, conflicts, skipped: false, days: reservationDays };
+};
 
 const isAssignedRoleEligible = (assignedRole) => {
   if (!assignedRole) return false;
@@ -605,6 +675,86 @@ const updatePlanningDetails = async ({ eventId, updates = {}, actorRole, actorMa
 };
 
 /**
+ * Sync reservation day for a planning owner.
+ * This keeps planning.eventDate/schedule day aligned with vendor selection reservation day.
+ */
+const updatePlanningReservationDayForOwner = async ({ eventId, authId, day } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  const trimmedAuthId = String(authId || '').trim();
+  const parsedDay = parseIstDayStart(day);
+
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+  if (!trimmedAuthId) throw createApiError(400, 'authId is required');
+  if (!parsedDay) throw createApiError(400, 'day must be in YYYY-MM-DD format');
+
+  const planning = await Planning.findOne({ eventId: trimmedEventId, authId: trimmedAuthId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const blockedStatuses = new Set([STATUS.CONFIRMED, STATUS.COMPLETED, STATUS.REJECTED]);
+  const currentStatus = String(planning.status || '').trim();
+  if (blockedStatuses.has(currentStatus)) {
+    throw createApiError(409, 'Cannot change date for finalized planning status');
+  }
+
+  const previousReservationDay = String(planning.category || '').trim() === CATEGORY.PUBLIC
+    ? toIstDayString(planning?.schedule?.startAt)
+    : toIstDayString(planning?.eventDate);
+  const nextReservationDay = toIstDayString(parsedDay);
+
+  if (String(planning.category || '').trim() === CATEGORY.PUBLIC) {
+    const currentStart = toDateOrNull(planning?.schedule?.startAt);
+    const currentEnd = toDateOrNull(planning?.schedule?.endAt);
+
+    if (!currentStart) {
+      throw createApiError(409, 'Public event schedule is missing start date');
+    }
+
+    const nextStart = shiftDateKeepingIstTime(nextReservationDay, currentStart);
+    const durationMs = currentEnd ? Math.max(0, currentEnd.getTime() - currentStart.getTime()) : 0;
+    const nextEnd = currentEnd ? new Date(nextStart.getTime() + durationMs) : null;
+
+    const ticketStart = toDateOrNull(planning?.ticketAvailability?.startAt);
+    const ticketEnd = toDateOrNull(planning?.ticketAvailability?.endAt);
+
+    planning.schedule = {
+      ...(planning.schedule || {}),
+      startAt: nextStart,
+      ...(nextEnd ? { endAt: nextEnd } : {}),
+    };
+
+    if (ticketStart || ticketEnd) {
+      const nextTicketStart = ticketStart
+        ? new Date(nextStart.getTime() + (ticketStart.getTime() - currentStart.getTime()))
+        : null;
+      const nextTicketEnd = ticketEnd
+        ? new Date(nextStart.getTime() + (ticketEnd.getTime() - currentStart.getTime()))
+        : null;
+
+      planning.ticketAvailability = {
+        ...(planning.ticketAvailability || {}),
+        ...(nextTicketStart ? { startAt: nextTicketStart } : {}),
+        ...(nextTicketEnd ? { endAt: nextTicketEnd } : {}),
+      };
+    }
+  } else {
+    planning.eventDate = parsedDay;
+  }
+
+  await planning.save();
+
+  if (previousReservationDay && nextReservationDay && previousReservationDay !== nextReservationDay) {
+    await vendorReservationService.reassignEventReservationsDay({
+      eventId: trimmedEventId,
+      fromDay: previousReservationDay,
+      toDay: nextReservationDay,
+    });
+  }
+
+  const cfg = await promoteConfigService.getFees();
+  return normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+};
+
+/**
  * Add a CORE staff member to a planning event (Manager/Admin)
  */
 const addPlanningCoreStaff = async ({ eventId, staffId, actorRole, actorManagerId } = {}) => {
@@ -816,6 +966,26 @@ const markPlanningDepositPaid = async (eventId, { amountPaise = null, currency =
   await planning.save({ validateBeforeSave: false });
   logger.info(`Planning deposit marked as paid: ${eventId}`);
 
+  // Once payment progress begins, reservations must become sticky (non-expiring).
+  // Best-effort: claim/refresh reservations for each selected vendor on the planning day.
+  try {
+    await vendorSelectionService.ensureForPlanning(planning);
+  } catch (err) {
+    logger.warn('Failed to ensure VendorSelection while making reservations sticky (deposit)', {
+      eventId: planning.eventId,
+      message: err?.message,
+    });
+  }
+
+  try {
+    await ensureStickyVendorReservationsForPlanning(planning);
+  } catch (err) {
+    logger.error('Failed to refresh sticky vendor reservations after deposit payment', {
+      eventId: planning.eventId,
+      message: err?.message,
+    });
+  }
+
   return planning;
 };
 
@@ -861,6 +1031,26 @@ const markPlanningVendorConfirmationPaid = async (
 
   await planning.save({ validateBeforeSave: false });
   logger.info(`Planning vendor confirmation marked as paid: ${eventId} -> ${planning.status}`);
+
+  // Vendor confirmation payment locks vendors for the date permanently.
+  try {
+    await vendorSelectionService.ensureForPlanning(planning);
+  } catch (err) {
+    logger.warn('Failed to ensure VendorSelection while making reservations sticky (vendor confirmation)', {
+      eventId: planning.eventId,
+      message: err?.message,
+    });
+  }
+
+  try {
+    await ensureStickyVendorReservationsForPlanning(planning);
+  } catch (err) {
+    logger.error('Failed to refresh sticky vendor reservations after vendor confirmation payment', {
+      eventId: planning.eventId,
+      message: err?.message,
+    });
+  }
+
   return planning;
 };
 
@@ -984,6 +1174,7 @@ module.exports = {
   getPlanningsForManager,
   getPlanningApplicationsForManager,
   updatePlanningDetails,
+  updatePlanningReservationDayForOwner,
   addPlanningCoreStaff,
   removePlanningCoreStaff,
 };

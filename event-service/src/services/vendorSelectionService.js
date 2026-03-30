@@ -3,7 +3,24 @@ const VendorSelection = require('../models/VendorSelection');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { SERVICE_OPTIONS, VENDOR_STATUS } = require('../utils/vendorSelectionConstants');
+const { STATUS } = require('../utils/planningConstants');
 const vendorReservationService = require('./vendorReservationService');
+const commissionService = require('./commissionService');
+
+const STICKY_PLANNING_STATUSES = new Set([STATUS.CONFIRMED, STATUS.COMPLETED]);
+const PRICING_UNIT_VALUES = new Set(['EVENT', 'PER_PERSON', 'PER_PLATE', 'PER_KG', 'PER_100_UNITS', 'FIXED']);
+
+const toSortedUniqueDays = (days = []) => {
+  const list = Array.isArray(days) ? days : [days];
+  return Array.from(new Set(list.map((d) => String(d || '').trim()).filter(Boolean))).sort();
+};
+
+const areSameDaySets = (left = [], right = []) => {
+  const a = toSortedUniqueDays(left);
+  const b = toSortedUniqueDays(right);
+  if (a.length !== b.length) return false;
+  return a.every((v, idx) => v === b[idx]);
+};
 
 const SERVICE_ALIASES = {
   catering: 'Catering & Drinks',
@@ -75,6 +92,39 @@ const normalizeServices = (selectedServices) => {
   return unique;
 };
 
+const sanitizePricingUnit = (value) => {
+  const raw = value == null ? '' : String(value).trim().toUpperCase();
+  if (!raw) return null;
+  return PRICING_UNIT_VALUES.has(raw) ? raw : null;
+};
+
+const sanitizePricingQuantity = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n * 100) / 100;
+};
+
+const sanitizePricingQuantityUnit = (value) => {
+  const raw = value == null ? '' : String(value).trim();
+  if (!raw) return null;
+  return raw.slice(0, 32);
+};
+
+const toMoney = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.round(n * 100) / 100;
+};
+
+const isVendorItemPriceLocked = (item) => {
+  const quoted = Number(item?.vendorQuotedPrice || 0);
+  const hasExplicitQuote = Number.isFinite(quoted) && quoted > 0;
+
+  // Final quotation is considered locked only when vendor explicitly locks price
+  // and provides quoted amount. Do not tie lock state to booking min/max range.
+  return Boolean(item?.priceLocked) && hasExplicitQuote;
+};
+
 const ensureForPlanning = async (planning) => {
   if (!planning?.eventId || !planning?.authId) {
     throw createApiError(400, 'Planning eventId and authId are required');
@@ -97,6 +147,13 @@ const ensureForPlanning = async (planning) => {
         alternativeNeeded: false,
         rejectionReason: null,
         servicePrice: { min: 0, max: 0 },
+        vendorQuotedPrice: null,
+        commissionPercent: null,
+        commissionAmount: null,
+        priceLocked: false,
+        pricingUnit: null,
+        pricingQuantity: null,
+        pricingQuantityUnit: null,
       })),
     });
 
@@ -159,6 +216,13 @@ const ensureForPlanning = async (planning) => {
       alternativeNeeded: false,
       rejectionReason: null,
       servicePrice: { min: 0, max: 0 },
+      vendorQuotedPrice: null,
+      commissionPercent: null,
+      commissionAmount: null,
+      priceLocked: false,
+      pricingUnit: null,
+      pricingQuantity: null,
+      pricingQuantityUnit: null,
     };
   });
 
@@ -227,6 +291,10 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
   if (!planning) throw createApiError(404, 'Planning not found');
 
   const selection = await ensureForPlanning(planning);
+  const planningDays = vendorReservationService.planningToReservationDays(planning);
+  const previousVendors = Array.isArray(selection.vendors)
+    ? selection.vendors.map((v) => (v?.toObject ? v.toObject() : v))
+    : [];
 
   selection.selectedServices = services;
 
@@ -242,6 +310,13 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
       alternativeNeeded: false,
       rejectionReason: null,
       servicePrice: { min: 0, max: 0 },
+      vendorQuotedPrice: null,
+      commissionPercent: null,
+      commissionAmount: null,
+      priceLocked: false,
+      pricingUnit: null,
+      pricingQuantity: null,
+      pricingQuantityUnit: null,
     };
   });
 
@@ -253,6 +328,39 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
     { _id: planning._id },
     { $set: { selectedServices: services } }
   );
+
+  // Release reservations for services that were removed from selection.
+  if (planningDays.length > 0) {
+    const selectedServiceSet = new Set(services.map((s) => String(s || '').trim()).filter(Boolean));
+    const toRelease = previousVendors.filter((item) => {
+      const service = String(item?.service || '').trim();
+      const vendorAuthId = String(item?.vendorAuthId || '').trim();
+      if (!service || !vendorAuthId) return false;
+      return !selectedServiceSet.has(service);
+    });
+
+    await Promise.all(
+      toRelease.map(async (item) => {
+        try {
+          await vendorReservationService.releaseForDays({
+            vendorAuthId: item.vendorAuthId,
+            days: planningDays,
+            eventId: eventId.trim(),
+            service: item.service,
+            serviceId: item.serviceId || null,
+          });
+        } catch (error) {
+          logger.warn('Failed to release reservation for removed service', {
+            eventId: eventId.trim(),
+            service: item?.service || null,
+            vendorAuthId: item?.vendorAuthId || null,
+            serviceId: item?.serviceId || null,
+            error: error?.message || String(error),
+          });
+        }
+      })
+    );
+  }
 
   return selection.toObject();
 };
@@ -266,7 +374,17 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
 
   const selection = await ensureForPlanning(planning);
 
-  const planningDay = vendorReservationService.planningToDay(planning);
+  const planningDays = vendorReservationService.planningToReservationDays(planning);
+  const requestedDay = vendorUpdate?.day != null ? String(vendorUpdate.day).trim() : '';
+  const requestedFrom = vendorUpdate?.from != null ? String(vendorUpdate.from).trim() : '';
+  const requestedTo = vendorUpdate?.to != null ? String(vendorUpdate.to).trim() : '';
+  const requestedDays = vendorReservationService.resolveReservationDays({
+    day: requestedDay,
+    from: requestedFrom,
+    to: requestedTo,
+  });
+  const reservationDays = requestedDays.length > 0 ? requestedDays : planningDays;
+  const dayChangedAgainstPlanning = requestedDays.length > 0 && !areSameDaySets(requestedDays, planningDays);
 
   const service = canonicalizeService(vendorUpdate?.service);
   if (!service) throw createApiError(400, 'service is required');
@@ -308,7 +426,30 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
         return safeMax;
       })(),
     },
+    vendorQuotedPrice: null,
+    commissionPercent: null,
+    commissionAmount: null,
+    priceLocked: false,
+    pricingUnit: sanitizePricingUnit(vendorUpdate?.pricingUnit),
+    pricingQuantity: sanitizePricingQuantity(vendorUpdate?.pricingQuantity),
+    pricingQuantityUnit: sanitizePricingQuantityUnit(vendorUpdate?.pricingQuantityUnit),
   };
+
+  if (!next.pricingQuantity) {
+    next.pricingQuantityUnit = null;
+  }
+
+  if (!next.vendorAuthId) {
+    next.serviceId = null;
+    next.pricingUnit = null;
+    next.pricingQuantity = null;
+    next.pricingQuantityUnit = null;
+    next.servicePrice = { min: 0, max: 0 };
+    next.vendorQuotedPrice = null;
+    next.commissionPercent = null;
+    next.commissionAmount = null;
+    next.priceLocked = false;
+  }
 
   if (service === 'Venue' && next.vendorAuthId && !next.serviceId) {
     throw createApiError(400, 'serviceId is required when selecting a venue');
@@ -326,21 +467,25 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
       : null;
 
   const reservationIdentityChanged =
-    next.vendorAuthId != null && (
+    (next.vendorAuthId != null && (
       next.vendorAuthId !== currentVendorAuthId ||
       ((next.serviceId || null) !== (currentServiceId || null))
-    );
+    )) ||
+    (next.vendorAuthId == null && currentVendorAuthId != null);
+  const deselectRequested = next.vendorAuthId == null;
 
-  // Claim new reservation first (so we don't drop an existing valid selection on conflict)
+  // Claim reservation first (so we don't drop an existing valid selection on conflict)
+  // We intentionally claim even when vendor/service identity is unchanged to ensure
+  // date changes are validated against current locks.
   let claimedReservation = false;
-  if (next.vendorAuthId && reservationIdentityChanged) {
-    if (!planningDay) {
+  if (next.vendorAuthId) {
+    if (reservationDays.length === 0) {
       throw createApiError(400, 'Event date is required before selecting vendors');
     }
 
-    await vendorReservationService.claim({
+    await vendorReservationService.claimForDays({
       vendorAuthId: next.vendorAuthId,
-      day: planningDay,
+      days: reservationDays,
       eventId: eventId.trim(),
       authId: authId.trim(),
       service,
@@ -371,11 +516,11 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     await selection.save();
   } catch (e) {
     // Roll back any newly-claimed reservation if selection save fails
-    if (claimedReservation && planningDay && next.vendorAuthId) {
+    if (claimedReservation && reservationDays.length > 0 && next.vendorAuthId) {
       vendorReservationService
-        .release({
+        .releaseForDays({
           vendorAuthId: next.vendorAuthId,
-          day: planningDay,
+          days: reservationDays,
           eventId: eventId.trim(),
           service,
           serviceId: next.serviceId,
@@ -385,20 +530,216 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     throw e;
   }
 
-  // Release old reservation after successful save (best-effort)
-  if (planningDay && currentVendorAuthId && reservationIdentityChanged) {
-    vendorReservationService
-      .release({
-        vendorAuthId: currentVendorAuthId,
-        day: planningDay,
+  // Keep only the latest reservation for this service/day/event.
+  if (reservationDays.length > 0 && (reservationIdentityChanged || dayChangedAgainstPlanning || deselectRequested)) {
+    try {
+      await vendorReservationService.releasePriorReservationsForEventServiceDays({
         eventId: eventId.trim(),
+        days: reservationDays,
         service,
-        serviceId: currentServiceId,
+        serviceId: next.serviceId,
+        keepVendorAuthId: next.vendorAuthId,
+      });
+    } catch (error) {
+      logger.error('Failed to cleanup prior vendor reservations after upsert:', error);
+    }
+  }
+
+  // Release old reservation against known candidate days to avoid stale locks
+  // when payload day differs from the planning-derived day.
+  if (currentVendorAuthId && (reservationIdentityChanged || dayChangedAgainstPlanning)) {
+    const isSameVendorIdentity =
+      Boolean(next.vendorAuthId) &&
+      next.vendorAuthId === currentVendorAuthId &&
+      ((next.serviceId || null) === (currentServiceId || null));
+
+    let releaseDays = [];
+
+    if (dayChangedAgainstPlanning && isSameVendorIdentity && !reservationIdentityChanged) {
+      // Same vendor selected on a different day/range:
+      // release only stale previously-planning days, never the freshly claimed days.
+      const selectedDaySet = new Set(toSortedUniqueDays(reservationDays));
+      releaseDays = toSortedUniqueDays(planningDays).filter((d) => !selectedDaySet.has(d));
+    } else {
+      releaseDays = toSortedUniqueDays([...reservationDays, ...planningDays]);
+    }
+
+    if (releaseDays.length === 0) {
+      return selection.toObject();
+    }
+
+    await Promise.all(
+      releaseDays.map(async (releaseDay) => {
+        try {
+          await vendorReservationService.release({
+            vendorAuthId: currentVendorAuthId,
+            day: releaseDay,
+            eventId: eventId.trim(),
+            service,
+            serviceId: currentServiceId,
+          });
+        } catch (error) {
+          logger.error('Failed to release previous vendor reservation:', {
+            eventId: eventId.trim(),
+            day: releaseDay,
+            service,
+            vendorAuthId: currentVendorAuthId,
+            error: error?.message || String(error),
+          });
+        }
       })
-      .catch((e) => logger.error('Failed to release vendor reservation:', e));
+    );
   }
 
   return selection.toObject();
+};
+
+const releaseReservationsForPlanning = async ({ eventId, authId, service = null, force = false }) => {
+  if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
+  if (!authId?.trim()) throw createApiError(400, 'Auth ID is required');
+
+  const eid = eventId.trim();
+  const uid = authId.trim();
+
+  const planning = await Planning.findOne({ eventId: eid, authId: uid }).select(
+    'eventId authId status platformFeePaid isPaid depositPaid vendorConfirmationPaid fullPaymentPaid eventDate schedule'
+  );
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  if (!force) {
+    const hasPaymentProgress =
+      Boolean(planning.depositPaid) ||
+      Boolean(planning.vendorConfirmationPaid) ||
+      Boolean(planning.fullPaymentPaid);
+
+    const isStickyStatus = STICKY_PLANNING_STATUSES.has(String(planning.status || '').trim());
+    if (hasPaymentProgress || isStickyStatus) {
+      return {
+        released: 0,
+        candidates: 0,
+        skipped: true,
+        reason: 'Planning is in a sticky reservation state',
+      };
+    }
+  }
+
+  const selection = await ensureForPlanning(planning);
+  const planningDays = vendorReservationService.planningToReservationDays(planning);
+  if (planningDays.length === 0) {
+    return {
+      released: 0,
+      candidates: 0,
+      skipped: true,
+      reason: 'Event date is not available',
+    };
+  }
+
+  const targetService = service != null && String(service).trim()
+    ? canonicalizeService(String(service).trim())
+    : null;
+
+  if (targetService && !SERVICE_OPTIONS.includes(targetService)) {
+    throw createApiError(400, 'Invalid service');
+  }
+
+  const vendors = Array.isArray(selection?.vendors)
+    ? selection.vendors.map((v) => (v?.toObject ? v.toObject() : v))
+    : [];
+
+  const candidates = vendors.filter((item) => {
+    const vendorAuthId = String(item?.vendorAuthId || '').trim();
+    if (!vendorAuthId) return false;
+    if (targetService) {
+      return String(item?.service || '').trim() === targetService;
+    }
+    return true;
+  });
+
+  const releasedCounts = await Promise.all(
+    candidates.map(async (item) => {
+      try {
+        const result = await vendorReservationService.releaseForDays({
+          vendorAuthId: item.vendorAuthId,
+          days: planningDays,
+          eventId: eid,
+          service: item.service,
+          serviceId: item.serviceId || null,
+        });
+        return Number(result?.removed || 0);
+      } catch (error) {
+        logger.warn('Failed to release reservation during unlock', {
+          eventId: eid,
+          vendorAuthId: item?.vendorAuthId || null,
+          service: item?.service || null,
+          serviceId: item?.serviceId || null,
+          error: error?.message || String(error),
+        });
+        return 0;
+      }
+    })
+  );
+
+  const released = releasedCounts.reduce((acc, n) => acc + n, 0);
+  const candidateKeys = new Set(
+    candidates
+      .map((item) => {
+        const serviceValue = String(item?.service || '').trim();
+        const vendorValue = String(item?.vendorAuthId || '').trim();
+        if (!serviceValue || !vendorValue) return null;
+        const serviceIdValue = item?.serviceId != null ? String(item.serviceId).trim() : '';
+        return `${serviceValue}::${vendorValue}::${serviceIdValue}`;
+      })
+      .filter(Boolean)
+  );
+
+  let selectionCleared = 0;
+  if (candidateKeys.size > 0) {
+    const currentVendors = Array.isArray(selection?.vendors)
+      ? selection.vendors.map((v) => (v?.toObject ? v.toObject() : v))
+      : [];
+
+    const nextVendors = currentVendors.map((item) => {
+      const serviceValue = String(item?.service || '').trim();
+      const vendorValue = String(item?.vendorAuthId || '').trim();
+      if (!serviceValue || !vendorValue) return item;
+
+      const serviceIdValue = item?.serviceId != null ? String(item.serviceId).trim() : '';
+      const key = `${serviceValue}::${vendorValue}::${serviceIdValue}`;
+      if (!candidateKeys.has(key)) return item;
+
+      selectionCleared += 1;
+      return {
+        ...(item || {}),
+        vendorAuthId: null,
+        serviceId: null,
+        status: VENDOR_STATUS.YET_TO_SELECT,
+        rejectionReason: null,
+        alternativeNeeded: false,
+        servicePrice: { min: 0, max: 0 },
+        vendorQuotedPrice: null,
+        commissionPercent: null,
+        commissionAmount: null,
+        priceLocked: false,
+        pricingUnit: null,
+        pricingQuantity: null,
+        pricingQuantityUnit: null,
+      };
+    });
+
+    if (selectionCleared > 0) {
+      selection.vendors = nextVendors;
+      await selection.save();
+    }
+  }
+
+  return {
+    released,
+    candidates: candidates.length,
+    selectionCleared,
+    skipped: false,
+    days: planningDays,
+    service: targetService,
+  };
 };
 
 // ─── Vendor-facing workflows ───────────────────────────────────────────────
@@ -451,6 +792,89 @@ const getSelectionForVendorEvent = async ({ eventId, vendorAuthId }) => {
   };
 };
 
+const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice }) => {
+  const eid = normalizeEventId(eventId);
+  const vendor = normalizeVendorAuthId(vendorAuthId);
+  const canonicalService = canonicalizeService(service);
+
+  if (!canonicalService) throw createApiError(400, 'service is required');
+  if (!SERVICE_OPTIONS.includes(canonicalService)) throw createApiError(400, 'Invalid service');
+
+  const quoted = toMoney(quotedPrice);
+  if (!quoted || quoted <= 0) {
+    throw createApiError(400, 'price must be greater than 0');
+  }
+
+  const selection = await VendorSelection.findOne({ eventId: eid });
+  if (!selection) throw createApiError(404, 'Vendor selection not found');
+
+  const vendors = Array.isArray(selection.vendors) ? selection.vendors : [];
+  const item = vendors.find(
+    (v) =>
+      String(v?.vendorAuthId || '').trim() === vendor &&
+      String(v?.service || '').trim() === canonicalService
+  );
+
+  if (!item) throw createApiError(404, 'Request not found for given service');
+  if (item?.status !== VENDOR_STATUS.YET_TO_SELECT) {
+    throw createApiError(409, 'Price can only be locked while request is pending');
+  }
+
+  const minRange = toMoney(item?.servicePrice?.min);
+  const maxRange = toMoney(item?.servicePrice?.max);
+  const cfg = await commissionService.getCommissionConfig();
+  const percentRaw = Number(cfg?.rates?.[canonicalService] ?? 0);
+  const configuredPercent = Number.isFinite(percentRaw) && percentRaw > 0 ? percentRaw : 0;
+
+  let commissionPercent = 0;
+  let commissionAmount = 0;
+  let lockedPrice = quoted;
+
+  const hasValidRange = minRange > 0 && maxRange > minRange;
+  if (hasValidRange) {
+    const quoteCap = toMoney(Math.min(maxRange, minRange * 1.25));
+    if (quoted > quoteCap) {
+      throw createApiError(
+        400,
+        `Quoted price cannot exceed ${quoteCap} for ${canonicalService}. Max allowed is min*1.25 based on booking range.`
+      );
+    }
+
+    if (configuredPercent > 0) {
+      // Prefer admin-configured service commission when set.
+      commissionPercent = configuredPercent;
+      commissionAmount = toMoney((quoted * commissionPercent) / 100);
+    } else {
+      // Fallback behavior when no admin commission is configured.
+      const commissionSlice = toMoney(Math.max(0, maxRange - quoteCap));
+      commissionAmount = commissionSlice;
+      commissionPercent = quoted > 0 ? toMoney((commissionAmount / quoted) * 100) : 0;
+    }
+    lockedPrice = toMoney(quoted + commissionAmount);
+  } else {
+    commissionPercent = configuredPercent;
+    commissionAmount = toMoney((quoted * commissionPercent) / 100);
+    lockedPrice = toMoney(quoted + commissionAmount);
+  }
+
+  item.vendorQuotedPrice = quoted;
+  item.commissionPercent = commissionPercent;
+  item.commissionAmount = commissionAmount;
+  item.priceLocked = true;
+
+  selection.vendors = vendors;
+  await selection.save();
+
+  return {
+    selection: selection.toObject(),
+    service: canonicalService,
+    quotedPrice: quoted,
+    commissionPercent,
+    commissionAmount,
+    lockedPrice,
+  };
+};
+
 const respondForVendor = async ({ eventId, vendorAuthId, action, service, rejectionReason }) => {
   const eid = normalizeEventId(eventId);
   const vendor = normalizeVendorAuthId(vendorAuthId);
@@ -473,6 +897,21 @@ const respondForVendor = async ({ eventId, vendorAuthId, action, service, reject
   if (!requestedService) {
     const pending = targetItems.filter((v) => v?.status === VENDOR_STATUS.YET_TO_SELECT);
     if (pending.length > 0) targetItems = pending;
+  }
+
+  const itemsRequiringLock = targetItems.filter((v) => v?.status === VENDOR_STATUS.YET_TO_SELECT);
+  if (itemsRequiringLock.length > 0) {
+    const unlockedServices = itemsRequiringLock
+      .filter((v) => !isVendorItemPriceLocked(v))
+      .map((v) => String(v?.service || '').trim())
+      .filter(Boolean);
+
+    if (unlockedServices.length > 0) {
+      throw createApiError(
+        409,
+        `Please provide and lock final quotation before ${action === 'accept' ? 'accepting' : 'declining'} for: ${unlockedServices.join(', ')}`
+      );
+    }
   }
 
   // Track status transitions so callers can avoid duplicate side-effects (chat/email sends).
@@ -534,7 +973,9 @@ module.exports = {
   getByEventId,
   updateSelectedServices,
   upsertVendor,
+  releaseReservationsForPlanning,
   listSelectionsForVendor,
   getSelectionForVendorEvent,
+  lockPriceForVendor,
   respondForVendor,
 };
