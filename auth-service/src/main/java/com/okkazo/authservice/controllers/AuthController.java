@@ -6,6 +6,7 @@ import com.okkazo.authservice.services.AuthService;
 import com.okkazo.authservice.services.EmailVerificationService;
 import com.okkazo.authservice.services.PasswordResetService;
 import com.okkazo.authservice.services.RefreshTokenService;
+import com.okkazo.authservice.services.VendorPhoneOtpService;
 import com.okkazo.authservice.services.VendorRegistrationService;
 import com.okkazo.authservice.validators.VendorRegistrationValidator;
 import jakarta.validation.Valid;
@@ -29,6 +30,7 @@ public class AuthController {
     private final RefreshTokenService refreshTokenService;
     private final PasswordResetService passwordResetService;
     private final VendorRegistrationService vendorRegistrationService;
+    private final VendorPhoneOtpService vendorPhoneOtpService;
     private final VendorRegistrationValidator vendorRegistrationValidator;
 
     @PostMapping("/register")
@@ -122,6 +124,7 @@ public class AuthController {
             @RequestParam(value = "businessLicense", required = false) MultipartFile businessLicense,
             @RequestParam(value = "ownerIdentity", required = false) MultipartFile ownerIdentity,
             @RequestParam(value = "otherProofs", required = false) MultipartFile[] otherProofs,
+            @RequestParam(value = "phoneVerificationToken", required = false) String phoneVerificationToken,
             @RequestParam("agreedToTerms") Boolean agreedToTerms) {
         
         // Parse location data from JSON
@@ -166,6 +169,7 @@ public class AuthController {
         requestDto.setBusinessLicense(businessLicense);
         requestDto.setOwnerIdentity(ownerIdentity);
         requestDto.setOtherProofs(otherProofs);
+        requestDto.setPhoneVerificationToken(phoneVerificationToken);
         requestDto.setAgreedToTerms(agreedToTerms);
         
         // Validate the request
@@ -180,6 +184,18 @@ public class AuthController {
         }
         
         return ResponseEntity.ok(vendorRegistrationService.registerVendor(requestDto));
+    }
+
+    @PostMapping("/vendor/phone-otp/send")
+    public ResponseEntity<VendorPhoneOtpResponseDto> sendVendorPhoneOtp(
+            @Valid @RequestBody SendVendorPhoneOtpRequestDto requestDto) {
+        return ResponseEntity.ok(vendorPhoneOtpService.sendOtp(requestDto));
+    }
+
+    @PostMapping("/vendor/phone-otp/verify")
+    public ResponseEntity<VendorPhoneOtpResponseDto> verifyVendorPhoneOtp(
+            @Valid @RequestBody VerifyVendorPhoneOtpRequestDto requestDto) {
+        return ResponseEntity.ok(vendorPhoneOtpService.verifyOtp(requestDto));
     }
     
     /**

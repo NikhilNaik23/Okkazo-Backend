@@ -53,6 +53,7 @@ public class AuthService {
     private final EmailVerificationTokenRepository emailVerificationTokenRepository;
     private final JwtUtil jwtUtil;
     private final RefreshTokenService refreshTokenService;
+                private final DisposableEmailDomainService disposableEmailDomainService;
         private final ObjectMapper objectMapper;
         private final HttpClient httpClient = HttpClient.newHttpClient();
     
@@ -65,6 +66,9 @@ public class AuthService {
     @Transactional
     public RegisterResponseDto register(RegisterRequestDto requestDto){
                 String normalizedEmail = normalizeEmail(requestDto.email());
+                if (disposableEmailDomainService.isDisposableEmail(normalizedEmail)) {
+                        throw new InvalidEmailDomainException("Temporary/disposable email addresses are not allowed. Please use a valid email.");
+                }
                 Auth existingUser = repository.findByEmailIgnoreCase(normalizedEmail).orElse(null);
 
         if (existingUser != null) {

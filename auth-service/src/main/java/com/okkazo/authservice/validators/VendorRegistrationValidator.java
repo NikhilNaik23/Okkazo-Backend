@@ -61,7 +61,7 @@ public class VendorRegistrationValidator {
         } else if (!PHONE_PATTERN.matcher(dto.getPhone()).matches()) {
             errors.add("Phone number should be valid (10-15 digits)");
         }
-        
+
         // Location validation
         if (dto.getLocation() == null || dto.getLocation().trim().isEmpty()) {
             errors.add("Location is required");

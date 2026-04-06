@@ -63,6 +63,18 @@ cloudinary:
 admin:
   promote-key: ${ADMIN_PROMOTE_KEY:okkazo-admin-secret-2026}
 
+twilio:
+  account-sid: ${TWILIO_ACCOUNT_SID:}
+  auth-token: ${TWILIO_AUTH_TOKEN:}
+  verify-service-sid: ${TWILIO_VERIFY_SERVICE_SID:}
+  otp:
+    channel: ${TWILIO_OTP_CHANNEL:sms}
+    verification-token-expiration-minutes: ${TWILIO_VENDOR_VERIFY_TOKEN_EXPIRY_MINUTES:20}
+
+kickbox:
+  api-key: ${KICKBOX_API_KEY:}
+  verify-timeout-ms: ${KICKBOX_VERIFY_TIMEOUT_MS:5000}
+
 eureka:
   client:
     service-url:

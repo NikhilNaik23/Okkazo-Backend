@@ -4,6 +4,7 @@ import com.okkazo.authservice.dtos.VendorRegisterRequestDto;
 import com.okkazo.authservice.dtos.VendorRegisterResponseDto;
 import com.okkazo.authservice.dtos.VendorRegistrationEvent;
 import com.okkazo.authservice.exceptions.AlreadyExistingException;
+import com.okkazo.authservice.exceptions.InvalidEmailDomainException;
 import com.okkazo.authservice.kafka.AuthEventProducer;
 import com.okkazo.authservice.models.Auth;
 import com.okkazo.authservice.models.PasswordResetToken;
@@ -35,6 +36,8 @@ public class VendorRegistrationService {
     private final AuthRepository authRepository;
     private final PasswordResetTokenRepository passwordResetTokenRepository;
     private final PasswordEncoder passwordEncoder;
+    private final DisposableEmailDomainService disposableEmailDomainService;
+    private final VendorPhoneOtpService vendorPhoneOtpService;
     
     @Transactional
     public VendorRegisterResponseDto registerVendor(VendorRegisterRequestDto requestDto) {
@@ -50,6 +53,14 @@ public class VendorRegistrationService {
                     throw new IllegalArgumentException("Custom service description is required when service category is 'Other'");
                 }
             }
+
+            String normalizedEmail = normalizeEmail(requestDto.getEmail());
+            if (disposableEmailDomainService.isDisposableEmail(normalizedEmail)) {
+                throw new InvalidEmailDomainException("Temporary/disposable email addresses are not allowed. Please use a valid business email.");
+            }
+
+            requestDto.setEmail(normalizedEmail);
+            requestDto.setPhone(vendorPhoneOtpService.normalizePhone(requestDto.getPhone()));
             
             // Check if email already exists
             if (authRepository.findByEmail(requestDto.getEmail()).isPresent()) {
@@ -186,6 +197,10 @@ public class VendorRegistrationService {
         String username = baseUsername + "_" + UUID.randomUUID().toString().substring(0, 8);
         
         return username;
+    }
+
+    private String normalizeEmail(String email) {
+        return email == null ? "" : email.trim().toLowerCase();
     }
     
     private String uploadSingleFile(MultipartFile file, String subfolder) throws IOException {

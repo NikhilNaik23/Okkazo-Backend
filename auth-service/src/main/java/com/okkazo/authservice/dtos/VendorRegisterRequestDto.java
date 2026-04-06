@@ -27,6 +27,8 @@ public class VendorRegisterRequestDto {
     @NotBlank(message = "Phone number is required")
     @Pattern(regexp = "^[+]?[0-9]{10,15}$", message = "Phone number should be valid")
     private String phone;
+
+    private String phoneVerificationToken;
     
     @NotBlank(message = "Location is required")
     @Size(min = 2, max = 500, message = "Location must be between 2 and 500 characters")
