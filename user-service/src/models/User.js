@@ -106,8 +106,8 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: null,
       enum: {
-        values: [null, 'Senior Event Manager', 'Junior Manager', 'Event Coordinator'],
-        message: 'Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator',
+        values: [null, 'Senior Event Manager', 'Junior Manager', 'Event Coordinator','Revenue Operations Specialist'],
+        message: 'Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator, Revenue Operations Specialist',
       },
     },
   },

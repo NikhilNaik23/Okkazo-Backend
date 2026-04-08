@@ -131,8 +131,8 @@ const validateUserUpdate = [
   body('assignedRole')
     .optional()
     .trim()
-    .isIn(['Senior Event Manager', 'Junior Manager', 'Event Coordinator'])
-    .withMessage('Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator'),
+    .isIn(['Senior Event Manager', 'Junior Manager', 'Event Coordinator', 'Revenue Operations Specialist'])
+    .withMessage('Assigned role must be one of: Senior Event Manager, Junior Manager, Event Coordinator, Revenue Operations Specialist'),
 
   // Prevent updating protected fields
   body('authId').not().exists().withMessage('Cannot update authId'),

@@ -4,12 +4,18 @@ const { createApiError } = require('../utils/ApiError');
 const axios = require('axios');
 
 const VALID_DEPARTMENTS = ['Public Event', 'Private Event', 'Core Operation'];
-const VALID_ROLES = ['Senior Event Manager', 'Junior Manager', 'Event Coordinator'];
+const VALID_ROLES = ['Senior Event Manager', 'Junior Manager', 'Event Coordinator', 'Revenue Operations Specialist'];
 const DEPARTMENT_ROLE_MAP = {
   'Public Event': ['Senior Event Manager', 'Junior Manager'],
   'Private Event': ['Senior Event Manager', 'Junior Manager'],
-  'Core Operation': ['Event Coordinator'],
+  'Core Operation': ['Event Coordinator', 'Revenue Operations Specialist'],
 };
+
+const getManagerRoleOptions = async () => ({
+  departments: [...VALID_DEPARTMENTS],
+  roles: [...VALID_ROLES],
+  departmentRoleMap: { ...DEPARTMENT_ROLE_MAP },
+});
 
 const createManager = async (managerData, createdByAuthId) => {
   try {
@@ -90,4 +96,5 @@ const createManager = async (managerData, createdByAuthId) => {
 
 module.exports = {
   createManager,
+  getManagerRoleOptions,
 };

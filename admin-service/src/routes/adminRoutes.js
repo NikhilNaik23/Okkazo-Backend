@@ -12,6 +12,7 @@ router.use(extractUser);
 
 // POST /managers - Create a new manager (Admin only)
 router.post('/managers', isAdmin, managerController.createManager);
+router.get('/managers/options', isAdmin, managerController.getManagerRoleOptions);
 router.get('/dashboard', isAdmin, dashboardController.getAdminDashboard);
 router.get('/reports', isAdmin, reportController.getAdminReports);
 router.get('/ledger', isAdmin, ledgerController.getAdminLedger);

@@ -788,7 +788,7 @@ const updatePlanningStatus = async (
 };
 
 /**
- * Mark a private planning event as COMPLETED.
+ * Mark a planning event as COMPLETED.
  * Allowed actors:
  * - planning owner (USER)
  * - assigned manager (MANAGER)
@@ -861,8 +861,10 @@ const markPlanningAsComplete = async ({ eventId, actorAuthId, actorUserId, actor
     throw createApiError(403, 'Only the event owner or assigned manager can mark this event as complete');
   }
 
-  if (String(planning.category || '').trim().toLowerCase() !== CATEGORY.PRIVATE) {
-    throw createApiError(409, 'Mark as complete is currently supported only for private planning events');
+  const normalizedCategory = String(planning.category || '').trim().toLowerCase();
+  const isSupportedCategory = normalizedCategory === CATEGORY.PRIVATE || normalizedCategory === CATEGORY.PUBLIC;
+  if (!isSupportedCategory) {
+    throw createApiError(409, 'Mark as complete is currently supported only for private/public planning events');
   }
 
   const currentStatus = String(planning.status || '').trim();
@@ -878,7 +880,7 @@ const markPlanningAsComplete = async ({ eventId, actorAuthId, actorUserId, actor
   await planning.save({ validateBeforeSave: false });
   logger.info(`Planning marked as completed: ${normalizedEventId}`);
 
-  // When manager marks a private planning event as complete, notify the owner in DM
+  // When manager marks a planning event as complete, notify the owner in DM
   // to proceed with remaining payment using the event management link.
   if (normalizedRole === 'MANAGER') {
     const ownerAuthId = String(planning.authId || '').trim();
@@ -1069,13 +1071,18 @@ const getPlanningsForManager = async ({ managerId, limit = 200 } = {}) => {
     throw createApiError(400, 'managerId is required');
   }
 
+  const normalizedManagerId = String(managerId).trim();
+
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
 
   const baseSelect =
-    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
+    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId coreStaffIds status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
 
   const plannings = await Planning.find({
-    assignedManagerId: String(managerId).trim(),
+    $or: [
+      { assignedManagerId: normalizedManagerId },
+      { coreStaffIds: normalizedManagerId },
+    ],
   })
     .sort({ createdAt: -1 })
     .limit(safeLimit)
@@ -1094,13 +1101,18 @@ const getPlanningApplicationsForManager = async ({ managerId, limit = 200 } = {}
     throw createApiError(400, 'managerId is required');
   }
 
+  const normalizedManagerId = String(managerId).trim();
+
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
 
   const baseSelect =
-    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
+    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId coreStaffIds status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
 
   const plannings = await Planning.find({
-    assignedManagerId: String(managerId).trim(),
+    $or: [
+      { assignedManagerId: normalizedManagerId },
+      { coreStaffIds: normalizedManagerId },
+    ],
     status: STATUS.PENDING_APPROVAL,
   })
     .sort({ createdAt: -1 })
@@ -1381,6 +1393,24 @@ const releasePlanningGeneratedRevenuePayout = async ({ eventId, actorRole, actor
     return normalizedExisting;
   }
 
+  const currentStatus = String(planning.status || '').trim();
+  if (currentStatus !== STATUS.COMPLETED && currentStatus !== STATUS.VENDOR_PAYMENT_PENDING) {
+    throw createApiError(409, 'Generated revenue payout can only be released after the event is marked as completed');
+  }
+
+  const totalAmountInr = toNonNegativeNumber(planning?.totalAmount);
+  const totalAmountPaise = Math.round(totalAmountInr * 100);
+  const depositPaidPaise = Math.max(0, Number(planning?.depositPaidAmountPaise || 0));
+  const vendorConfirmationPaidPaise = Math.max(0, Number(planning?.vendorConfirmationPaidAmountPaise || 0));
+  const remainingPaymentPaidPaise = Math.max(0, Number(planning?.remainingPaymentPaidAmountPaise || 0));
+  const paidMilestonesTotalPaise = depositPaidPaise + vendorConfirmationPaidPaise + remainingPaymentPaidPaise;
+  const remainingDuePaise = Math.max(0, totalAmountPaise - paidMilestonesTotalPaise);
+  const remainingPaymentSettled = Boolean(planning?.remainingPaymentPaid) || remainingDuePaise <= 0;
+
+  if (!remainingPaymentSettled) {
+    throw createApiError(409, 'Remaining event payment must be paid before releasing generated revenue payout');
+  }
+
   const cfg = await promoteConfigService.getFees();
   const normalizedPlanning = normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
   const ticketSalesStats = await buildPlanningTicketSalesStats(normalizedPlanning, cfg);
@@ -1388,7 +1418,7 @@ const releasePlanningGeneratedRevenuePayout = async ({ eventId, actorRole, actor
   const generatedRevenueInr = toNonNegativeNumber(ticketSalesStats?.grossRevenueInr);
   const totalVendorCostInr = await computePlanningVendorCostInr(trimmedEventId);
   const totalFeesInr = toNonNegativeNumber(ticketSalesStats?.totalFeesInr ?? ticketSalesStats?.platformFeeInr);
-  const payoutAmountInr = Number(Math.max(0, generatedRevenueInr - totalVendorCostInr - totalFeesInr).toFixed(2));
+  const payoutAmountInr = Number(Math.max(0, generatedRevenueInr - totalFeesInr).toFixed(2));
   const payoutAmountPaise = Math.round(payoutAmountInr * 100);
 
   if (payoutAmountPaise <= 0) {
@@ -1870,7 +1900,7 @@ const markPlanningVendorConfirmationPaid = async (
 };
 
 /**
- * Mark private planning remaining payment as paid and move to VENDOR_PAYMENT_PENDING.
+ * Mark planning remaining payment as paid and move to VENDOR_PAYMENT_PENDING.
  */
 const markPlanningRemainingPaymentPaid = async (
   eventId,
@@ -1885,8 +1915,10 @@ const markPlanningRemainingPaymentPaid = async (
     throw createApiError(404, 'Planning not found');
   }
 
-  if (String(planning.category || '').trim().toLowerCase() !== CATEGORY.PRIVATE) {
-    throw createApiError(409, 'Remaining payment flow is currently supported only for private planning events');
+  const normalizedCategory = String(planning.category || '').trim().toLowerCase();
+  const isSupportedCategory = normalizedCategory === CATEGORY.PRIVATE || normalizedCategory === CATEGORY.PUBLIC;
+  if (!isSupportedCategory) {
+    throw createApiError(409, 'Remaining payment flow is currently supported only for private/public planning events');
   }
 
   const currentStatus = String(planning.status || '').trim();

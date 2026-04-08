@@ -1377,6 +1377,9 @@ const createOrder = async (payload, user) => {
 
   const orderType = value.orderType;
   const isTicketSale = orderType === 'TICKET SALE';
+  // Reusing stale CREATED orders can break Razorpay checkout when keys/account change.
+  // Keep reuse opt-in via env (default OFF) so all flows create a fresh provider order.
+  const allowCreatedOrderReuse = String(process.env.ALLOW_RAZORPAY_ORDER_REUSE || '').trim().toLowerCase() === 'true';
 
   let upstreamRecord;
   if (!isTicketSale) {
@@ -1463,6 +1466,10 @@ const createOrder = async (payload, user) => {
   // For deposit + vendor confirmation orders, the amount is derived from upstream state,
   // so only reuse an existing order if the amount still matches.
   if (
+    allowCreatedOrderReuse
+    &&
+    orderType !== 'PROMOTE EVENT'
+    &&
     orderType !== 'PLANNING EVENT DEPOSIT FEE'
     && orderType !== 'PLANNING EVENT VENDOR CONFIRMATION FEE'
     && orderType !== 'PLANNING EVENT REMAINING FEE'
@@ -1600,7 +1607,7 @@ const createOrder = async (payload, user) => {
     ? Math.round(Number(amountInPaiseOverride))
     : Math.round(Number(amountInInr) * 100);
 
-  if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
+  if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT DEPOSIT FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,
@@ -1627,7 +1634,7 @@ const createOrder = async (payload, user) => {
     }
   }
 
-  if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+  if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,
@@ -1654,7 +1661,7 @@ const createOrder = async (payload, user) => {
     }
   }
 
-  if (orderType === 'PLANNING EVENT REMAINING FEE') {
+  if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT REMAINING FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,

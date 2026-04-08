@@ -1246,13 +1246,18 @@ const getPromotesForManager = async ({ managerId, limit = 200 } = {}) => {
     throw createApiError(400, 'managerId is required');
   }
 
+  const normalizedManagerId = String(managerId).trim();
+
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
 
   const baseSelect =
-    'eventId eventTitle eventCategory customCategory eventField eventBanner schedule ticketAvailability tickets venue createdAt authId assignedManagerId adminDecision managerAssignment eventStatus platformFeePaid totalAmount serviceCharge estimatedNetRevenue ticketAnalytics';
+    'eventId eventTitle eventCategory customCategory eventField eventBanner schedule ticketAvailability tickets venue createdAt authId assignedManagerId coreStaffIds adminDecision managerAssignment eventStatus platformFeePaid totalAmount serviceCharge estimatedNetRevenue ticketAnalytics';
 
   const promotes = await Promote.find({
-    assignedManagerId: String(managerId).trim(),
+    $or: [
+      { assignedManagerId: normalizedManagerId },
+      { coreStaffIds: normalizedManagerId },
+    ],
     'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
   })
     .sort({ createdAt: -1 })

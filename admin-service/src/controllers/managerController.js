@@ -29,6 +29,24 @@ const createManager = async (req, res) => {
   }
 };
 
+const getManagerRoleOptions = async (req, res) => {
+  try {
+    const result = await managerService.getManagerRoleOptions();
+
+    res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in getManagerRoleOptions controller:', error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch manager role options',
+    });
+  }
+};
+
 module.exports = {
   createManager,
+  getManagerRoleOptions,
 };
