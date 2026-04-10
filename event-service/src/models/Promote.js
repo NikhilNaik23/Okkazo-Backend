@@ -420,6 +420,9 @@ const computeRevenue = (doc) => {
 const computeEventStatus = (doc) => {
   if (!doc.platformFeePaid) return PROMOTE_STATUS.PAYMENT_REQUIRED;
   if (!doc.assignedManagerId) return PROMOTE_STATUS.MANAGER_UNASSIGNED;
+  if (String(doc?.adminDecision?.status || '').trim().toUpperCase() === 'APPROVED') {
+    return PROMOTE_STATUS.CONFIRMED;
+  }
   return PROMOTE_STATUS.IN_REVIEW;
 };
 

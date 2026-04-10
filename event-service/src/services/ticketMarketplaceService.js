@@ -218,6 +218,51 @@ const normalizePlanningDayWiseAllocations = ({ tickets, tiers } = {}) => {
     .sort((a, b) => String(a.day).localeCompare(String(b.day)));
 };
 
+const normalizePromoteDayWiseAllocations = ({ tickets, tiers } = {}) => {
+  const rows = Array.isArray(tickets?.dayWiseAllocations) ? tickets.dayWiseAllocations : [];
+  if (rows.length === 0) return [];
+
+  const priceByTierName = new Map(
+    (Array.isArray(tiers) ? tiers : [])
+      .map((tier) => [normalizeTierNameKey(tier?.name), Number(tier?.price || 0)])
+      .filter(([name]) => Boolean(name))
+  );
+
+  return rows
+    .map((row) => {
+      const day = normalizeDayKey(row?.day);
+      if (!day) return null;
+
+      const ticketCountRaw = Number(row?.ticketCount || 0);
+      const ticketCount = Number.isFinite(ticketCountRaw) && ticketCountRaw > 0 ? ticketCountRaw : 0;
+
+      const tierBreakdown = (Array.isArray(row?.tierBreakdown) ? row.tierBreakdown : [])
+        .map((tierRow) => {
+          const name = String(tierRow?.tierName || tierRow?.name || '').trim();
+          if (!name) return null;
+
+          const availableRaw = Number(tierRow?.ticketCount || tierRow?.quantity || 0);
+          const available = Number.isFinite(availableRaw) && availableRaw > 0 ? availableRaw : 0;
+          const price = Number(priceByTierName.get(normalizeTierNameKey(name)) || 0);
+
+          return {
+            name,
+            available,
+            price,
+          };
+        })
+        .filter((tier) => tier && tier.available > 0);
+
+      return {
+        day,
+        ticketCount,
+        tierBreakdown,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => String(a.day).localeCompare(String(b.day)));
+};
+
 const ensureTicketSalesWindow = (ticketAvailability) => {
   const now = new Date();
   const startAt = ticketAvailability?.startAt ? new Date(ticketAvailability.startAt) : null;
@@ -299,18 +344,26 @@ const resolveEventForPurchase = async (eventId) => {
   }).lean();
 
   if (promote) {
+    const promoteTiers = (Array.isArray(promote?.tickets?.tiers) ? promote.tickets.tiers : [])
+      .map((tier) => ({
+        name: String(tier?.name || '').trim(),
+        available: Number(tier?.quantity || 0),
+        price: Number(tier?.price || 0),
+      }))
+      .filter((tier) => tier.name && tier.available > 0);
+
+    const promoteDayWiseAllocations = normalizePromoteDayWiseAllocations({
+      tickets: promote?.tickets,
+      tiers: promoteTiers,
+    });
+
     return {
       source: 'promote',
       event: promote,
       ticketType: String(promote?.tickets?.ticketType || 'free').toLowerCase() === 'paid' ? 'paid' : 'free',
       totalAvailable: Number(promote?.tickets?.noOfTickets || 0),
-      tiers: (Array.isArray(promote?.tickets?.tiers) ? promote.tickets.tiers : [])
-        .map((tier) => ({
-          name: String(tier?.name || '').trim(),
-          available: Number(tier?.quantity || 0),
-          price: Number(tier?.price || 0),
-        }))
-        .filter((tier) => tier.name && tier.available > 0),
+      tiers: promoteTiers,
+      dayWiseAllocations: promoteDayWiseAllocations,
       venue: {
         locationName: promote?.venue?.locationName || 'TBA',
         latitude: promote?.venue?.latitude ?? null,
@@ -535,10 +588,16 @@ const normalizePromoteTickets = (tickets) => {
       .filter((tier) => tier.name && tier.noOfTickets > 0)
     : [];
 
+  const dayWiseAllocations = normalizePromoteDayWiseAllocations({
+    tickets,
+    tiers,
+  });
+
   return {
     noOfTickets,
     ticketType,
     tiers,
+    dayWiseAllocations,
   };
 };
 

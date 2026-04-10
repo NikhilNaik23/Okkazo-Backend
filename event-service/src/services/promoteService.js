@@ -971,6 +971,8 @@ const assignManagerWithMetadata = async (
     };
   }
 
+  promote.eventStatus = PROMOTE_STATUS.CONFIRMED;
+
   await promote.save();
   logger.info(`Manager ${managerId} assigned to promote ${eventId} (auto=${Boolean(autoAssigned)})`);
 
@@ -1016,6 +1018,7 @@ const tryAutoAssignManager = async (
           assignedByAuthId: assignedByAuthId || null,
           autoAssigned: true,
         },
+        eventStatus: PROMOTE_STATUS.CONFIRMED,
       },
     }
   );
@@ -1041,11 +1044,17 @@ const tryAutoAssignManager = async (
     }
 
     try {
-      const promote = await Promote.findOne({ eventId: String(eventId).trim() }).select('platformFeePaid assignedManagerId eventStatus').lean();
+      const promote = await Promote.findOne({ eventId: String(eventId).trim() })
+        .select('platformFeePaid assignedManagerId eventStatus adminDecision.status')
+        .lean();
       if (promote && ![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE].includes(promote.eventStatus)) {
         const computedStatus = !promote.platformFeePaid
           ? PROMOTE_STATUS.PAYMENT_REQUIRED
-          : (!promote.assignedManagerId ? PROMOTE_STATUS.MANAGER_UNASSIGNED : PROMOTE_STATUS.IN_REVIEW);
+          : (!promote.assignedManagerId
+            ? PROMOTE_STATUS.MANAGER_UNASSIGNED
+            : (String(promote?.adminDecision?.status || '').trim().toUpperCase() === 'APPROVED'
+              ? PROMOTE_STATUS.CONFIRMED
+              : PROMOTE_STATUS.IN_REVIEW));
 
         if (computedStatus !== promote.eventStatus) {
           await Promote.updateOne(
@@ -1132,6 +1141,7 @@ const decidePromote = async (
     decidedByAuthId: decidedByAuthId || null,
     rejectionReason: null,
   };
+  promote.eventStatus = PROMOTE_STATUS.CONFIRMED;
   await promote.save();
 
   if (managerId) {

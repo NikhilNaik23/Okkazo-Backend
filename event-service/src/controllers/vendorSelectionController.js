@@ -1104,7 +1104,7 @@ const getVendorRequestDetails = async (req, res) => {
     const selection = await vendorSelectionService.getSelectionForVendorEvent({ eventId, vendorAuthId });
     const planning = await Planning.findOne({ eventId })
       .select(
-        'eventId authId eventTitle category eventType customEventType eventField eventDescription eventBanner schedule eventDate eventTime guestCount tickets location assignedManagerId status'
+        'eventId authId eventTitle category eventType customEventType eventField eventDescription eventBanner schedule eventDate eventTime guestCount tickets location assignedManagerId coreStaffIds status'
       )
       .lean();
 
@@ -1115,6 +1115,31 @@ const getVendorRequestDetails = async (req, res) => {
         managerProfile = await fetchUserById(managerId);
       } catch (e) {
         logger.warn('Failed to fetch manager profile for vendor request', { eventId, managerId: String(managerId) });
+      }
+    }
+
+    let coreStaffProfiles = [];
+    const coreStaffIds = Array.isArray(planning?.coreStaffIds)
+      ? planning.coreStaffIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+
+    if (coreStaffIds.length > 0) {
+      const uniqueCoreStaffIds = Array.from(new Set(coreStaffIds));
+      const settledProfiles = await Promise.allSettled(
+        uniqueCoreStaffIds.map((staffId) => fetchUserById(staffId))
+      );
+
+      coreStaffProfiles = settledProfiles
+        .filter((result) => result.status === 'fulfilled' && result.value)
+        .map((result) => result.value);
+
+      const rejectedCount = settledProfiles.filter((result) => result.status === 'rejected').length;
+      if (rejectedCount > 0) {
+        logger.warn('Failed to fetch some core staff profiles for vendor request', {
+          eventId,
+          requestedCount: uniqueCoreStaffIds.length,
+          failedCount: rejectedCount,
+        });
       }
     }
 
@@ -1482,6 +1507,7 @@ const getVendorRequestDetails = async (req, res) => {
           managerAssigned: Boolean(selection.managerId),
         },
         managerProfile,
+        coreStaffProfiles,
         pricingConfig: {
           vendorHikeRate,
         },

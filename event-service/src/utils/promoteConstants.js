@@ -22,6 +22,7 @@ const PROMOTE_STATUS = {
   PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',  // platformFeePaid = false
   MANAGER_UNASSIGNED: 'MANAGER_UNASSIGNED', // paid, no manager
   IN_REVIEW: 'IN_REVIEW',                // paid + manager assigned
+  CONFIRMED: 'CONFIRMED',                // approved by admin after document verification
   LIVE: 'LIVE',                          // approved by manager
   COMPLETE: 'COMPLETE',                  // event ended, closed by manager
 };
