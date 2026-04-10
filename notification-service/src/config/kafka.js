@@ -14,6 +14,7 @@ const kafka = new Kafka({
 });
 
 let consumer = null;
+let producer = null;
 
 const createConsumer = async (groupId) => {
   try {
@@ -32,11 +33,57 @@ const createConsumer = async (groupId) => {
   }
 };
 
+const createProducer = async () => {
+  try {
+    if (producer) {
+      return producer;
+    }
+
+    producer = kafka.producer();
+    await producer.connect();
+    logger.info('Kafka producer connected successfully');
+    return producer;
+  } catch (error) {
+    logger.error('Error creating Kafka producer:', error);
+    throw error;
+  }
+};
+
+const sendEvent = async ({ topic, key, payload, headers = {} } = {}) => {
+  const normalizedTopic = String(topic || '').trim();
+  if (!normalizedTopic) {
+    throw new Error('Kafka topic is required');
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Kafka payload must be an object');
+  }
+
+  const activeProducer = await createProducer();
+  await activeProducer.send({
+    topic: normalizedTopic,
+    messages: [
+      {
+        key: key == null ? null : String(key),
+        value: JSON.stringify(payload),
+        headers,
+      },
+    ],
+  });
+};
+
 const disconnect = async () => {
   try {
     if (consumer) {
       await consumer.disconnect();
+      consumer = null;
       logger.info('Kafka consumer disconnected');
+    }
+
+    if (producer) {
+      await producer.disconnect();
+      producer = null;
+      logger.info('Kafka producer disconnected');
     }
   } catch (error) {
     logger.error('Error disconnecting Kafka:', error);
@@ -45,5 +92,7 @@ const disconnect = async () => {
 
 module.exports = {
   createConsumer,
+  createProducer,
+  sendEvent,
   disconnect,
 };

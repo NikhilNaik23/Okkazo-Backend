@@ -26,6 +26,7 @@ const createNotification = async ({
   const safeType = normalizeType(type || 'INFO');
   const safeCategory = normalizeCategory(category || 'SYSTEM');
   const safeRole = normalizeRole(recipientRole || 'USER');
+  const normalizedDedupeKey = dedupeKey ? String(dedupeKey).trim() : '';
 
   const payload = {
     notificationId: uuidv4(),
@@ -37,10 +38,13 @@ const createNotification = async ({
     message: String(message || '').trim() || 'You have a new notification.',
     actionUrl: actionUrl ? String(actionUrl).trim() : null,
     metadata: metadata && typeof metadata === 'object' ? metadata : {},
-    dedupeKey: dedupeKey ? String(dedupeKey).trim() : null,
     unread: true,
     readAt: null,
   };
+
+  if (normalizedDedupeKey) {
+    payload.dedupeKey = normalizedDedupeKey;
+  }
 
   if (createdAt) {
     const when = new Date(createdAt);

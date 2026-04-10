@@ -1,6 +1,27 @@
 const notificationService = require('../services/notificationService');
 const { fetchUsersByRole } = require('../services/userDirectoryService');
 const createApiError = require('../utils/ApiError');
+const crypto = require('crypto');
+
+const ALLOWED_BROADCAST_ROLES = ['USER', 'VENDOR', 'ADMIN', 'MANAGER'];
+
+const normalizeBroadcastRoles = (rolesInput) => {
+  const rawRoles = Array.isArray(rolesInput) ? rolesInput : [];
+  const cleanedRoles = rawRoles
+    .map((role) => String(role || '').trim().toUpperCase())
+    .filter(Boolean);
+
+  if (cleanedRoles.includes('ALL')) {
+    return [...ALLOWED_BROADCAST_ROLES];
+  }
+
+  const filtered = cleanedRoles.filter((role) => ALLOWED_BROADCAST_ROLES.includes(role));
+  if (filtered.length === 0) {
+    return ['USER'];
+  }
+
+  return Array.from(new Set(filtered));
+};
 
 const healthCheck = async (req, res) => {
   return res.status(200).json({
@@ -87,17 +108,17 @@ const broadcastSystemNotification = async (req, res) => {
   const type = String(req.body?.type || 'SYSTEM_ANNOUNCEMENT').trim().toUpperCase();
   const metadata = req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
 
-  let roles = Array.isArray(req.body?.roles) ? req.body.roles : [];
-  roles = roles.map((role) => String(role || '').trim().toUpperCase()).filter(Boolean);
-  if (roles.length === 0) {
-    roles = ['USER'];
-  }
+  const uniqueRoles = normalizeBroadcastRoles(req.body?.roles);
 
   if (!title || !message) {
     throw createApiError(400, 'title and message are required');
   }
 
-  const uniqueRoles = Array.from(new Set(roles));
+  const contentFingerprint = crypto
+    .createHash('sha1')
+    .update(JSON.stringify({ type, category, title, message, actionUrl, metadata }))
+    .digest('hex');
+
   const users = [];
   for (const role of uniqueRoles) {
     const rows = await fetchUsersByRole(role);
@@ -122,7 +143,7 @@ const broadcastSystemNotification = async (req, res) => {
     message,
     actionUrl,
     metadata,
-    dedupeKey: `SYSTEM_BROADCAST:${type}:${title}:${String(user.authId).trim()}`,
+    dedupeKey: `SYSTEM_BROADCAST:${contentFingerprint}:${String(user.authId).trim()}`,
   }));
 
   const created = await notificationService.createNotificationsBulk(notifications);
@@ -138,6 +159,50 @@ const broadcastSystemNotification = async (req, res) => {
   });
 };
 
+const sendNotificationToUser = async (req, res) => {
+  const recipientAuthId = String(req.body?.recipientAuthId || '').trim();
+  const recipientRole = String(req.body?.recipientRole || 'USER').trim().toUpperCase();
+  const title = String(req.body?.title || '').trim();
+  const message = String(req.body?.message || '').trim();
+  const actionUrl = req.body?.actionUrl ? String(req.body.actionUrl).trim() : null;
+  const category = String(req.body?.category || 'SYSTEM').trim().toUpperCase();
+  const type = String(req.body?.type || 'SYSTEM_ANNOUNCEMENT').trim().toUpperCase();
+  const metadata = req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
+
+  if (!recipientAuthId) {
+    throw createApiError(400, 'recipientAuthId is required');
+  }
+
+  if (!title || !message) {
+    throw createApiError(400, 'title and message are required');
+  }
+
+  const contentFingerprint = crypto
+    .createHash('sha1')
+    .update(JSON.stringify({ type, category, title, message, actionUrl, metadata }))
+    .digest('hex');
+
+  const dedupeKey = `DIRECT:${contentFingerprint}:${recipientAuthId}`;
+
+  const created = await notificationService.createNotification({
+    recipientAuthId,
+    recipientRole,
+    type,
+    category,
+    title,
+    message,
+    actionUrl,
+    metadata,
+    dedupeKey,
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: 'Notification sent successfully',
+    data: created,
+  });
+};
+
 module.exports = {
   healthCheck,
   getNotifications,
@@ -145,4 +210,5 @@ module.exports = {
   markNotificationRead,
   markAllRead,
   broadcastSystemNotification,
+  sendNotificationToUser,
 };

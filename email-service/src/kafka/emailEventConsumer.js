@@ -41,6 +41,12 @@ const promotionEmailBlastDedupeTtlMs = parseInt(
 );
 const sentPromotionEmailBlastRequests = new Map();
 
+const ticketReminderEmailDedupeTtlMs = parseInt(
+  process.env.TICKET_REMINDER_EMAIL_DEDUPE_TTL_MS || '172800000',
+  10
+);
+const sentTicketReminderEmails = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
@@ -91,6 +97,15 @@ const prunePromotionEmailBlastSentCache = () => {
   for (const [key, ts] of sentPromotionEmailBlastRequests.entries()) {
     if (now - ts > promotionEmailBlastDedupeTtlMs) {
       sentPromotionEmailBlastRequests.delete(key);
+    }
+  }
+};
+
+const pruneTicketReminderSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentTicketReminderEmails.entries()) {
+    if (now - ts > ticketReminderEmailDedupeTtlMs) {
+      sentTicketReminderEmails.delete(key);
     }
   }
 };
@@ -675,6 +690,58 @@ const formatDistance = (km) => {
   return `${n.toFixed(1)} km`;
 };
 
+const formatReminderLeadText = (hours) => {
+  const n = Number(hours || 0);
+  if (!Number.isFinite(n) || n <= 0) return 'soon';
+  return `${n} hour${n === 1 ? '' : 's'}`;
+};
+
+const handleTicketEventReminderEmailRequested = async (payload) => {
+  const eventId = String(payload?.eventId || '').trim();
+  const authId = String(payload?.authId || '').trim();
+  const eventTitle = String(payload?.eventTitle || 'Your event').trim() || 'Your event';
+  const leadHours = Number(payload?.reminderOffsetHours || payload?.metadata?.offsetHours || 0);
+  const dedupeKey = String(payload?.dedupeKey || `${eventId}:${authId}:${leadHours || 'na'}`).trim();
+
+  if (!eventId || !authId) {
+    logger.error('TICKET_EVENT_REMINDER_EMAIL_REQUESTED missing required fields', { payload });
+    return;
+  }
+
+  pruneTicketReminderSentCache();
+  if (dedupeKey && sentTicketReminderEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate ticket reminder email request', { eventId, authId, dedupeKey });
+    return;
+  }
+
+  const user = await fetchUserByAuthId(authId);
+  const recipientEmail = String(user?.email || '').trim();
+  if (!recipientEmail) {
+    logger.warn('Unable to send ticket reminder email: user email not found', { eventId, authId });
+    return;
+  }
+
+  await emailService.sendTicketEventReminderEmail(recipientEmail, {
+    recipientName: user?.name || user?.fullName || user?.username || 'there',
+    eventId,
+    eventTitle,
+    eventStartAt: payload?.eventStartAt || payload?.metadata?.eventStartAt || null,
+    leadHours,
+    actionUrl: payload?.actionUrl || '/user/ticket-management',
+  });
+
+  if (dedupeKey) {
+    sentTicketReminderEmails.set(dedupeKey, Date.now());
+  }
+
+  logger.info('Ticket reminder email sent', {
+    eventId,
+    authId,
+    leadTime: formatReminderLeadText(leadHours),
+    to: recipientEmail,
+  });
+};
+
 const handleVendorRequestRejectedAlternatives = async (event) => {
   const { eventId, authId, service, rejectionReason, options, radiusKm } = event || {};
 
@@ -1228,6 +1295,11 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'PROMOTION_EMAIL_BLAST_REQUESTED':
       if (topic === eventTopic) {
         await handlePromotionEmailBlastRequested(payload);
+      }
+      break;
+    case 'TICKET_EVENT_REMINDER_EMAIL_REQUESTED':
+      if (topic === eventTopic) {
+        await handleTicketEventReminderEmailRequested(payload);
       }
       break;
     case 'VENDOR_REQUEST_REJECTED_ALTERNATIVES':

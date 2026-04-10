@@ -14,6 +14,7 @@ const logger = require('./utils/logger');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { extractUser } = require('./middleware/extractUser');
 const { startManagerAutoAssignJob, stopManagerAutoAssignJob } = require('./jobs/managerAutoAssignJob');
+const { startPromoteAutoLiveJob, stopPromoteAutoLiveJob } = require('./jobs/promoteAutoLiveJob');
 
 // Import routes
 const planningRoutes = require('./routes/planningRoutes');
@@ -98,6 +99,7 @@ const startServer = async () => {
 
     // Background jobs
     startManagerAutoAssignJob();
+    startPromoteAutoLiveJob();
 
     // Graceful shutdown
     const gracefulShutdown = async (signal) => {
@@ -121,6 +123,7 @@ const startServer = async () => {
 
           // Stop background jobs
           stopManagerAutoAssignJob();
+          stopPromoteAutoLiveJob();
 
           // Close MongoDB connection
           const mongoose = require('mongoose');

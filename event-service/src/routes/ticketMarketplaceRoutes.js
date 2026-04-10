@@ -48,6 +48,18 @@ router.get(
   ticketMarketplaceController.getEventTicketGuests
 );
 
+router.get(
+  '/tickets/events/:eventId/guests/export',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  ticketMarketplaceController.exportEventTicketGuests
+);
+
+router.post(
+  '/tickets/events/:eventId/guests/notify',
+  authorizeRoles(['MANAGER']),
+  ticketMarketplaceController.notifyEventTicketGuests
+);
+
 router.post(
   '/tickets/verify-qr',
   authorizeRoles(['VENDOR', 'ADMIN', 'MANAGER']),

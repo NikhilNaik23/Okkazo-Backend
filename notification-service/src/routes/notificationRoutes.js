@@ -20,4 +20,10 @@ router.post(
   notificationController.broadcastSystemNotification
 );
 
+router.post(
+  '/system/send-to-user',
+  authorizeRoles(['ADMIN']),
+  notificationController.sendNotificationToUser
+);
+
 module.exports = router;

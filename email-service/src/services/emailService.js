@@ -673,6 +673,63 @@ const sendPlanningFinalSettlementThankYouEmail = async (email, details) => {
   }
 };
 
+/**
+ * Send ticket holder pre-event reminder email.
+ */
+const sendTicketEventReminderEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventStartAt,
+      leadHours,
+      actionUrl,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('ticket-event-reminder');
+    const safeLeadHours = Number(leadHours || 0);
+
+    const parsedStartAt = eventStartAt ? new Date(eventStartAt) : null;
+    const eventStartDisplay = parsedStartAt && !Number.isNaN(parsedStartAt.getTime())
+      ? parsedStartAt.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      })
+      : null;
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      leadHours: safeLeadHours > 0 ? safeLeadHours : null,
+      eventStartAt: eventStartDisplay,
+      actionUrl: actionUrl || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    const subject = safeLeadHours > 0
+      ? `Reminder: ${eventTitle} starts in ${safeLeadHours} hour${safeLeadHours === 1 ? '' : 's'}`
+      : `Reminder: ${eventTitle} is coming up`;
+
+    await sendEmail(email, subject, html);
+    logger.info('Ticket event reminder email sent', { email, eventId, leadHours: safeLeadHours });
+  } catch (error) {
+    logger.error('Error sending ticket event reminder email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -690,4 +747,5 @@ module.exports = {
   sendPlanningQuoteLockedUserEmail,
   sendPlanningQuoteLockedVendorEmail,
   sendPlanningFinalSettlementThankYouEmail,
+  sendTicketEventReminderEmail,
 };

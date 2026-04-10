@@ -7,11 +7,15 @@ const { ADMIN_DECISION_STATUS, PROMOTE_STATUS } = require('../utils/promoteConst
 const { USER_TICKET_STATUS, USER_TICKET_VERIFICATION_STATUS } = require('../utils/ticketConstants');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
-const { fetchUserByAuthId } = require('./userServiceClient');
+const { fetchUserByAuthId, resolveUserServiceIdFromAuthId } = require('./userServiceClient');
 const promoteConfigService = require('./promoteConfigService');
 const { signTicketQrToken, verifyTicketQrToken } = require('../utils/ticketQrToken');
 
 const ORDER_SERVICE_URL = (process.env.ORDER_SERVICE_URL || 'http://order-service:8087').replace(/\/$/, '');
+const NOTIFICATION_SERVICE_URL = (
+  process.env.NOTIFICATION_SERVICE_URL
+  || (process.env.SERVICE_HOST ? 'http://notification-service:8088' : 'http://localhost:8088')
+).replace(/\/$/, '');
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_SCAN_HISTORY = 200;
 
@@ -171,6 +175,151 @@ const normalizeGuestName = (user, authId) => {
 const normalizeGuestEmail = (user) => {
   const email = String(user?.email || user?.mail || '').trim();
   return email || null;
+};
+
+const sanitizeFileNameFragment = (value, fallback = 'event') => {
+  const normalized = String(value || '').trim().toLowerCase();
+  const collapsed = normalized.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return collapsed || fallback;
+};
+
+const escapeCsvCell = (value) => {
+  const text = value == null ? '' : String(value);
+  const escaped = text.replace(/"/g, '""');
+  return `"${escaped}"`;
+};
+
+const formatIsoDateTimeForCsv = (value) => {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toISOString();
+};
+
+const buildGuestNotificationHeaders = () => {
+  const authId = process.env.EVENT_SERVICE_SYSTEM_AUTH_ID || 'system:event-service';
+  return {
+    'x-auth-id': authId,
+    'x-user-id': authId,
+    'x-user-email': 'system@okkazo.local',
+    'x-user-username': 'event-service',
+    'x-user-role': 'ADMIN',
+  };
+};
+
+const getTicketEventAssignment = async ({ eventId } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const [planning, promote] = await Promise.all([
+    Planning.findOne({ eventId: normalizedEventId })
+      .select('eventId eventTitle assignedManagerId')
+      .lean(),
+    Promote.findOne({ eventId: normalizedEventId })
+      .select('eventId eventTitle assignedManagerId')
+      .lean(),
+  ]);
+
+  if (planning) {
+    return {
+      eventId: normalizedEventId,
+      eventType: 'planning',
+      eventTitle: String(planning?.eventTitle || '').trim() || 'Event',
+      assignedManagerId: String(planning?.assignedManagerId || '').trim() || null,
+    };
+  }
+
+  if (promote) {
+    return {
+      eventId: normalizedEventId,
+      eventType: 'promote',
+      eventTitle: String(promote?.eventTitle || '').trim() || 'Event',
+      assignedManagerId: String(promote?.assignedManagerId || '').trim() || null,
+    };
+  }
+
+  throw createApiError(404, 'Event not found');
+};
+
+const assertAssignedManagerGuestNotifyAccess = async ({ eventId, actorRole, actorAuthId } = {}) => {
+  const normalizedActorRole = String(actorRole || '').trim().toUpperCase();
+  const normalizedActorAuthId = String(actorAuthId || '').trim();
+
+  if (!normalizedActorAuthId) {
+    throw createApiError(401, 'Authentication required');
+  }
+
+  if (normalizedActorRole !== 'MANAGER') {
+    throw createApiError(403, 'Only the assigned manager can notify guests for this event');
+  }
+
+  const eventAssignment = await getTicketEventAssignment({ eventId });
+  const assignedManagerId = String(eventAssignment?.assignedManagerId || '').trim();
+
+  if (!assignedManagerId) {
+    throw createApiError(409, 'No manager is assigned to this event yet');
+  }
+
+  if (assignedManagerId === normalizedActorAuthId) {
+    return eventAssignment;
+  }
+
+  let resolvedManagerUserId = '';
+  try {
+    resolvedManagerUserId = String(await resolveUserServiceIdFromAuthId(normalizedActorAuthId) || '').trim();
+  } catch (error) {
+    logger.warn('Failed to resolve manager id for guest notification authorization', {
+      eventId: eventAssignment.eventId,
+      actorAuthId: normalizedActorAuthId,
+      message: error?.message,
+    });
+  }
+
+  if (resolvedManagerUserId && assignedManagerId === resolvedManagerUserId) {
+    return eventAssignment;
+  }
+
+  throw createApiError(403, 'Only the assigned manager can notify guests for this event');
+};
+
+const buildGuestsCsv = ({ guests = [] } = {}) => {
+  const headers = [
+    'Ticket ID',
+    'Name',
+    'Email',
+    'Ticket Type',
+    'Quantity',
+    'Status',
+    'Paid Amount',
+    'Currency',
+    'Paid At',
+    'Created At',
+  ];
+
+  const lines = [headers.map((cell) => escapeCsvCell(cell)).join(',')];
+
+  for (const guest of guests) {
+    const paidAmount = Number(guest?.paidAmount || 0);
+    const normalizedPaidAmount = Number.isFinite(paidAmount) && paidAmount >= 0 ? paidAmount : 0;
+    const row = [
+      guest?.ticketId || '',
+      guest?.registrant?.name || '',
+      guest?.registrant?.email || '',
+      guest?.ticketType || '',
+      Number(guest?.quantity || 0),
+      guest?.status || '',
+      normalizedPaidAmount,
+      guest?.currency || 'INR',
+      formatIsoDateTimeForCsv(guest?.paidAt),
+      formatIsoDateTimeForCsv(guest?.createdAt),
+    ];
+
+    lines.push(row.map((cell) => escapeCsvCell(cell)).join(','));
+  }
+
+  return `\uFEFF${lines.join('\r\n')}`;
 };
 
 const normalizePlanningDayWiseAllocations = ({ tickets, tiers } = {}) => {
@@ -1379,6 +1528,117 @@ const getEventTicketGuests = async ({ eventId, page = 1, limit = 20, query = '' 
   };
 };
 
+const exportEventTicketGuestsCsv = async ({ eventId, query = '' } = {}) => {
+  const eventAssignment = await getTicketEventAssignment({ eventId });
+
+  const guestResult = await getEventTicketGuests({
+    eventId: eventAssignment.eventId,
+    page: 1,
+    limit: 100000,
+    query,
+  });
+
+  const guests = Array.isArray(guestResult?.guests) ? guestResult.guests : [];
+  const csvContent = buildGuestsCsv({ guests });
+  const safeTitle = sanitizeFileNameFragment(eventAssignment.eventTitle, sanitizeFileNameFragment(eventAssignment.eventId, 'event'));
+
+  return {
+    filename: `guest-list-${safeTitle}.csv`,
+    contentType: 'text/csv; charset=utf-8',
+    csvContent,
+    total: Number(guestResult?.total || 0),
+  };
+};
+
+const notifyEventTicketGuests = async ({ eventId, actorRole, actorAuthId, title, message, actionUrl = null } = {}) => {
+  const normalizedTitle = String(title || '').trim();
+  const normalizedMessage = String(message || '').trim();
+  const normalizedActionUrl = actionUrl ? String(actionUrl).trim() : null;
+
+  if (!normalizedTitle || !normalizedMessage) {
+    throw createApiError(400, 'title and message are required');
+  }
+
+  const eventAssignment = await assertAssignedManagerGuestNotifyAccess({
+    eventId,
+    actorRole,
+    actorAuthId,
+  });
+
+  const ticketRows = await UserEventTicket.find({
+    eventId: eventAssignment.eventId,
+    ticketStatus: USER_TICKET_STATUS.SUCCESS,
+  })
+    .select('userAuthId')
+    .lean();
+
+  const recipientAuthIds = Array.from(
+    new Set(
+      (Array.isArray(ticketRows) ? ticketRows : [])
+        .map((row) => String(row?.userAuthId || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (recipientAuthIds.length === 0) {
+    return {
+      targetedGuests: 0,
+      delivered: 0,
+      failed: 0,
+      failedRecipients: [],
+      eventId: eventAssignment.eventId,
+    };
+  }
+
+  const headers = buildGuestNotificationHeaders();
+  const requests = recipientAuthIds.map((recipientAuthId) => axios.post(
+    `${NOTIFICATION_SERVICE_URL}/system/send-to-user`,
+    {
+      recipientAuthId,
+      recipientRole: 'USER',
+      title: normalizedTitle,
+      message: normalizedMessage,
+      actionUrl: normalizedActionUrl,
+      category: 'EVENT',
+      type: 'EVENT_GUEST_ANNOUNCEMENT',
+      metadata: {
+        eventId: eventAssignment.eventId,
+        eventType: eventAssignment.eventType,
+        eventTitle: eventAssignment.eventTitle,
+        source: 'event-service:guest-notify',
+      },
+    },
+    {
+      headers,
+      timeout: 10_000,
+    }
+  ));
+
+  const settled = await Promise.allSettled(requests);
+  const failedRecipients = [];
+
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') return;
+
+    const failedRecipient = recipientAuthIds[index];
+    if (failedRecipient) failedRecipients.push(failedRecipient);
+
+    logger.warn('Failed to send guest notification', {
+      eventId: eventAssignment.eventId,
+      recipientAuthId: failedRecipient || null,
+      message: result?.reason?.response?.data?.message || result?.reason?.message,
+    });
+  });
+
+  return {
+    eventId: eventAssignment.eventId,
+    targetedGuests: recipientAuthIds.length,
+    delivered: recipientAuthIds.length - failedRecipients.length,
+    failed: failedRecipients.length,
+    failedRecipients,
+  };
+};
+
 const markTicketSalePaid = async (payload = {}) => {
   const eventId = String(payload?.eventId || '').trim();
   const authId = String(payload?.authId || '').trim();
@@ -1626,6 +1886,8 @@ module.exports = {
   getMyTickets,
   getMyTicketByTicketId,
   getEventTicketGuests,
+  exportEventTicketGuestsCsv,
+  notifyEventTicketGuests,
   markTicketSalePaid,
   verifyTicketQr,
 };

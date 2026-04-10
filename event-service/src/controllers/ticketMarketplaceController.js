@@ -152,6 +152,52 @@ const getEventTicketGuests = async (req, res) => {
   }
 };
 
+const exportEventTicketGuests = async (req, res) => {
+  try {
+    const result = await ticketMarketplaceService.exportEventTicketGuestsCsv({
+      eventId: req.params?.eventId,
+      query: req.query?.query,
+    });
+
+    res.setHeader('Content-Type', result.contentType || 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename || 'guest-list.csv'}"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    return res.status(200).send(result.csvContent || '');
+  } catch (error) {
+    logger.error('Error in exportEventTicketGuests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to export event guests',
+    });
+  }
+};
+
+const notifyEventTicketGuests = async (req, res) => {
+  try {
+    const result = await ticketMarketplaceService.notifyEventTicketGuests({
+      eventId: req.params?.eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      title: req.body?.title,
+      message: req.body?.message,
+      actionUrl: req.body?.actionUrl,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Guest notification processing completed',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in notifyEventTicketGuests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to notify guests',
+    });
+  }
+};
+
 const verifyTicketQr = async (req, res) => {
   try {
     const result = await ticketMarketplaceService.verifyTicketQr({
@@ -203,5 +249,7 @@ module.exports = {
   getMyTickets,
   getMyTicketByTicketId,
   getEventTicketGuests,
+  exportEventTicketGuests,
+  notifyEventTicketGuests,
   verifyTicketQr,
 };

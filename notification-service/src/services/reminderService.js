@@ -1,9 +1,18 @@
 const { v4: uuidv4 } = require('uuid');
 const NotificationSchedule = require('../models/NotificationSchedule');
 const { createNotification } = require('./notificationService');
+const { publishTicketReminderEmailRequested } = require('./reminderEmailPublisher');
 const logger = require('../utils/logger');
 
-const DEFAULT_REMINDER_OFFSETS_HOURS = [48, 24, 12];
+const DEFAULT_REMINDER_OFFSETS_HOURS = [48, 24, 2];
+
+const formatReminderLeadText = (offsetHours) => {
+  const hours = Number(offsetHours || 0);
+  if (hours === 24) return '24 hours';
+  if (hours === 48) return '48 hours';
+  if (hours === 2) return '2 hours';
+  return `${hours} hour(s)`;
+};
 
 const scheduleTicketReminders = async ({
   recipientAuthId,
@@ -41,6 +50,8 @@ const scheduleTicketReminders = async ({
     }
 
     try {
+      const eventTitleSafe = String(eventTitle || 'Your event').trim() || 'Your event';
+
       const schedule = await NotificationSchedule.create({
         scheduleId: uuidv4(),
         recipientAuthId: authId,
@@ -48,11 +59,12 @@ const scheduleTicketReminders = async ({
         eventId: eid,
         type: 'TICKET_EVENT_REMINDER',
         category: 'SYSTEM',
-        title: 'Event Reminder',
-        message: `${String(eventTitle || 'Your event').trim()} starts in ${offsetHours} hour(s).`,
+        title: 'Upcoming Event Reminder',
+        message: `${eventTitleSafe} is starting in ${formatReminderLeadText(offsetHours)}.`,
         actionUrl,
         metadata: {
           ...metadata,
+          eventTitle: eventTitleSafe,
           eventStartAt: startAt.toISOString(),
           offsetHours,
         },
@@ -89,6 +101,7 @@ const processDueReminderSchedules = async ({ batchSize = 100 } = {}) => {
 
   let sent = 0;
   let failed = 0;
+  let emailRequested = 0;
 
   for (const row of due) {
     try {
@@ -103,6 +116,21 @@ const processDueReminderSchedules = async ({ batchSize = 100 } = {}) => {
         metadata: row.metadata || {},
         dedupeKey: `${row.dedupeKey}:DELIVERY`,
       });
+
+      const offsetHours = Number(row?.metadata?.offsetHours || 0);
+      if (row?.type === 'TICKET_EVENT_REMINDER' && offsetHours === 48) {
+        await publishTicketReminderEmailRequested({
+          recipientAuthId: row.recipientAuthId,
+          eventId: row.eventId,
+          eventTitle: row?.metadata?.eventTitle || row?.title || 'Your event',
+          eventStartAt: row?.metadata?.eventStartAt || null,
+          offsetHours,
+          actionUrl: row.actionUrl,
+          metadata: row.metadata || {},
+          dedupeKey: row.dedupeKey,
+        });
+        emailRequested += 1;
+      }
 
       row.status = 'SENT';
       row.processedAt = new Date();
@@ -126,6 +154,7 @@ const processDueReminderSchedules = async ({ batchSize = 100 } = {}) => {
     processed: due.length,
     sent,
     failed,
+    emailRequested,
   };
 };
 
