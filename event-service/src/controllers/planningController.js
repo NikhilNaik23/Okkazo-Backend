@@ -933,6 +933,203 @@ const getManagerPlanningApplications = async (req, res) => {
 };
 
 /**
+ * Create planning cancellation refund request (Owner)
+ * POST /planning/:eventId/refund-request
+ */
+const createPlanningRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const planning = await planningService.createPlanningRefundRequest({
+      eventId,
+      authId: req.user.authId,
+      cancellationReason: req.body?.cancellationReason,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Cancellation refund request submitted successfully',
+      data: planning,
+    });
+  } catch (error) {
+    logger.error('Error in createPlanningRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to create refund request',
+    });
+  }
+};
+
+/**
+ * Get planning refund request by eventId
+ * GET /planning/:eventId/refund-request
+ */
+const getPlanningRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const planning = await planningService.getPlanningRefundRequestByEventId({ eventId });
+
+    if (
+      req.user?.role !== 'ADMIN'
+      && req.user?.role !== 'MANAGER'
+      && String(planning?.authId || '').trim() !== String(req.user?.authId || '').trim()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only view your own refund request.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: planning,
+    });
+  } catch (error) {
+    logger.error('Error in getPlanningRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch refund request',
+    });
+  }
+};
+
+/**
+ * Revenue Operations Specialist queue for planning refund requests
+ * GET /planning/manager/refund-requests
+ */
+const getManagerPlanningRefundRequests = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+    const statuses = String(req.query?.statuses || '')
+      .split(',')
+      .map((status) => String(status || '').trim())
+      .filter(Boolean);
+
+    const context = await planningService.resolveRevenueOpsManagerContext({
+      authId: req.user?.authId,
+      role: req.user?.role,
+    });
+
+    const managerId = context.isAdmin && req.query?.managerId
+      ? String(req.query.managerId).trim()
+      : context.managerId;
+
+    const requests = await planningService.getPlanningRefundRequestsForManager({
+      managerId,
+      limit,
+      statuses,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { requests },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPlanningRefundRequests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch refund requests',
+    });
+  }
+};
+
+/**
+ * Review planning refund request
+ * PATCH /planning/:eventId/refund-request
+ */
+const reviewPlanningRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const context = await planningService.resolveRevenueOpsManagerContext({
+      authId: req.user?.authId,
+      role: req.user?.role,
+    });
+
+    const updated = await planningService.reviewPlanningRefundRequest({
+      eventId,
+      managerId: context.managerId,
+      managerAuthId: req.user?.authId,
+      nextStatus: req.body?.status,
+      managerNotes: req.body?.managerNotes,
+      refundTransactionRef: req.body?.refundTransactionRef,
+      isAdmin: context.isAdmin,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Refund request updated successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in reviewPlanningRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to review refund request',
+    });
+  }
+};
+
+/**
+ * Manually trigger cancellation guest operations (notifications + emails + ticket refunds)
+ * POST /planning/:eventId/refund-request/cancellation-ops
+ */
+const triggerPlanningCancellationGuestOpsManual = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const isAdmin = String(req.user?.role || '').trim().toUpperCase() === 'ADMIN';
+
+    const managerId = isAdmin
+      ? String(req.body?.managerId || '').trim() || null
+      : await resolveUserServiceIdFromAuthId(req.user?.authId);
+
+    if (!isAdmin && !managerId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Manager not found',
+      });
+    }
+
+    const result = await planningService.triggerPlanningCancellationGuestOpsManual({
+      eventId,
+      managerId,
+      managerAuthId: req.user?.authId,
+      isAdmin,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result?.alreadyCompleted
+        ? 'Cancellation guest operations are already completed'
+        : 'Cancellation guest operations executed',
+      data: result?.planning || null,
+      alreadyCompleted: Boolean(result?.alreadyCompleted),
+    });
+  } catch (error) {
+    logger.error('Error in triggerPlanningCancellationGuestOpsManual:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to trigger cancellation guest operations',
+    });
+  }
+};
+
+/**
  * Update planning core details (Manager/Admin)
  * PATCH /planning/:eventId
  */
@@ -1579,6 +1776,11 @@ module.exports = {
   getVendorsForPlanning,
   getManagerPlanningEvents,
   getManagerPlanningApplications,
+  createPlanningRefundRequest,
+  getPlanningRefundRequest,
+  getManagerPlanningRefundRequests,
+  reviewPlanningRefundRequest,
+  triggerPlanningCancellationGuestOpsManual,
   updatePlanningDetails,
   syncPlanningReservationDay,
   addPlanningCoreStaff,

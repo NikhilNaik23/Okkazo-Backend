@@ -6,6 +6,8 @@ const router = express.Router();
 
 router.post('/orders/create', authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']), orderController.createOrder);
 router.post('/orders/verify', authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']), orderController.verifyPayment);
+router.post('/orders/refund/event-ticket-sales', authorizeRoles(['ADMIN', 'MANAGER']), orderController.refundEventTicketSales);
+router.post('/orders/refund/ticket-sale', authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']), orderController.refundTicketSalePayment);
 router.post('/orders/refund', authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']), orderController.refundPayment);
 router.post('/orders/vendor-payouts/onboarding-link', authorizeRoles(['VENDOR']), orderController.createVendorPayoutOnboardingLink);
 router.get('/orders/vendor-payouts/onboarding-status', authorizeRoles(['VENDOR']), orderController.getVendorPayoutOnboardingStatus);

@@ -275,6 +275,159 @@ const getManagerPromoteEvents = async (req, res) => {
 };
 
 /**
+ * Create promote cancellation refund request (Owner)
+ * POST /promote/:eventId/refund-request
+ */
+const createPromoteRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const promote = await promoteService.createPromoteRefundRequest({
+      eventId,
+      authId: req.user.authId,
+      cancellationReason: req.body?.cancellationReason,
+      reasonCode: req.body?.reasonCode,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Cancellation processed successfully',
+      data: promote,
+    });
+  } catch (error) {
+    logger.error('Error in createPromoteRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to create refund request',
+    });
+  }
+};
+
+/**
+ * Get promote refund request by eventId
+ * GET /promote/:eventId/refund-request
+ */
+const getPromoteRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const promote = await promoteService.getPromoteRefundRequestByEventId({ eventId });
+
+    if (
+      req.user?.role !== 'ADMIN'
+      && req.user?.role !== 'MANAGER'
+      && String(promote?.authId || '').trim() !== String(req.user?.authId || '').trim()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only view your own refund request.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: promote,
+    });
+  } catch (error) {
+    logger.error('Error in getPromoteRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch refund request',
+    });
+  }
+};
+
+/**
+ * Revenue Operations Specialist queue for promote refund requests
+ * GET /promote/manager/refund-requests
+ */
+const getManagerPromoteRefundRequests = async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+    const statuses = String(req.query?.statuses || '')
+      .split(',')
+      .map((status) => String(status || '').trim())
+      .filter(Boolean);
+
+    const context = await promoteService.resolveRevenueOpsManagerContext({
+      authId: req.user?.authId,
+      role: req.user?.role,
+    });
+
+    const managerId = context.isAdmin && req.query?.managerId
+      ? String(req.query.managerId).trim()
+      : context.managerId;
+
+    const requests = await promoteService.getPromoteRefundRequestsForManager({
+      managerId,
+      limit,
+      statuses,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { requests },
+    });
+  } catch (error) {
+    logger.error('Error in getManagerPromoteRefundRequests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch refund requests',
+    });
+  }
+};
+
+/**
+ * Review promote refund request
+ * PATCH /promote/:eventId/refund-request
+ */
+const reviewPromoteRefundRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const context = await promoteService.resolveRevenueOpsManagerContext({
+      authId: req.user?.authId,
+      role: req.user?.role,
+    });
+
+    const updated = await promoteService.reviewPromoteRefundRequest({
+      eventId,
+      managerId: context.managerId,
+      managerAuthId: req.user?.authId,
+      nextStatus: req.body?.status,
+      managerNotes: req.body?.managerNotes,
+      refundTransactionRef: req.body?.refundTransactionRef,
+      isAdmin: context.isAdmin,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Refund request updated successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in reviewPromoteRefundRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to review refund request',
+    });
+  }
+};
+
+/**
  * Update promote core details (Manager/Admin)
  * PATCH /promote/:eventId
  */
@@ -399,6 +552,41 @@ const releasePromoteGeneratedRevenuePayout = async (req, res) => {
 };
 
 /**
+ * Recover cancellation liability from event creator (Manager/Admin)
+ * PATCH /promote/:eventId/liability-recovery
+ */
+const recoverPromoteCancellationLiability = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await promoteService.recoverPromoteCancellationLiability({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: updated?.liabilityRecoverySummary?.alreadyRecovered
+        ? 'Creator liability is already recovered'
+        : updated?.liabilityRecoverySummary?.alreadyPending
+          ? 'Creator liability recovery is already pending payment'
+          : updated?.liabilityRecoverySummary?.notRequired
+            ? 'No creator liability is due for this event'
+            : 'Creator liability recovery initiated',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in recoverPromoteCancellationLiability:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to recover promote cancellation liability',
+    });
+  }
+};
+
+/**
  * Trigger EMAIL BLAST promotion action (Manager/Admin)
  * POST /promote/:eventId/promotion-actions/email-blast
  */
@@ -440,7 +628,11 @@ const updatePromoteStatus = async (req, res) => {
       return res.status(400).json({ success: false, message: 'eventStatus is required' });
     }
 
-    const promote = await promoteService.updatePromoteStatus(eventId, eventStatus, assignedManagerId);
+    const promote = await promoteService.updatePromoteStatus(eventId, eventStatus, assignedManagerId, {
+      updatedByAuthId: req.user?.authId || null,
+      updatedByRole: req.user?.role || null,
+      updatedByManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
 
     // Publish Kafka
     try {
@@ -665,9 +857,14 @@ module.exports = {
   addPromoteCoreStaff,
   removePromoteCoreStaff,
   releasePromoteGeneratedRevenuePayout,
+  recoverPromoteCancellationLiability,
   triggerPromoteEmailBlastPromotionAction,
   getAllPromotes,
   getManagerPromoteEvents,
+  createPromoteRefundRequest,
+  getPromoteRefundRequest,
+  getManagerPromoteRefundRequests,
+  reviewPromoteRefundRequest,
   updatePromoteStatus,
   assignManager,
   unassignManager,

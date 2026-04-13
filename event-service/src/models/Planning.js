@@ -399,6 +399,159 @@ const PlanningVendorFeedbackSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const PlanningRefundResultSchema = new mongoose.Schema(
+  {
+    grossPaidAmountPaise: {
+      type: Number,
+      min: 0,
+      required: true,
+    },
+    deductionPercent: {
+      type: Number,
+      min: 0,
+      max: 100,
+      required: true,
+    },
+    deductionAmountPaise: {
+      type: Number,
+      min: 0,
+      required: true,
+    },
+    refundAmountPaise: {
+      type: Number,
+      min: 0,
+      required: true,
+    },
+    daysUntilEvent: {
+      type: Number,
+      required: true,
+    },
+    timelineLabel: {
+      type: String,
+      trim: true,
+      default: '5-7 working days',
+    },
+    ruleCode: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    currency: {
+      type: String,
+      trim: true,
+      default: 'INR',
+    },
+  },
+  { _id: false }
+);
+
+const PlanningRefundRequestSchema = new mongoose.Schema(
+  {
+    requestId: {
+      type: String,
+      required: true,
+      default: () => uuidv4(),
+      trim: true,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['PENDING_REVIEW', 'APPROVED', 'REJECTED', 'REFUNDED'],
+      default: 'PENDING_REVIEW',
+      index: true,
+      trim: true,
+    },
+    requestedByAuthId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    requestedAt: {
+      type: Date,
+      default: Date.now,
+      index: true,
+    },
+    cancellationReason: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    assignedManagerId: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
+    assignedManagerRole: {
+      type: String,
+      trim: true,
+      default: 'Revenue Operations Specialist',
+    },
+    managerReviewedByAuthId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    managerReviewedAt: {
+      type: Date,
+      default: null,
+    },
+    managerNotes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    result: {
+      type: PlanningRefundResultSchema,
+      default: null,
+    },
+    refundedAt: {
+      type: Date,
+      default: null,
+    },
+    refundTransactionRef: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    cancellationOps: {
+      status: {
+        type: String,
+        enum: ['COMPLETED', 'FAILED'],
+        default: null,
+        trim: true,
+      },
+      triggeredBy: {
+        type: String,
+        enum: ['AUTOMATIC', 'MANUAL'],
+        default: null,
+        trim: true,
+      },
+      attemptedAt: {
+        type: Date,
+        default: null,
+      },
+      completedAt: {
+        type: Date,
+        default: null,
+      },
+      error: {
+        type: String,
+        trim: true,
+        maxlength: 1500,
+        default: null,
+      },
+      details: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null,
+      },
+    },
+  },
+  { _id: false }
+);
+
 const PlanningSchema = new mongoose.Schema(
   {
     eventId: {
@@ -675,6 +828,11 @@ const PlanningSchema = new mongoose.Schema(
         type: [PlanningVendorFeedbackSchema],
         default: [],
       },
+    },
+
+    refundRequest: {
+      type: PlanningRefundRequestSchema,
+      default: null,
     },
 
     quoteLockedAt: {
@@ -982,5 +1140,6 @@ PlanningSchema.pre('validate', function preValidate(next) {
 
 PlanningSchema.index({ authId: 1, createdAt: -1 });
 PlanningSchema.index({ category: 1, status: 1, isUrgent: 1 });
+PlanningSchema.index({ 'refundRequest.status': 1, 'refundRequest.assignedManagerId': 1, createdAt: -1 });
 
 module.exports = mongoose.model('Planning', PlanningSchema);

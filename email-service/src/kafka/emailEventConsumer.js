@@ -20,6 +20,12 @@ const httpTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 
 const dedupeTtlMs = parseInt(process.env.PAYMENT_EMAIL_DEDUPE_TTL_MS || '3600000', 10);
 const sentPaymentEmails = new Map();
 
+const paymentRefundEmailDedupeTtlMs = parseInt(
+  process.env.PAYMENT_REFUND_EMAIL_DEDUPE_TTL_MS || String(dedupeTtlMs),
+  10
+);
+const sentPaymentRefundEmails = new Map();
+
 const alternativesDedupeTtlMs = parseInt(process.env.ALTERNATIVES_EMAIL_DEDUPE_TTL_MS || '3600000', 10);
 const sentAlternativesEmails = new Map();
 
@@ -47,11 +53,32 @@ const ticketReminderEmailDedupeTtlMs = parseInt(
 );
 const sentTicketReminderEmails = new Map();
 
+const planningCancellationEmailDedupeTtlMs = parseInt(
+  process.env.PLANNING_CANCELLATION_EMAIL_DEDUPE_TTL_MS || '604800000',
+  10
+);
+const sentPlanningCancellationEmails = new Map();
+
+const ticketCancellationEmailDedupeTtlMs = parseInt(
+  process.env.TICKET_CANCELLATION_EMAIL_DEDUPE_TTL_MS || '604800000',
+  10
+);
+const sentTicketCancellationEmails = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
     if (now - ts > dedupeTtlMs) {
       sentPaymentEmails.delete(key);
+    }
+  }
+};
+
+const prunePaymentRefundSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentPaymentRefundEmails.entries()) {
+    if (now - ts > paymentRefundEmailDedupeTtlMs) {
+      sentPaymentRefundEmails.delete(key);
     }
   }
 };
@@ -106,6 +133,24 @@ const pruneTicketReminderSentCache = () => {
   for (const [key, ts] of sentTicketReminderEmails.entries()) {
     if (now - ts > ticketReminderEmailDedupeTtlMs) {
       sentTicketReminderEmails.delete(key);
+    }
+  }
+};
+
+const prunePlanningCancellationSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentPlanningCancellationEmails.entries()) {
+    if (now - ts > planningCancellationEmailDedupeTtlMs) {
+      sentPlanningCancellationEmails.delete(key);
+    }
+  }
+};
+
+const pruneTicketCancellationSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentTicketCancellationEmails.entries()) {
+    if (now - ts > ticketCancellationEmailDedupeTtlMs) {
+      sentTicketCancellationEmails.delete(key);
     }
   }
 };
@@ -742,6 +787,125 @@ const handleTicketEventReminderEmailRequested = async (payload) => {
   });
 };
 
+const handleTicketCancelledByUserEmailRequested = async (payload) => {
+  const eventId = String(payload?.eventId || '').trim();
+  const authId = String(payload?.authId || '').trim();
+  const ticketId = String(payload?.ticketId || '').trim();
+  const dedupeKey = String(payload?.dedupeKey || `${eventId}:${ticketId || 'na'}:${authId}`).trim();
+
+  if (!eventId || !authId) {
+    logger.error('TICKET_CANCELLED_BY_USER missing required fields for email', { payload });
+    return;
+  }
+
+  pruneTicketCancellationSentCache();
+  if (dedupeKey && sentTicketCancellationEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate ticket cancellation email request', { eventId, authId, ticketId, dedupeKey });
+    return;
+  }
+
+  const user = await fetchUserByAuthId(authId);
+  const recipientEmail = String(user?.email || '').trim();
+  if (!recipientEmail) {
+    logger.warn('Unable to send ticket cancellation email: user email not found', { eventId, authId, ticketId });
+    return;
+  }
+
+  await emailService.sendTicketCancellationUserEmail(recipientEmail, {
+    recipientName: user?.name || user?.fullName || user?.username || 'there',
+    eventId,
+    eventTitle: payload?.eventTitle || 'Event',
+    selectedDay: payload?.selectedDay || null,
+    eventStartAt: payload?.eventStartAt || null,
+    cancelledAt: payload?.cancelledAt || null,
+    cancellationReason: payload?.cancellationReason || null,
+    refundAmountInInr: payload?.refundAmountInInr || 0,
+    refundPercent: payload?.refundPercent || 0,
+    timelineLabel: payload?.timelineLabel || null,
+    actionUrl: payload?.actionUrl || '/user/my-events',
+  });
+
+  if (dedupeKey) {
+    sentTicketCancellationEmails.set(dedupeKey, Date.now());
+  }
+
+  logger.info('Ticket cancellation email sent', {
+    eventId,
+    authId,
+    ticketId,
+    to: recipientEmail,
+  });
+};
+
+const handlePlanningEventCancelledForGuests = async (payload) => {
+  const eventId = String(payload?.eventId || '').trim();
+  const eventTitle = String(payload?.eventTitle || '').trim() || 'Event';
+  const recipientAuthIds = Array.isArray(payload?.recipientAuthIds)
+    ? Array.from(new Set(payload.recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    : [];
+
+  if (!eventId || recipientAuthIds.length === 0) {
+    logger.warn('PLANNING_EVENT_CANCELLED_FOR_GUESTS missing required fields', {
+      eventId,
+      recipients: recipientAuthIds.length,
+    });
+    return;
+  }
+
+  prunePlanningCancellationSentCache();
+
+  let sentCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+
+  for (const authId of recipientAuthIds) {
+    const dedupeKey = `${eventId}:${authId}`;
+    if (sentPlanningCancellationEmails.has(dedupeKey)) {
+      skippedCount += 1;
+      continue;
+    }
+
+    try {
+      const user = await fetchUserByAuthId(authId);
+      const recipientEmail = String(user?.email || '').trim();
+      if (!recipientEmail) {
+        failedCount += 1;
+        logger.warn('Skipping cancellation email because recipient email was not found', { eventId, authId });
+        continue;
+      }
+
+      await emailService.sendPlanningEventCancelledGuestEmail(recipientEmail, {
+        recipientName: user?.name || user?.fullName || user?.username || 'there',
+        eventId,
+        eventTitle,
+        eventDate: payload?.eventDate || null,
+        eventLocation: payload?.eventLocation || null,
+        cancellationReason: payload?.cancellationReason || null,
+        refundTimelineLabel: payload?.refundTimelineLabel || null,
+        actionUrl: payload?.actionUrl || null,
+      });
+
+      sentPlanningCancellationEmails.set(dedupeKey, Date.now());
+      sentCount += 1;
+    } catch (error) {
+      failedCount += 1;
+      logger.warn('Failed to send planning cancellation email to guest', {
+        eventId,
+        authId,
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  logger.info('Processed PLANNING_EVENT_CANCELLED_FOR_GUESTS email batch', {
+    eventId,
+    requestedRecipients: recipientAuthIds.length,
+    sentCount,
+    skippedCount,
+    failedCount,
+  });
+};
+
 const handleVendorRequestRejectedAlternatives = async (event) => {
   const { eventId, authId, service, rejectionReason, options, radiusKm } = event || {};
 
@@ -1034,6 +1198,102 @@ const handlePaymentSuccessEvent = async (payload) => {
   logger.info('Payment success email sent successfully', { authId, eventId, to: recipientEmail });
 };
 
+const handlePaymentRefundSuccessEvent = async (payload) => {
+  const {
+    eventId,
+    authId,
+    paymentOrderId,
+    transactionId,
+    razorpayRefundId,
+    amount,
+    currency,
+    refundedAt,
+    orderType,
+  } = payload || {};
+
+  if (!eventId || !authId) {
+    logger.error('PAYMENT_REFUND_SUCCESS event missing required fields', { eventId, authId });
+    return;
+  }
+
+  const dedupeKey = razorpayRefundId || paymentOrderId || `${eventId}:${authId}:${transactionId || refundedAt || ''}`;
+  prunePaymentRefundSentCache();
+  if (sentPaymentRefundEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate PAYMENT_REFUND_SUCCESS email', { eventId, authId, dedupeKey });
+    return;
+  }
+
+  const user = await fetchUserByAuthId(authId);
+  const recipientEmail = user?.email;
+  if (!recipientEmail) {
+    logger.error('Unable to send refund email: user email not found', { authId, eventId });
+    return;
+  }
+
+  const recipientName = user?.name || user?.fullName || 'there';
+  let eventTitle = 'your event';
+  let eventLocation = 'TBA';
+  let eventStatus = 'REFUNDED';
+
+  try {
+    const promote = await fetchPromoteByEventIdForUser(eventId, user);
+    if (promote) {
+      eventTitle = promote?.eventTitle || eventTitle;
+      eventLocation = promote?.venue?.locationName || eventLocation;
+      eventStatus = promote?.eventStatus || eventStatus;
+    }
+  } catch (error) {
+    if (Number(error?.response?.status) !== 404) {
+      logger.warn('Unable to fetch promote details for refund email', {
+        eventId,
+        authId,
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  if (eventTitle === 'your event') {
+    try {
+      const planning = await fetchPlanningByEventIdForUser(eventId, user);
+      if (planning) {
+        eventTitle = planning?.eventTitle || eventTitle;
+        eventLocation = planning?.location?.name || planning?.location || eventLocation;
+        eventStatus = planning?.status || eventStatus;
+      }
+    } catch (error) {
+      if (Number(error?.response?.status) !== 404) {
+        logger.warn('Unable to fetch planning details for refund email', {
+          eventId,
+          authId,
+          message: error?.message || String(error),
+        });
+      }
+    }
+  }
+
+  await emailService.sendPaymentRefundSuccessEmail(recipientEmail, {
+    recipientName,
+    eventId,
+    eventTitle,
+    eventLocation,
+    eventStatus,
+    amount,
+    currency,
+    transactionId,
+    refundedAt,
+    razorpayRefundId,
+    orderType,
+  });
+
+  sentPaymentRefundEmails.set(dedupeKey, Date.now());
+  logger.info('Payment refund success email sent successfully', {
+    authId,
+    eventId,
+    to: recipientEmail,
+    dedupeKey,
+  });
+};
+
 const handleUserRevenuePayoutSuccessEvent = async (payload) => {
   const eventId = String(payload?.eventId || '').trim();
   const userAuthId = String(payload?.userAuthId || payload?.authId || '').trim();
@@ -1287,6 +1547,11 @@ const handleEvent = async (eventType, payload, topic) => {
         await handlePaymentSuccessEvent(payload);
       }
       break;
+    case 'PAYMENT_REFUND_SUCCESS':
+      if (topic === paymentTopic) {
+        await handlePaymentRefundSuccessEvent(payload);
+      }
+      break;
     case 'USER_REVENUE_PAYOUT_SUCCESS':
       if (topic === paymentTopic || topic === eventTopic) {
         await handleUserRevenuePayoutSuccessEvent(payload);
@@ -1300,6 +1565,16 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'TICKET_EVENT_REMINDER_EMAIL_REQUESTED':
       if (topic === eventTopic) {
         await handleTicketEventReminderEmailRequested(payload);
+      }
+      break;
+    case 'TICKET_CANCELLED_BY_USER':
+      if (topic === eventTopic) {
+        await handleTicketCancelledByUserEmailRequested(payload);
+      }
+      break;
+    case 'PLANNING_EVENT_CANCELLED_FOR_GUESTS':
+      if (topic === eventTopic) {
+        await handlePlanningEventCancelledForGuests(payload);
       }
       break;
     case 'VENDOR_REQUEST_REJECTED_ALTERNATIVES':
@@ -1320,7 +1595,6 @@ const handleEvent = async (eventType, payload, topic) => {
     // Payment events that are useful for audit/analytics but do not trigger emails here
     case 'PAYMENT_ORDER_CREATED':
     case 'PAYMENT_TRANSACTION_UPDATED':
-    case 'PAYMENT_REFUND_SUCCESS':
       break;
     default:
       logger.warn(`Unknown event type: ${eventType}`);

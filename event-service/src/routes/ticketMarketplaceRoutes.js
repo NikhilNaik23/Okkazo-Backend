@@ -42,6 +42,12 @@ router.get(
   ticketMarketplaceController.getMyTicketByTicketId
 );
 
+router.post(
+  '/tickets/my/:ticketId/cancel',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  ticketMarketplaceController.cancelMyTicket
+);
+
 router.get(
   '/tickets/events/:eventId/guests',
   authorizeRoles(['ADMIN', 'MANAGER']),

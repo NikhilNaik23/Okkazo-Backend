@@ -358,6 +358,69 @@ const sendPaymentSuccessEmail = async (email, details) => {
 };
 
 /**
+ * Send payment refund success email with event details
+ */
+const sendPaymentRefundSuccessEmail = async (email, details) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventLocation,
+      eventStatus,
+      amount,
+      currency,
+      transactionId,
+      refundedAt,
+      razorpayRefundId,
+      orderType,
+    } = details || {};
+
+    if (!eventId) {
+      throw new Error('Event ID is required');
+    }
+
+    const template = await loadTemplate('payment-refund-success');
+
+    const amountNumber = amount === null || amount === undefined ? null : Number(amount);
+    const amountRupees = Number.isFinite(amountNumber)
+      ? (amountNumber % 100 === 0 ? String(amountNumber / 100) : (amountNumber / 100).toFixed(2))
+      : null;
+
+    const currencyCode = (currency || 'INR').toString().toUpperCase();
+    const currencySymbol = currencyCode === 'INR' ? '₹' : '';
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle: eventTitle || 'Event',
+      eventLocation: eventLocation || 'TBA',
+      eventStatus: eventStatus || 'REFUNDED',
+      amountRupees,
+      currency: currencyCode,
+      currencySymbol,
+      transactionId: transactionId || null,
+      refundedAt: refundedAt || null,
+      razorpayRefundId: razorpayRefundId || null,
+      orderType: String(orderType || '').trim().toUpperCase() || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Refund Processed - ${eventTitle || eventId}`, html);
+
+    logger.info('Payment refund success email sent', { email, eventId, transactionId, razorpayRefundId });
+  } catch (error) {
+    logger.error('Error sending payment refund success email:', error);
+    throw error;
+  }
+};
+
+/**
  * Send generated revenue payout received email to user.
  */
 const sendUserGeneratedRevenueReceivedEmail = async (email, details) => {
@@ -730,6 +793,151 @@ const sendTicketEventReminderEmail = async (email, details) => {
   }
 };
 
+const sendTicketCancellationUserEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      selectedDay,
+      eventStartAt,
+      cancelledAt,
+      cancellationReason,
+      refundAmountInInr,
+      refundPercent,
+      timelineLabel,
+      actionUrl,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('ticket-cancelled-user');
+
+    const parsedSelectedDay = selectedDay
+      ? new Date(`${String(selectedDay).trim()}T00:00:00+05:30`)
+      : null;
+    const selectedDayDisplay = parsedSelectedDay && !Number.isNaN(parsedSelectedDay.getTime())
+      ? parsedSelectedDay.toLocaleDateString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+      })
+      : null;
+
+    const parsedEventStartAt = eventStartAt ? new Date(eventStartAt) : null;
+    const eventDateDisplay = selectedDayDisplay
+      || (parsedEventStartAt && !Number.isNaN(parsedEventStartAt.getTime())
+        ? parsedEventStartAt.toLocaleString('en-IN', {
+          year: 'numeric',
+          month: 'short',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true,
+        })
+        : null);
+
+    const parsedCancelledAt = cancelledAt ? new Date(cancelledAt) : null;
+    const cancelledAtDisplay = parsedCancelledAt && !Number.isNaN(parsedCancelledAt.getTime())
+      ? parsedCancelledAt.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      })
+      : null;
+
+    const parsedRefundAmount = Number(refundAmountInInr || 0);
+    const hasRefund = Number.isFinite(parsedRefundAmount) && parsedRefundAmount > 0;
+    const normalizedRefundAmount = hasRefund
+      ? Number(parsedRefundAmount.toFixed(2)).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : null;
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      eventDate: eventDateDisplay,
+      cancelledAt: cancelledAtDisplay,
+      cancellationReason: String(cancellationReason || '').trim() || null,
+      hasRefund,
+      refundAmountInInr: normalizedRefundAmount,
+      refundPercent: Number.isFinite(Number(refundPercent)) ? Number(refundPercent) : null,
+      timelineLabel: String(timelineLabel || '').trim() || '5-7 working days',
+      actionUrl: actionUrl || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    const subject = hasRefund
+      ? `Ticket Cancelled & Refund Initiated - ${eventTitle}`
+      : `Ticket Cancelled - ${eventTitle}`;
+
+    await sendEmail(email, subject, html);
+    logger.info('Ticket cancellation email sent', { email, eventId, hasRefund });
+  } catch (error) {
+    logger.error('Error sending ticket cancellation email:', error);
+    throw error;
+  }
+};
+
+const sendPlanningEventCancelledGuestEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      cancellationReason,
+      refundTimelineLabel,
+      actionUrl,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('planning-event-cancelled-guest');
+    const parsedEventDate = eventDate ? new Date(eventDate) : null;
+    const eventDateDisplay = parsedEventDate && !Number.isNaN(parsedEventDate.getTime())
+      ? parsedEventDate.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      })
+      : null;
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      eventDate: eventDateDisplay,
+      eventLocation: eventLocation || null,
+      cancellationReason: String(cancellationReason || '').trim() || null,
+      refundTimelineLabel: String(refundTimelineLabel || '').trim() || '5-7 working days',
+      actionUrl: actionUrl || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Event Cancelled - ${eventTitle}`, html);
+    logger.info('Planning event cancelled guest email sent', { email, eventId });
+  } catch (error) {
+    logger.error('Error sending planning event cancelled guest email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -741,6 +949,7 @@ module.exports = {
   sendVendorAccountCreatedEmail,
   sendManagerAccountCreatedEmail,
   sendPaymentSuccessEmail,
+  sendPaymentRefundSuccessEmail,
   sendUserGeneratedRevenueReceivedEmail,
   sendPromotionEmailBlastEmail,
   sendVendorRejectedAlternativesEmail,
@@ -748,4 +957,6 @@ module.exports = {
   sendPlanningQuoteLockedVendorEmail,
   sendPlanningFinalSettlementThankYouEmail,
   sendTicketEventReminderEmail,
+  sendTicketCancellationUserEmail,
+  sendPlanningEventCancelledGuestEmail,
 };

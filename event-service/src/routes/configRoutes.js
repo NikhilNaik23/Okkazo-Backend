@@ -32,6 +32,34 @@ router.patch(
   configController.updatePromotions
 );
 
+// GET /config/refund-policy — all authenticated roles
+router.get(
+  '/config/refund-policy',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  configController.getRefundPolicy
+);
+
+// PATCH /config/refund-policy — Revenue Ops specialist manager or admin
+router.patch(
+  '/config/refund-policy',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  configController.updateRefundPolicy
+);
+
+// GET /config/ticket-refund-policy — all authenticated roles
+router.get(
+  '/config/ticket-refund-policy',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  configController.getTicketRefundPolicy
+);
+
+// PATCH /config/ticket-refund-policy — Revenue Ops specialist manager or admin
+router.patch(
+  '/config/ticket-refund-policy',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  configController.updateTicketRefundPolicy
+);
+
 // GET /config/manager-autoassign — admin only
 router.get(
   '/config/manager-autoassign',

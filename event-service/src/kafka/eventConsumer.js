@@ -46,24 +46,54 @@ const startConsuming = async () => {
 
         if (eventType === 'PAYMENT_SUCCESS' && payload.eventId) {
           const orderType = payload.orderType || '';
+          const paymentNotes = (payload?.notes && typeof payload.notes === 'object') ? payload.notes : {};
+          const orderPurpose = String(paymentNotes?.orderPurpose || '').trim().toUpperCase();
 
           if (orderType === 'PROMOTE EVENT') {
-            // ── Promote payment confirmed ────────────────────────────────────
-            try {
-              const promote = await promoteService.markPromotePaid(payload.eventId);
-              await publishEvent('PROMOTE_PAYMENT_CONFIRMED', {
-                eventId: promote.eventId,
-                promoteId: promote.promoteId,
-                authId: promote.authId,
-                platformFeePaid: promote.platformFeePaid,
-                eventStatus: promote.eventStatus,
-                paymentOrderId: payload.paymentOrderId,
-                razorpayOrderId: payload.razorpayOrderId,
-                razorpayPaymentId: payload.razorpayPaymentId,
-                paidAt: payload.paidAt,
-              });
-            } catch (err) {
-              logger.error('Failed to process PROMOTE payment success:', err.message);
+            const isLiabilityRecoveryPayment = orderPurpose === 'PROMOTE_LIABILITY_RECOVERY'
+              || paymentNotes?.liabilityRecovery === true;
+
+            if (isLiabilityRecoveryPayment) {
+              try {
+                const promote = await promoteService.markPromoteLiabilityRecovered({
+                  eventId: payload.eventId,
+                  paymentOrderId: payload.paymentOrderId,
+                  razorpayOrderId: payload.razorpayOrderId,
+                  transactionId: payload.transactionId,
+                  paidAt: payload.paidAt,
+                });
+
+                await publishEvent('PROMOTE_LIABILITY_RECOVERY_CONFIRMED', {
+                  eventId: promote.eventId,
+                  promoteId: promote.promoteId,
+                  authId: promote.authId,
+                  liabilityRecoveryStatus: promote?.refundRequest?.liabilityRecovery?.status || null,
+                  paymentOrderId: payload.paymentOrderId,
+                  razorpayOrderId: payload.razorpayOrderId,
+                  razorpayPaymentId: payload.razorpayPaymentId,
+                  paidAt: payload.paidAt,
+                });
+              } catch (err) {
+                logger.error('Failed to process PROMOTE liability recovery payment success:', err.message);
+              }
+            } else {
+              // ── Promote payment confirmed ────────────────────────────────────
+              try {
+                const promote = await promoteService.markPromotePaid(payload.eventId);
+                await publishEvent('PROMOTE_PAYMENT_CONFIRMED', {
+                  eventId: promote.eventId,
+                  promoteId: promote.promoteId,
+                  authId: promote.authId,
+                  platformFeePaid: promote.platformFeePaid,
+                  eventStatus: promote.eventStatus,
+                  paymentOrderId: payload.paymentOrderId,
+                  razorpayOrderId: payload.razorpayOrderId,
+                  razorpayPaymentId: payload.razorpayPaymentId,
+                  paidAt: payload.paidAt,
+                });
+              } catch (err) {
+                logger.error('Failed to process PROMOTE payment success:', err.message);
+              }
             }
           } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
             // ── Planning deposit confirmed ─────────────────────────────────

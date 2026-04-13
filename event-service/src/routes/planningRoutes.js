@@ -47,6 +47,13 @@ router.get(
   planningController.getManagerPlanningApplications
 );
 
+// GET /planning/manager/refund-requests - Revenue Operations Specialist refund queue (Manager/Admin)
+router.get(
+  '/planning/manager/refund-requests',
+  isAdminOrManager,
+  planningController.getManagerPlanningRefundRequests
+);
+
 // GET /planning/me - Get current user's plannings
 router.get(
   '/planning/me',
@@ -66,6 +73,34 @@ router.get(
   '/planning/:eventId/quote/latest',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
   planningController.getPlanningQuoteLatest
+);
+
+// GET /planning/:eventId/refund-request - Get cancellation refund request
+router.get(
+  '/planning/:eventId/refund-request',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.getPlanningRefundRequest
+);
+
+// POST /planning/:eventId/refund-request - Create cancellation refund request (Owner)
+router.post(
+  '/planning/:eventId/refund-request',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.createPlanningRefundRequest
+);
+
+// PATCH /planning/:eventId/refund-request - Review cancellation refund request (Revenue Ops/Admin)
+router.patch(
+  '/planning/:eventId/refund-request',
+  isAdminOrManager,
+  planningController.reviewPlanningRefundRequest
+);
+
+// POST /planning/:eventId/refund-request/cancellation-ops - Manual fallback for guest cancellation notifications/emails/refunds
+router.post(
+  '/planning/:eventId/refund-request/cancellation-ops',
+  isAdminOrManager,
+  planningController.triggerPlanningCancellationGuestOpsManual
 );
 
 // POST /planning/:eventId/quote/send-email - Manually send quotation email (Manager/Admin)

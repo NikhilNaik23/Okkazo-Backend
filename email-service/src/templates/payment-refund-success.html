@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Refund Processed</title>
+</head>
+<body style="margin: 0; padding: 0; background: #f4f6fb; font-family: Arial, Helvetica, sans-serif; color: #1f2937;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding: 24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width: 620px; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+          <tr>
+            <td style="background: #064e3b; color: #ffffff; padding: 24px;">
+              <h1 style="margin: 0; font-size: 22px; line-height: 1.3;">Refund Processed Successfully</h1>
+              <p style="margin: 8px 0 0; font-size: 14px; opacity: 0.95;">Your refund has been initiated to the original payment method.</p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 24px;">
+              <p style="margin: 0 0 14px; font-size: 15px;">Hi {{recipientName}},</p>
+
+              <p style="margin: 0 0 16px; font-size: 15px; line-height: 1.6;">
+                We have processed your refund for <strong>{{eventTitle}}</strong>.
+                {{#if amountRupees}}
+                Refund amount: <strong>{{currencySymbol}}{{amountRupees}} {{currency}}</strong>.
+                {{/if}}
+                The bank settlement usually completes within <strong>5-7 working days</strong>.
+              </p>
+
+              <div style="margin: 0 0 16px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px;">
+                <p style="margin: 0 0 6px; font-size: 14px;"><strong>Event:</strong> {{eventTitle}}</p>
+                {{#if eventLocation}}
+                <p style="margin: 0 0 6px; font-size: 14px;"><strong>Location:</strong> {{eventLocation}}</p>
+                {{/if}}
+                {{#if eventStatus}}
+                <p style="margin: 0 0 6px; font-size: 14px;"><strong>Status:</strong> {{eventStatus}}</p>
+                {{/if}}
+                {{#if refundedAt}}
+                <p style="margin: 0; font-size: 14px;"><strong>Refunded At:</strong> {{refundedAt}}</p>
+                {{/if}}
+              </div>
+
+              <div style="margin: 0 0 16px; background: #ecfeff; border: 1px solid #a5f3fc; border-radius: 10px; padding: 14px;">
+                <p style="margin: 0 0 6px; font-size: 12px; color: #155e75; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700;">Reference Details</p>
+                {{#if transactionId}}
+                <p style="margin: 0 0 6px; font-size: 13px; color: #0f172a;"><strong>Transaction ID:</strong> {{transactionId}}</p>
+                {{/if}}
+                {{#if razorpayRefundId}}
+                <p style="margin: 0; font-size: 13px; color: #0f172a;"><strong>Refund ID:</strong> {{razorpayRefundId}}</p>
+                {{/if}}
+              </div>
+
+              <p style="margin: 0; font-size: 13px; color: #6b7280; line-height: 1.6;">
+                Event ID: {{eventId}}<br/>
+                {{#if orderType}}Refund Type: {{orderType}}<br/>{{/if}}
+                Need help? Contact us at {{supportEmail}}.
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 14px 24px; background: #f9fafb; border-top: 1px solid #e5e7eb;">
+              <p style="margin: 0; font-size: 12px; color: #6b7280;">{{platformName}} Team</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -24,7 +24,9 @@ const PROMOTE_STATUS = {
   IN_REVIEW: 'IN_REVIEW',                // paid + manager assigned
   CONFIRMED: 'CONFIRMED',                // approved by admin after document verification
   LIVE: 'LIVE',                          // approved by manager
+  CANCELLED: 'CANCELLED',                // cancelled by promoter/request flow
   COMPLETE: 'COMPLETE',                  // event ended, closed by manager
+  CLOSED: 'CLOSED',                      // cancellation and liability settled, closed by manager/admin
 };
 
 const PROMOTE_STATUS_VALUES = Object.values(PROMOTE_STATUS);

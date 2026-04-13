@@ -9,7 +9,7 @@ const router = express.Router();
 // POST /promote — Create a new promote record (multipart/form-data)
 router.post(
   '/promote',
-  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
   promoteUpload,
   validateCreatePromote,
   promoteController.createPromote
@@ -18,14 +18,14 @@ router.post(
 // GET /promote/me — Get current user's own promote records
 router.get(
   '/promote/me',
-  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
   promoteController.getMyPromotes
 );
 
 // GET /promote/platform-fee — Get current platform fee (all authenticated users)
 router.get(
   '/promote/platform-fee',
-  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
   promoteController.getPlatformFee
 );
 
@@ -64,6 +64,13 @@ router.get(
   promoteController.getManagerPromoteEvents
 );
 
+// GET /promote/manager/refund-requests - Revenue Operations Specialist refund queue (Manager/Admin)
+router.get(
+  '/promote/manager/refund-requests',
+  isAdminOrManager,
+  promoteController.getManagerPromoteRefundRequests
+);
+
 // PATCH /promote/:eventId/decision — Approve/Reject application (Admin only)
 router.patch(
   '/promote/:eventId/decision',
@@ -71,10 +78,31 @@ router.patch(
   promoteController.decidePromote
 );
 
+// GET /promote/:eventId/refund-request - Get cancellation refund request
+router.get(
+  '/promote/:eventId/refund-request',
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
+  promoteController.getPromoteRefundRequest
+);
+
+// POST /promote/:eventId/refund-request - Create cancellation refund request (Owner)
+router.post(
+  '/promote/:eventId/refund-request',
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
+  promoteController.createPromoteRefundRequest
+);
+
+// PATCH /promote/:eventId/refund-request - Review cancellation refund request (Revenue Ops/Admin)
+router.patch(
+  '/promote/:eventId/refund-request',
+  isAdminOrManager,
+  promoteController.reviewPromoteRefundRequest
+);
+
 // GET /promote/:eventId — Get a single promote record
 router.get(
   '/promote/:eventId',
-  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
   promoteController.getPromoteByEventId
 );
 
@@ -104,6 +132,13 @@ router.patch(
   '/promote/:eventId/generated-revenue-payout',
   authorizeRoles(['MANAGER', 'ADMIN']),
   promoteController.releasePromoteGeneratedRevenuePayout
+);
+
+// PATCH /promote/:eventId/liability-recovery - Initiate creator liability recovery for cancelled promote events
+router.patch(
+  '/promote/:eventId/liability-recovery',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  promoteController.recoverPromoteCancellationLiability
 );
 
 // POST /promote/:eventId/promotion-actions/email-blast - Trigger email blast promotion
@@ -137,7 +172,7 @@ router.patch(
 // DELETE /promote/:eventId — Delete a promote record (Owner or Admin)
 router.delete(
   '/promote/:eventId',
-  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
   promoteController.deletePromote
 );
 

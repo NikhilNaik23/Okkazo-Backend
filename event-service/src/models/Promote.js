@@ -136,6 +136,259 @@ const CloudinaryImageSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const PromoteRefundResultSchema = new mongoose.Schema(
+  {
+    scenarioCode: {
+      type: String,
+      enum: ['WITHIN_24_HOURS', 'BEFORE_TICKET_SALES', 'AFTER_TICKET_SALES', 'OKKAZO_FAILURE'],
+      default: null,
+      trim: true,
+    },
+    scenarioLabel: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    reasonCode: {
+      type: String,
+      enum: ['CLIENT_CANCELLED', 'VENDOR_UNAVAILABLE', 'OKKAZO_FAILURE', 'FORCE_MAJEURE'],
+      trim: true,
+      default: 'CLIENT_CANCELLED',
+    },
+    ticketsSold: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    ticketSalesStarted: {
+      type: Boolean,
+      default: false,
+    },
+    within24Hours: {
+      type: Boolean,
+      default: false,
+    },
+    grossRevenuePaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    platformFeePercent: {
+      type: Number,
+      default: 2.5,
+      min: 0,
+      max: 100,
+    },
+    platformFeeAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    promotionUsedAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    grossPaidAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    refundAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    deductionAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    deductionPercent: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    userRefundAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    promoterLiabilityAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    platformLiabilityAmountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    timelineLabel: {
+      type: String,
+      trim: true,
+      default: '5-7 working days',
+    },
+    currency: {
+      type: String,
+      trim: true,
+      default: 'INR',
+    },
+  },
+  { _id: false }
+);
+
+const PromoteLiabilityRecoverySchema = new mongoose.Schema(
+  {
+    status: {
+      type: String,
+      enum: ['NOT_REQUIRED', 'PENDING_PAYMENT', 'PAID', 'FAILED'],
+      default: 'NOT_REQUIRED',
+      trim: true,
+    },
+    amountPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    currency: {
+      type: String,
+      trim: true,
+      default: 'INR',
+    },
+    ownerAuthId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    paymentOrderId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    razorpayOrderId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    transactionId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    initiatedByAuthId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    initiatedAt: {
+      type: Date,
+      default: null,
+    },
+    paidAt: {
+      type: Date,
+      default: null,
+    },
+    lastError: {
+      type: String,
+      trim: true,
+      default: null,
+      maxlength: 2000,
+    },
+  },
+  { _id: false }
+);
+
+const PromoteRefundRequestSchema = new mongoose.Schema(
+  {
+    requestId: {
+      type: String,
+      required: true,
+      default: () => uuidv4(),
+      trim: true,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['PENDING_REVIEW', 'APPROVED', 'REJECTED', 'REFUNDED'],
+      default: 'PENDING_REVIEW',
+      index: true,
+      trim: true,
+    },
+    requestedByAuthId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    requestedAt: {
+      type: Date,
+      default: Date.now,
+      index: true,
+    },
+    reasonCode: {
+      type: String,
+      enum: ['CLIENT_CANCELLED', 'VENDOR_UNAVAILABLE', 'OKKAZO_FAILURE', 'FORCE_MAJEURE'],
+      trim: true,
+      default: 'CLIENT_CANCELLED',
+    },
+    cancellationReason: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    assignedManagerId: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
+    assignedManagerRole: {
+      type: String,
+      trim: true,
+      default: 'Revenue Operations Specialist',
+    },
+    managerReviewedByAuthId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    managerReviewedAt: {
+      type: Date,
+      default: null,
+    },
+    managerNotes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    result: {
+      type: PromoteRefundResultSchema,
+      default: null,
+    },
+    refundedAt: {
+      type: Date,
+      default: null,
+    },
+    refundTransactionRef: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    bulkRefundSummary: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    liabilityRecovery: {
+      type: PromoteLiabilityRecoverySchema,
+      default: null,
+    },
+  },
+  { _id: false }
+);
+
 // ─── Main Schema ──────────────────────────────────────────────────────────────
 
 const PromoteSchema = new mongoose.Schema(
@@ -321,6 +574,11 @@ const PromoteSchema = new mongoose.Schema(
         maxlength: 500,
         default: null,
       },
+    },
+
+    refundRequest: {
+      type: PromoteRefundRequestSchema,
+      default: null,
     },
 
     // Revenue calculations (computed and stored on save)
@@ -653,8 +911,8 @@ PromoteSchema.pre('validate', function preValidate(next) {
     this.isModified('assignedManagerId')
   ) {
     const computed = computeEventStatus(this);
-    // Only auto-compute if NOT already manually set to LIVE or COMPLETE
-    if (![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE].includes(this.eventStatus)) {
+    // Only auto-compute if NOT already manually set to a terminal/manual lifecycle status.
+    if (![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED].includes(this.eventStatus)) {
       this.eventStatus = computed;
     }
   }
@@ -675,5 +933,6 @@ PromoteSchema.pre('validate', function preValidate(next) {
 PromoteSchema.index({ authId: 1, createdAt: -1 });
 PromoteSchema.index({ eventStatus: 1, platformFeePaid: 1 });
 PromoteSchema.index({ 'schedule.startAt': 1 });
+PromoteSchema.index({ 'refundRequest.status': 1, 'refundRequest.assignedManagerId': 1, createdAt: -1 });
 
 module.exports = mongoose.model('Promote', PromoteSchema);

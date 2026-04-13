@@ -102,7 +102,7 @@ const getAvailableCoreStaff = async (req, res) => {
         .select('eventId category schedule eventDate assignedManagerId coreStaffIds')
         .lean(),
       Promote.find({
-        eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+        eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
         'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
         $or: [
           { assignedManagerId: { $ne: null } },

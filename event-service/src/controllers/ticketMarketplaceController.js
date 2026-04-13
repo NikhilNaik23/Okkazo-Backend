@@ -111,6 +111,30 @@ const getMyTicketByTicketId = async (req, res) => {
   }
 };
 
+const cancelMyTicket = async (req, res) => {
+  try {
+    const result = await ticketMarketplaceService.cancelMyTicket({
+      ticketId: req.params?.ticketId,
+      userAuthId: req.user?.authId,
+      userId: req.user?.userId,
+      reason: req.body?.reason,
+      flags: req.body?.flags,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result?.alreadyCancelled ? 'Ticket is already cancelled' : 'Ticket cancelled successfully',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in cancelMyTicket:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to cancel ticket',
+    });
+  }
+};
+
 const getMyTickets = async (req, res) => {
   try {
     const result = await ticketMarketplaceService.getMyTickets({
@@ -248,6 +272,7 @@ module.exports = {
   confirmFreeTicketPurchase,
   getMyTickets,
   getMyTicketByTicketId,
+  cancelMyTicket,
   getEventTicketGuests,
   exportEventTicketGuests,
   notifyEventTicketGuests,

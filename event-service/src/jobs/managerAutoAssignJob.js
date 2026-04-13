@@ -20,7 +20,7 @@ const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
 
 const promoteCandidateFilter = {
   assignedManagerId: null,
-  eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+  eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
   'adminDecision.status': 'APPROVED',
   'adminDecision.decidedAt': { $ne: null },
 };
@@ -90,7 +90,7 @@ const isManagerAvailableForDay = async ({ managerId, dayStart, dayEnd, excludeEv
 
   const promoteQuery = {
     assignedManagerId: managerId,
-    eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+    eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
     'adminDecision.status': { $ne: 'REJECTED' },
     ...(excludeEventId ? { eventId: { $ne: String(excludeEventId).trim() } } : {}),
     $or: buildScheduleOverlapOr({ start: dayStart, end: dayEnd }),

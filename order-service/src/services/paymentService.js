@@ -20,8 +20,27 @@ const {
 
 const RAZORPAY_API_BASE_URL = (process.env.RAZORPAY_API_BASE_URL || 'https://api.razorpay.com').replace(/\/$/, '');
 
+const REFUND_REASON_CODES = [
+  'CLIENT_CANCELLED',
+  'VENDOR_UNAVAILABLE',
+  'OKKAZO_FAILURE',
+  'FORCE_MAJEURE',
+];
+
+const REFUND_REASON_CODE_LABELS = {
+  CLIENT_CANCELLED: 'Client cancelled',
+  VENDOR_UNAVAILABLE: 'Vendor unavailable',
+  OKKAZO_FAILURE: 'Okkazo failure',
+  FORCE_MAJEURE: 'Force majeure',
+};
+
+const PROMOTE_LIABILITY_ORDER_PURPOSE = 'PROMOTE_LIABILITY_RECOVERY';
+
+const normalizeRefundReasonCode = (value) => String(value || '').trim().toUpperCase();
+
 const createOrderSchema = Joi.object({
   eventId: Joi.string().trim().required(),
+  authId: Joi.string().trim().optional(),
   orderType: Joi
     .string()
     .trim()
@@ -32,7 +51,8 @@ const createOrderSchema = Joi.object({
       'PLANNING EVENT REMAINING FEE',
       'PROMOTE EVENT',
       'TICKET SALE',
-      'REFUND'
+      'REFUND',
+      'PLANNING_REFUND'
     )
     .required(),
   amount: Joi.number().positive().optional(),
@@ -67,9 +87,26 @@ const verifyPaymentSchema = Joi.object({
 
 const refundPaymentSchema = Joi.object({
   eventId: Joi.string().trim().required(),
+  authId: Joi.string().trim().optional(),
   amount: Joi.number().positive().optional(),
   notes: Joi.object().optional(),
-  reason: Joi.string().trim().max(500).optional(),
+  reasonCode: Joi.string().trim().uppercase().valid(...REFUND_REASON_CODES).required(),
+});
+
+const bulkRefundEventTicketSalesSchema = Joi.object({
+  eventId: Joi.string().trim().required(),
+  authIds: Joi.array().items(Joi.string().trim().min(1)).optional(),
+  notes: Joi.object().optional(),
+  reasonCode: Joi.string().trim().uppercase().valid(...REFUND_REASON_CODES).required(),
+});
+
+const refundTicketSaleSchema = Joi.object({
+  eventId: Joi.string().trim().required(),
+  authId: Joi.string().trim().required(),
+  ticketId: Joi.string().trim().required(),
+  amount: Joi.number().positive().optional(),
+  notes: Joi.object().optional(),
+  reasonCode: Joi.string().trim().uppercase().valid(...REFUND_REASON_CODES).required(),
 });
 
 const vendorPayoutOnboardingLinkSchema = Joi.object({
@@ -109,6 +146,7 @@ const adminLedgerQuerySchema = Joi.object({
     'PROMOTE EVENT',
     'TICKET SALE',
     'REFUND',
+    'PLANNING_REFUND',
     'VENDOR PAYOUT'
   ).optional(),
   days: Joi.number().integer().min(1).max(3650).optional(),
@@ -129,28 +167,33 @@ const adminReportQuerySchema = Joi.object({
 const REPORT_REVENUE_STATUSES = ['PAID', 'REFUNDED'];
 
 const normalizeLedgerAmount = (order) => {
-  const isRefund = order.orderType === 'REFUND' || order.status === 'REFUNDED';
+  const isRefund = order.orderType === 'REFUND' || order.orderType === 'PLANNING_REFUND' || order.status === 'REFUNDED';
   const baseAmount = Number(order.refundedAmount ?? order.amount ?? 0) || 0;
   return isRefund ? -Math.abs(baseAmount) : Math.abs(baseAmount);
 };
 
-const mapOrderToAdminLedgerRow = (order) => ({
-  transactionId: order.transactionId,
-  eventId: order.eventId,
-  authId: order.authId,
-  vendorId: order?.notes?.vendorAuthId || order?.notes?.vendorId || null,
-  type: order.orderType,
-  status: order.status,
-  amount: normalizeLedgerAmount(order),
-  currency: order.currency || 'INR',
-  vendor: order?.notes?.vendorName || order?.notes?.businessName || order?.notes?.vendor || 'System Auto',
-  razorpayOrderId: order.razorpayOrderId || null,
-  razorpayPaymentId: order.razorpayPaymentId || null,
-  razorpayRefundId: order.razorpayRefundId || null,
-  createdAt: order.createdAt,
-  paidAt: order.paidAt,
-  refundedAt: order.refundedAt,
-});
+const mapOrderToAdminLedgerRow = (order) => {
+  const isRefund = order.orderType === 'REFUND' || order.orderType === 'PLANNING_REFUND' || order.status === 'REFUNDED';
+  const effectiveCreatedAt = isRefund ? (order.refundedAt || order.createdAt) : order.createdAt;
+
+  return {
+    transactionId: order.transactionId,
+    eventId: order.eventId,
+    authId: order.authId,
+    vendorId: order?.notes?.vendorAuthId || order?.notes?.vendorId || null,
+    type: order.orderType,
+    status: order.status,
+    amount: normalizeLedgerAmount(order),
+    currency: order.currency || 'INR',
+    vendor: order?.notes?.vendorName || order?.notes?.businessName || order?.notes?.vendor || 'System Auto',
+    razorpayOrderId: order.razorpayOrderId || null,
+    razorpayPaymentId: order.razorpayPaymentId || null,
+    razorpayRefundId: order.razorpayRefundId || null,
+    createdAt: effectiveCreatedAt,
+    paidAt: order.paidAt,
+    refundedAt: order.refundedAt,
+  };
+};
 
 const resolveVendorPayoutMode = (row) => {
   const notesMode = String(row?.notes?.payoutMode || '').trim().toUpperCase();
@@ -217,12 +260,18 @@ const buildAdminLedgerMongoQuery = (filters) => {
   }
 
   if (Object.keys(dateQuery).length > 0) {
-    query.createdAt = dateQuery;
+    if (!Array.isArray(query.$and)) query.$and = [];
+    query.$and.push({
+      $or: [
+        { createdAt: dateQuery },
+        { refundedAt: dateQuery },
+      ],
+    });
   }
 
   if (filters.search) {
     const regex = new RegExp(filters.search, 'i');
-    query.$or = [
+    const searchOr = [
       { transactionId: regex },
       { eventId: regex },
       { authId: regex },
@@ -232,6 +281,9 @@ const buildAdminLedgerMongoQuery = (filters) => {
       { razorpayPaymentId: regex },
       { razorpayRefundId: regex },
     ];
+
+    if (!Array.isArray(query.$and)) query.$and = [];
+    query.$and.push({ $or: searchOr });
   }
 
   return query;
@@ -1377,6 +1429,27 @@ const createOrder = async (payload, user) => {
 
   const orderType = value.orderType;
   const isTicketSale = orderType === 'TICKET SALE';
+  const requesterAuthId = String(user.authId || '').trim();
+  const requesterRole = String(user.role || '').trim().toUpperCase();
+  const elevatedOrderActor = requesterRole === 'ADMIN' || requesterRole === 'MANAGER';
+  const payloadAuthId = String(value.authId || '').trim();
+  const orderPurpose = String(value?.notes?.orderPurpose || '').trim().toUpperCase();
+  const isPromoteLiabilityRecovery = orderType === 'PROMOTE EVENT' && orderPurpose === PROMOTE_LIABILITY_ORDER_PURPOSE;
+
+  if (payloadAuthId && !elevatedOrderActor && payloadAuthId !== requesterAuthId) {
+    throw createApiError(403, 'You are not allowed to create payment orders for another user');
+  }
+
+  const targetAuthId = payloadAuthId || requesterAuthId;
+  if (!targetAuthId) {
+    throw createApiError(400, 'Order target authId is required');
+  }
+
+  const effectiveUser = {
+    ...user,
+    authId: targetAuthId,
+  };
+
   // Reusing stale CREATED orders can break Razorpay checkout when keys/account change.
   // Keep reuse opt-in via env (default OFF) so all flows create a fresh provider order.
   const allowCreatedOrderReuse = String(process.env.ALLOW_RAZORPAY_ORDER_REUSE || '').trim().toLowerCase() === 'true';
@@ -1385,9 +1458,9 @@ const createOrder = async (payload, user) => {
   if (!isTicketSale) {
     try {
       if (orderType === 'PROMOTE EVENT') {
-        upstreamRecord = await getPromoteForUser(value.eventId, user);
+        upstreamRecord = await getPromoteForUser(value.eventId, effectiveUser);
       } else {
-        upstreamRecord = await getPlanningForUser(value.eventId, user);
+        upstreamRecord = await getPlanningForUser(value.eventId, effectiveUser);
       }
     } catch (err) {
       if (isAxiosLikeError(err)) {
@@ -1402,7 +1475,21 @@ const createOrder = async (payload, user) => {
 
     // Payment gating differs by order type.
     if (orderType === 'PROMOTE EVENT') {
-      if (Boolean(upstreamRecord.platformFeePaid)) {
+      if (isPromoteLiabilityRecovery) {
+        const normalizedPromoteStatus = String(upstreamRecord?.eventStatus || upstreamRecord?.status || '').trim().toUpperCase();
+        const normalizedRefundStatus = String(upstreamRecord?.refundRequest?.status || '').trim().toUpperCase();
+        const isCancelledLifecycle = ['CANCELLED', 'CANCELED', 'REFUNDED'].includes(normalizedPromoteStatus);
+        const isRefundFlow = ['PENDING_REVIEW', 'APPROVED', 'REFUNDED'].includes(normalizedRefundStatus);
+
+        if (!isCancelledLifecycle && !isRefundFlow) {
+          throw createApiError(409, 'Liability recovery order is allowed only for cancelled promote events');
+        }
+
+        const liabilityAmountInr = Number(value.amount);
+        if (!Number.isFinite(liabilityAmountInr) || liabilityAmountInr <= 0) {
+          throw createApiError(400, 'amount is required for PROMOTE liability recovery orders');
+        }
+      } else if (Boolean(upstreamRecord.platformFeePaid)) {
         throw createApiError(409, 'Payment is already completed for this event');
       }
     } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
@@ -1477,7 +1564,7 @@ const createOrder = async (payload, user) => {
   ) {
     const activeOrder = await PaymentOrder.findOne({
       eventId: value.eventId,
-      authId: user.authId,
+      authId: targetAuthId,
       orderType,
       status: 'CREATED',
     })
@@ -1513,7 +1600,7 @@ const createOrder = async (payload, user) => {
   } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
     let selection;
     try {
-      selection = await getVendorSelectionForUser(value.eventId, user);
+      selection = await getVendorSelectionForUser(value.eventId, effectiveUser);
     } catch (err) {
       if (isAxiosLikeError(err)) {
         throw normalizeAxiosError(err, { upstreamName: 'event-service' });
@@ -1539,8 +1626,8 @@ const createOrder = async (payload, user) => {
     let quote;
     let selection;
     try {
-      quote = await getPlanningQuoteLatestForUser(value.eventId, user);
-      selection = await getVendorSelectionForUser(value.eventId, user);
+      quote = await getPlanningQuoteLatestForUser(value.eventId, effectiveUser);
+      selection = await getVendorSelectionForUser(value.eventId, effectiveUser);
     } catch (err) {
       if (isAxiosLikeError(err)) {
         throw normalizeAxiosError(err, { upstreamName: 'event-service' });
@@ -1570,8 +1657,8 @@ const createOrder = async (payload, user) => {
     let quote;
     let selection;
     try {
-      quote = await getPlanningQuoteLatestForUser(value.eventId, user);
-      selection = await getVendorSelectionForUser(value.eventId, user);
+      quote = await getPlanningQuoteLatestForUser(value.eventId, effectiveUser);
+      selection = await getVendorSelectionForUser(value.eventId, effectiveUser);
     } catch (err) {
       if (isAxiosLikeError(err)) {
         throw normalizeAxiosError(err, { upstreamName: 'event-service' });
@@ -1610,7 +1697,7 @@ const createOrder = async (payload, user) => {
   if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT DEPOSIT FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
-      authId: user.authId,
+      authId: targetAuthId,
       orderType,
       status: 'CREATED',
       currency,
@@ -1637,7 +1724,7 @@ const createOrder = async (payload, user) => {
   if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
-      authId: user.authId,
+      authId: targetAuthId,
       orderType,
       status: 'CREATED',
       currency,
@@ -1664,7 +1751,7 @@ const createOrder = async (payload, user) => {
   if (allowCreatedOrderReuse && orderType === 'PLANNING EVENT REMAINING FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
-      authId: user.authId,
+      authId: targetAuthId,
       orderType,
       status: 'CREATED',
       currency,
@@ -1694,10 +1781,10 @@ const createOrder = async (payload, user) => {
     order = await razorpay.orders.create({
       amount: amountInPaise,
       currency,
-      receipt: value.receipt || buildRazorpayReceipt({ eventId: value.eventId, authId: user.authId }),
+      receipt: value.receipt || buildRazorpayReceipt({ eventId: value.eventId, authId: targetAuthId }),
       notes: {
         eventId: value.eventId,
-        authId: user.authId,
+        authId: targetAuthId,
         ...(orderType === 'PLANNING EVENT DEPOSIT FEE'
           ? {
               computedFrom: 'vendor-selection.totalMinAmount',
@@ -1731,7 +1818,7 @@ const createOrder = async (payload, user) => {
 
   const paymentOrder = await PaymentOrder.create({
     eventId: value.eventId,
-    authId: user.authId,
+    authId: targetAuthId,
     orderType,
     amount: order.amount,
     currency: order.currency,
@@ -1747,7 +1834,7 @@ const createOrder = async (payload, user) => {
   try {
     await publishEvent('PAYMENT_ORDER_CREATED', {
       eventId: value.eventId,
-      authId: user.authId,
+      authId: targetAuthId,
       transactionId: paymentOrder.transactionId,
       orderType: paymentOrder.orderType,
       razorpayOrderId: order.id,
@@ -1762,7 +1849,7 @@ const createOrder = async (payload, user) => {
   await publishTransactionUpdate(
     buildTransactionEnvelope({
       order: paymentOrder,
-      user,
+      user: effectiveUser,
       orderType,
       paymentStatus: 'CREATED',
       transactionId: paymentOrder.transactionId,
@@ -2771,7 +2858,7 @@ const releaseVendorPayout = async (payload, user) => {
     const sourceOrder = await PaymentOrder.findOne({
       eventId: value.eventId,
       status: 'PAID',
-      orderType: { $ne: 'REFUND' },
+      orderType: { $nin: ['REFUND', 'PLANNING_REFUND'] },
     })
       .sort({ paidAt: -1, createdAt: -1 })
       .lean();
@@ -2852,7 +2939,7 @@ const releaseVendorPayout = async (payload, user) => {
   const sourceOrder = await PaymentOrder.findOne({
     eventId: value.eventId,
     status: 'PAID',
-    orderType: { $ne: 'REFUND' },
+    orderType: { $nin: ['REFUND', 'PLANNING_REFUND'] },
     razorpayPaymentId: { $exists: true, $nin: [null, ''] },
   })
     .sort({ paidAt: -1, createdAt: -1 })
@@ -3143,7 +3230,7 @@ const releaseUserGeneratedRevenuePayout = async (payload, user) => {
   const sourceOrder = await PaymentOrder.findOne({
     eventId: value.eventId,
     status: 'PAID',
-    orderType: { $ne: 'REFUND' },
+    orderType: { $nin: ['REFUND', 'PLANNING_REFUND'] },
     razorpayPaymentId: { $exists: true, $nin: [null, ''] },
   })
     .sort({ paidAt: -1, createdAt: -1 })
@@ -3259,84 +3346,485 @@ const refundPayment = async (payload, user) => {
     throw createApiError(400, error.details[0].message);
   }
 
-  const paymentOrder = await PaymentOrder.findOne({
-    eventId: value.eventId,
-    authId: user.authId,
-  }).sort({ createdAt: -1 });
+  const requesterAuthId = String(user.authId || '').trim();
+  const requesterRole = String(user.role || '').trim().toUpperCase();
+  const reasonCode = normalizeRefundReasonCode(value.reasonCode);
+  const reasonLabel = REFUND_REASON_CODE_LABELS[reasonCode] || reasonCode;
+  const elevatedRefundActor = requesterRole === 'ADMIN' || requesterRole === 'MANAGER';
+  const payloadAuthId = String(value.authId || '').trim();
+  const requestedRefundType = String(value?.notes?.refundType || '').trim().toUpperCase();
+  const targetRefundOrderType = requestedRefundType === 'PLANNING_REFUND' ? 'PLANNING_REFUND' : 'REFUND';
 
-  if (!paymentOrder) {
-    throw createApiError(404, 'Payment order not found');
+  if (!REFUND_REASON_CODES.includes(reasonCode)) {
+    throw createApiError(400, 'Valid refund reasonCode is required');
   }
 
-  if (paymentOrder.status !== 'PAID') {
+  if (payloadAuthId && !elevatedRefundActor && payloadAuthId !== requesterAuthId) {
+    throw createApiError(403, 'You are not allowed to refund payments for another user');
+  }
+
+  const targetAuthId = payloadAuthId || requesterAuthId;
+  if (!targetAuthId) {
+    throw createApiError(400, 'Refund target authId is required');
+  }
+
+  const refundableOrders = await PaymentOrder.find({
+    eventId: value.eventId,
+    authId: targetAuthId,
+    status: 'PAID',
+    orderType: { $nin: ['REFUND', 'PLANNING_REFUND'] },
+    razorpayPaymentId: { $exists: true, $nin: [null, ''] },
+  }).sort({ createdAt: -1 });
+
+  if (!Array.isArray(refundableOrders) || refundableOrders.length === 0) {
+    const latestOrder = await PaymentOrder.findOne({
+      eventId: value.eventId,
+      authId: targetAuthId,
+    }).sort({ createdAt: -1 });
+
+    if (!latestOrder) {
+      throw createApiError(404, 'Payment order not found');
+    }
+
     throw createApiError(409, 'Refund can only be processed for PAID orders');
   }
 
-  if (!paymentOrder.razorpayPaymentId) {
-    throw createApiError(400, 'Razorpay payment id is missing for this order');
+  const totalRefundableAmount = refundableOrders.reduce(
+    (sum, order) => sum + Math.max(0, Number(order?.amount || 0)),
+    0
+  );
+  const requestedRefundAmount = value.amount
+    ? Math.round(Number(value.amount) * 100)
+    : totalRefundableAmount;
+
+  if (!(requestedRefundAmount > 0)) {
+    throw createApiError(400, 'Refund amount must be greater than zero');
   }
 
-  const refundAmount = value.amount ? Math.round(value.amount * 100) : paymentOrder.amount;
+  if (requestedRefundAmount > totalRefundableAmount) {
+    throw createApiError(409, 'Refund amount exceeds refundable paid amount for this event');
+  }
 
   const razorpay = getRazorpayClient();
-  const refund = await razorpay.payments.refund(paymentOrder.razorpayPaymentId, {
-    amount: refundAmount,
+  let remainingAmount = requestedRefundAmount;
+  let totalRefundedAmount = 0;
+  const refundedOrders = [];
+
+  for (const paymentOrder of refundableOrders) {
+    if (remainingAmount <= 0) break;
+
+    const sourceAmount = Math.max(0, Number(paymentOrder?.amount || 0));
+    if (!(sourceAmount > 0)) continue;
+
+    const refundAmount = Math.min(remainingAmount, sourceAmount);
+
+    const refund = await razorpay.payments.refund(paymentOrder.razorpayPaymentId, {
+      amount: refundAmount,
+      speed: 'normal',
+      notes: {
+        eventId: paymentOrder.eventId,
+        authId: targetAuthId,
+        initiatedByAuthId: requesterAuthId,
+        initiatedByRole: requesterRole || null,
+        reasonCode,
+        reason: reasonLabel,
+        sourcePaymentOrderId: paymentOrder._id.toString(),
+        sourceTransactionId: paymentOrder.transactionId,
+        ...(value.notes || {}),
+      },
+    });
+
+    paymentOrder.status = 'REFUNDED';
+    paymentOrder.orderType = targetRefundOrderType;
+    paymentOrder.refundedAt = new Date();
+    paymentOrder.refundedAmount = refund.amount;
+    paymentOrder.razorpayRefundId = refund.id;
+    paymentOrder.refundReasonCode = reasonCode;
+    paymentOrder.refundReason = reasonLabel;
+    await paymentOrder.save();
+
+    try {
+      await publishEvent('PAYMENT_REFUND_SUCCESS', {
+        eventId: paymentOrder.eventId,
+        authId: targetAuthId,
+        paymentOrderId: paymentOrder._id.toString(),
+        transactionId: paymentOrder.transactionId,
+        orderType: targetRefundOrderType,
+        paymentStatus: paymentOrder.status,
+        razorpayOrderId: paymentOrder.razorpayOrderId,
+        razorpayPaymentId: paymentOrder.razorpayPaymentId,
+        razorpayRefundId: paymentOrder.razorpayRefundId,
+        amount: paymentOrder.refundedAmount,
+        currency: paymentOrder.currency,
+        refundedAt: paymentOrder.refundedAt.toISOString(),
+        reasonCode,
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish PAYMENT_REFUND_SUCCESS event:', kafkaError);
+    }
+
+    await publishTransactionUpdate(
+      buildTransactionEnvelope({
+        order: paymentOrder,
+        user,
+        orderType: targetRefundOrderType,
+        paymentStatus: 'REFUNDED',
+        transactionId: paymentOrder.transactionId,
+        amount: paymentOrder.refundedAmount,
+        source: 'refund-endpoint',
+      })
+    );
+
+    refundedOrders.push(paymentOrder);
+    totalRefundedAmount += Number(paymentOrder.refundedAmount || 0);
+    remainingAmount -= refundAmount;
+  }
+
+  if (remainingAmount > 0) {
+    throw createApiError(409, 'Unable to process full refund amount from available paid orders');
+  }
+
+  const primaryRefundOrder = refundedOrders[0];
+  return {
+    eventId: primaryRefundOrder.eventId,
+    authId: targetAuthId,
+    transactionId: primaryRefundOrder.transactionId,
+    orderType: primaryRefundOrder.orderType,
+    status: primaryRefundOrder.status,
+    refundId: primaryRefundOrder.razorpayRefundId,
+    refundedAmount: totalRefundedAmount,
+    refundedAt: primaryRefundOrder.refundedAt,
+    reasonCode,
+  };
+};
+
+const refundTicketSalePayment = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const { value, error } = refundTicketSaleSchema.validate(payload);
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const requesterAuthId = String(user.authId || '').trim();
+  const requesterRole = String(user.role || '').trim().toUpperCase();
+  const elevatedRefundActor = requesterRole === 'ADMIN' || requesterRole === 'MANAGER';
+  const targetAuthId = String(value.authId || '').trim();
+  const normalizedTicketId = String(value.ticketId || '').trim();
+  const reasonCode = normalizeRefundReasonCode(value.reasonCode);
+  const reasonLabel = REFUND_REASON_CODE_LABELS[reasonCode] || reasonCode;
+  const requestedRefundType = String(value?.notes?.refundType || '').trim().toUpperCase();
+  const targetRefundOrderType = requestedRefundType === 'PLANNING_REFUND' ? 'PLANNING_REFUND' : 'REFUND';
+
+  if (!targetAuthId || !normalizedTicketId) {
+    throw createApiError(400, 'Refund target authId and ticketId are required');
+  }
+
+  if (!REFUND_REASON_CODES.includes(reasonCode)) {
+    throw createApiError(400, 'Valid refund reasonCode is required');
+  }
+
+  if (!elevatedRefundActor && targetAuthId !== requesterAuthId) {
+    throw createApiError(403, 'You are not allowed to refund payments for another user');
+  }
+
+  const paidTicketOrder = await PaymentOrder.findOne({
+    eventId: String(value.eventId || '').trim(),
+    authId: targetAuthId,
+    status: 'PAID',
+    orderType: 'TICKET SALE',
+    'notes.ticketId': normalizedTicketId,
+    razorpayPaymentId: { $exists: true, $nin: [null, ''] },
+  }).sort({ createdAt: -1 });
+
+  if (!paidTicketOrder) {
+    const existingRefundedOrder = await PaymentOrder.findOne({
+      eventId: String(value.eventId || '').trim(),
+      authId: targetAuthId,
+      status: 'REFUNDED',
+      'notes.ticketId': normalizedTicketId,
+    }).sort({ refundedAt: -1, createdAt: -1 });
+
+    if (existingRefundedOrder) {
+      return {
+        alreadyRefunded: true,
+        eventId: existingRefundedOrder.eventId,
+        authId: existingRefundedOrder.authId,
+        ticketId: normalizedTicketId,
+        paymentOrderId: existingRefundedOrder._id.toString(),
+        transactionId: existingRefundedOrder.transactionId,
+        orderType: existingRefundedOrder.orderType,
+        status: existingRefundedOrder.status,
+        refundId: existingRefundedOrder.razorpayRefundId || null,
+        refundedAmount: Number(existingRefundedOrder.refundedAmount || 0),
+        refundedAt: existingRefundedOrder.refundedAt || null,
+        reasonCode: existingRefundedOrder.refundReasonCode || reasonCode,
+      };
+    }
+
+    throw createApiError(404, 'Paid ticket sale order not found for this ticket');
+  }
+
+  const sourceAmount = Math.max(0, Number(paidTicketOrder.amount || 0));
+  if (!(sourceAmount > 0)) {
+    throw createApiError(409, 'Ticket sale order has invalid amount for refund');
+  }
+
+  const requestedRefundAmount = value.amount
+    ? Math.round(Number(value.amount) * 100)
+    : sourceAmount;
+
+  if (!(requestedRefundAmount > 0)) {
+    throw createApiError(400, 'Refund amount must be greater than zero');
+  }
+
+  if (requestedRefundAmount > sourceAmount) {
+    throw createApiError(409, 'Refund amount exceeds paid amount for this ticket');
+  }
+
+  const razorpay = getRazorpayClient();
+  const refund = await razorpay.payments.refund(paidTicketOrder.razorpayPaymentId, {
+    amount: requestedRefundAmount,
     speed: 'normal',
     notes: {
-      eventId: paymentOrder.eventId,
-      authId: paymentOrder.authId,
-      reason: value.reason || 'User initiated refund',
+      eventId: paidTicketOrder.eventId,
+      authId: targetAuthId,
+      ticketId: normalizedTicketId,
+      initiatedByAuthId: requesterAuthId,
+      initiatedByRole: requesterRole || null,
+      reasonCode,
+      reason: reasonLabel,
+      sourcePaymentOrderId: paidTicketOrder._id.toString(),
+      sourceTransactionId: paidTicketOrder.transactionId,
+      source: 'ticket-sale-refund',
       ...(value.notes || {}),
     },
   });
 
-  paymentOrder.status = 'REFUNDED';
-  paymentOrder.orderType = 'REFUND';
-  paymentOrder.refundedAt = new Date();
-  paymentOrder.refundedAmount = refund.amount;
-  paymentOrder.razorpayRefundId = refund.id;
-  paymentOrder.refundReason = value.reason || null;
-  await paymentOrder.save();
+  paidTicketOrder.status = 'REFUNDED';
+  paidTicketOrder.orderType = targetRefundOrderType;
+  paidTicketOrder.refundedAt = new Date();
+  paidTicketOrder.refundedAmount = refund.amount;
+  paidTicketOrder.razorpayRefundId = refund.id;
+  paidTicketOrder.refundReasonCode = reasonCode;
+  paidTicketOrder.refundReason = reasonLabel;
+  await paidTicketOrder.save();
 
   try {
     await publishEvent('PAYMENT_REFUND_SUCCESS', {
-      eventId: paymentOrder.eventId,
-      authId: paymentOrder.authId,
-      paymentOrderId: paymentOrder._id.toString(),
-      transactionId: paymentOrder.transactionId,
-      orderType: 'REFUND',
-      paymentStatus: paymentOrder.status,
-      razorpayOrderId: paymentOrder.razorpayOrderId,
-      razorpayPaymentId: paymentOrder.razorpayPaymentId,
-      razorpayRefundId: paymentOrder.razorpayRefundId,
-      amount: paymentOrder.refundedAmount,
-      currency: paymentOrder.currency,
-      refundedAt: paymentOrder.refundedAt.toISOString(),
+      eventId: paidTicketOrder.eventId,
+      authId: targetAuthId,
+      paymentOrderId: paidTicketOrder._id.toString(),
+      transactionId: paidTicketOrder.transactionId,
+      orderType: targetRefundOrderType,
+      paymentStatus: paidTicketOrder.status,
+      razorpayOrderId: paidTicketOrder.razorpayOrderId,
+      razorpayPaymentId: paidTicketOrder.razorpayPaymentId,
+      razorpayRefundId: paidTicketOrder.razorpayRefundId,
+      amount: paidTicketOrder.refundedAmount,
+      currency: paidTicketOrder.currency,
+      refundedAt: paidTicketOrder.refundedAt.toISOString(),
+      reasonCode,
+      ticketId: normalizedTicketId,
     });
   } catch (kafkaError) {
-    logger.error('Failed to publish PAYMENT_REFUND_SUCCESS event:', kafkaError);
+    logger.error('Failed to publish PAYMENT_REFUND_SUCCESS for ticket sale refund:', kafkaError);
   }
 
   await publishTransactionUpdate(
     buildTransactionEnvelope({
-      order: paymentOrder,
+      order: paidTicketOrder,
       user,
-      orderType: 'REFUND',
+      orderType: targetRefundOrderType,
       paymentStatus: 'REFUNDED',
-      transactionId: paymentOrder.transactionId,
-      amount: paymentOrder.refundedAmount,
-      source: 'refund-endpoint',
+      transactionId: paidTicketOrder.transactionId,
+      amount: paidTicketOrder.refundedAmount,
+      source: 'ticket-sale-refund',
     })
   );
 
   return {
-    eventId: paymentOrder.eventId,
-    transactionId: paymentOrder.transactionId,
-    orderType: 'REFUND',
-    status: paymentOrder.status,
-    refundId: paymentOrder.razorpayRefundId,
-    refundedAmount: paymentOrder.refundedAmount,
-    refundedAt: paymentOrder.refundedAt,
+    alreadyRefunded: false,
+    eventId: paidTicketOrder.eventId,
+    authId: targetAuthId,
+    ticketId: normalizedTicketId,
+    paymentOrderId: paidTicketOrder._id.toString(),
+    transactionId: paidTicketOrder.transactionId,
+    orderType: paidTicketOrder.orderType,
+    status: paidTicketOrder.status,
+    refundId: paidTicketOrder.razorpayRefundId,
+    refundedAmount: Number(paidTicketOrder.refundedAmount || 0),
+    refundedAt: paidTicketOrder.refundedAt,
+    sourceAmount,
+    reasonCode,
+  };
+};
+
+const refundEventTicketSales = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const { value, error } = bulkRefundEventTicketSalesSchema.validate(payload);
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const requesterAuthId = String(user.authId || '').trim();
+  const requesterRole = String(user.role || '').trim().toUpperCase();
+  const reasonCode = normalizeRefundReasonCode(value.reasonCode);
+  const reasonLabel = REFUND_REASON_CODE_LABELS[reasonCode] || reasonCode;
+  if (!['ADMIN', 'MANAGER'].includes(requesterRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can process grouped ticket refunds');
+  }
+
+  if (!REFUND_REASON_CODES.includes(reasonCode)) {
+    throw createApiError(400, 'Valid refund reasonCode is required');
+  }
+
+  const normalizedEventId = String(value.eventId || '').trim();
+  const targetRefundOrderType = 'PLANNING_REFUND';
+  const normalizedAuthIds = Array.isArray(value.authIds)
+    ? Array.from(
+      new Set(
+        value.authIds
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    )
+    : [];
+
+  const query = {
+    eventId: normalizedEventId,
+    orderType: 'TICKET SALE',
+    status: 'PAID',
+  };
+
+  if (normalizedAuthIds.length > 0) {
+    query.authId = { $in: normalizedAuthIds };
+  }
+
+  const orders = await PaymentOrder.find(query).sort({ createdAt: 1 });
+  if (!Array.isArray(orders) || orders.length === 0) {
+    return {
+      eventId: normalizedEventId,
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: 0,
+      skippedCount: 0,
+      refundedOrders: [],
+      failures: [],
+    };
+  }
+
+  const razorpay = getRazorpayClient();
+  const refundedOrders = [];
+  const failures = [];
+  let skippedCount = 0;
+
+  for (const paymentOrder of orders) {
+    const orderId = String(paymentOrder?._id || '').trim() || null;
+
+    if (!paymentOrder?.razorpayPaymentId) {
+      skippedCount += 1;
+      failures.push({
+        paymentOrderId: orderId,
+        authId: paymentOrder?.authId || null,
+        transactionId: paymentOrder?.transactionId || null,
+        reason: 'Razorpay payment id is missing for this order',
+      });
+      continue;
+    }
+
+    try {
+      const refund = await razorpay.payments.refund(paymentOrder.razorpayPaymentId, {
+        amount: paymentOrder.amount,
+        speed: 'normal',
+        notes: {
+          eventId: paymentOrder.eventId,
+          authId: paymentOrder.authId,
+          initiatedByAuthId: requesterAuthId,
+          initiatedByRole: requesterRole,
+          reasonCode,
+          reason: reasonLabel,
+          source: 'event-ticket-bulk-refund',
+          ...(value.notes || {}),
+        },
+      });
+
+      paymentOrder.status = 'REFUNDED';
+      paymentOrder.orderType = targetRefundOrderType;
+      paymentOrder.refundedAt = new Date();
+      paymentOrder.refundedAmount = refund.amount;
+      paymentOrder.razorpayRefundId = refund.id;
+      paymentOrder.refundReasonCode = reasonCode;
+      paymentOrder.refundReason = reasonLabel;
+      await paymentOrder.save();
+
+      try {
+        await publishEvent('PAYMENT_REFUND_SUCCESS', {
+          eventId: paymentOrder.eventId,
+          authId: paymentOrder.authId,
+          paymentOrderId: paymentOrder._id.toString(),
+          transactionId: paymentOrder.transactionId,
+          orderType: targetRefundOrderType,
+          paymentStatus: paymentOrder.status,
+          razorpayOrderId: paymentOrder.razorpayOrderId,
+          razorpayPaymentId: paymentOrder.razorpayPaymentId,
+          razorpayRefundId: paymentOrder.razorpayRefundId,
+          amount: paymentOrder.refundedAmount,
+          currency: paymentOrder.currency,
+          refundedAt: paymentOrder.refundedAt.toISOString(),
+          reasonCode,
+        });
+      } catch (kafkaError) {
+        logger.error('Failed to publish PAYMENT_REFUND_SUCCESS event for bulk ticket refund:', kafkaError);
+      }
+
+      await publishTransactionUpdate(
+        buildTransactionEnvelope({
+          order: paymentOrder,
+          user,
+          orderType: targetRefundOrderType,
+          paymentStatus: 'REFUNDED',
+          transactionId: paymentOrder.transactionId,
+          amount: paymentOrder.refundedAmount,
+          source: 'event-ticket-bulk-refund',
+        })
+      );
+
+      refundedOrders.push({
+        paymentOrderId: paymentOrder._id.toString(),
+        authId: paymentOrder.authId,
+        transactionId: paymentOrder.transactionId,
+        refundId: paymentOrder.razorpayRefundId,
+        refundedAmount: paymentOrder.refundedAmount,
+        refundedAt: paymentOrder.refundedAt,
+        reasonCode,
+      });
+    } catch (refundError) {
+      failures.push({
+        paymentOrderId: orderId,
+        authId: paymentOrder?.authId || null,
+        transactionId: paymentOrder?.transactionId || null,
+        reason: normalizeRazorpayError(refundError)?.message
+          || refundError?.response?.data?.message
+          || refundError?.message
+          || 'Failed to process refund',
+      });
+    }
+  }
+
+  return {
+    eventId: normalizedEventId,
+    totalOrders: orders.length,
+    refundedCount: refundedOrders.length,
+    failedCount: failures.length,
+    skippedCount,
+    refundedOrders,
+    failures,
   };
 };
 
@@ -3344,6 +3832,8 @@ module.exports = {
   createOrder,
   verifyPayment,
   refundPayment,
+  refundTicketSalePayment,
+  refundEventTicketSales,
   handleWebhook,
   getOrderByEventId,
   getOrdersByEventIdForAdmin,

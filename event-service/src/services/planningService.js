@@ -2,6 +2,7 @@ const Planning = require('../models/Planning');
 const Promote = require('../models/Promote');
 const UserEventTicket = require('../models/UserEventTicket');
 const VendorSelection = require('../models/VendorSelection');
+const PlanningRefundPolicyConfig = require('../models/PlanningRefundPolicyConfig');
 const axios = require('axios');
 const logger = require('../utils/logger');
 const createApiError = require('../utils/ApiError');
@@ -19,12 +20,18 @@ const vendorReservationService = require('./vendorReservationService');
 const promoteConfigService = require('./promoteConfigService');
 const planningQuoteService = require('./planningQuoteService');
 const mongoose = require('mongoose');
-const { fetchUserById, resolveUserServiceIdFromAuthId } = require('./userServiceClient');
+const {
+  fetchActiveManagers,
+  fetchUserByAuthId,
+  fetchUserById,
+  resolveUserServiceIdFromAuthId,
+} = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
 const { sendEventDmConversationMessage } = require('./chatServiceClient');
 const { publishEvent } = require('../kafka/eventProducer');
 const {
   parseIstDayStart,
+  startOfIstDay,
   shiftDateKeepingIstTime,
   toIstDayString,
 } = require('../utils/istDateTime');
@@ -38,7 +45,79 @@ const defaultOrderServiceUrl = process.env.SERVICE_HOST
   ? 'http://order-service:8087'
   : 'http://localhost:8087';
 const orderServiceUrl = process.env.ORDER_SERVICE_URL || defaultOrderServiceUrl;
+const notificationServiceUrl = (
+  process.env.NOTIFICATION_SERVICE_URL
+  || (process.env.SERVICE_HOST ? 'http://notification-service:8088' : 'http://localhost:8088')
+).replace(/\/$/, '');
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
+
+const REFUND_POLICY_CONFIG_KEY = 'default';
+const DEFAULT_REFUND_TIMELINE_LABEL = '5-7 working days';
+const REFUND_REQUEST_STATUSES = {
+  PENDING_REVIEW: 'PENDING_REVIEW',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+  REFUNDED: 'REFUNDED',
+};
+
+const CANCELLATION_OP_STATUSES = {
+  COMPLETED: 'COMPLETED',
+  FAILED: 'FAILED',
+};
+
+const CANCELLATION_OP_TRIGGERS = {
+  AUTOMATIC: 'AUTOMATIC',
+  MANUAL: 'MANUAL',
+};
+
+const REVENUE_OPS_ASSIGNED_ROLES = new Set([
+  'REVENUE OPERATIONS SPECIALIST',
+  'REVENUE OPERATION SPECIALIST',
+  'REVENUE OPERATIONS SPECIALISTS',
+  'REVENUE OPERATION SPECIALISTS',
+]);
+
+const DEFAULT_REFUND_POLICY_SLABS = [
+  {
+    code: 'GE_30_DAYS',
+    label: '30 days or more before event',
+    minDays: 30,
+    maxDays: null,
+    deductionPercent: 10,
+  },
+  {
+    code: 'DAYS_15_TO_29',
+    label: '15 to 29 days before event',
+    minDays: 15,
+    maxDays: 29,
+    deductionPercent: 25,
+  },
+  {
+    code: 'DAYS_7_TO_14',
+    label: '7 to 14 days before event',
+    minDays: 7,
+    maxDays: 14,
+    deductionPercent: 50,
+  },
+  {
+    code: 'DAYS_0_TO_6',
+    label: '0 to 6 days before event',
+    minDays: 0,
+    maxDays: 6,
+    deductionPercent: 75,
+  },
+  {
+    code: 'PAST_EVENT_OR_SAME_DAY',
+    label: 'Past event date',
+    minDays: null,
+    maxDays: -1,
+    deductionPercent: 100,
+  },
+];
+
+const REFUND_SLAB_BY_CODE = new Map(
+  DEFAULT_REFUND_POLICY_SLABS.map((slab) => [String(slab.code), slab])
+);
 
 const resolveFrontendBaseUrl = () => {
   const fromEnv = String(process.env.FRONTEND_URL || process.env.FRONTEND_URL_FALLBACK || '').trim();
@@ -47,6 +126,237 @@ const resolveFrontendBaseUrl = () => {
 };
 
 const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const normalizeRoleToken = (value) => String(value || '')
+  .trim()
+  .toUpperCase()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ');
+
+const isRevenueOpsAssignedRole = (assignedRole) => REVENUE_OPS_ASSIGNED_ROLES.has(normalizeRoleToken(assignedRole));
+
+const cloneDefaultRefundPolicySlabs = () => DEFAULT_REFUND_POLICY_SLABS.map((slab) => ({ ...slab }));
+
+const buildDefaultRefundPolicyConfigPayload = () => ({
+  key: REFUND_POLICY_CONFIG_KEY,
+  timelineLabel: DEFAULT_REFUND_TIMELINE_LABEL,
+  slabs: cloneDefaultRefundPolicySlabs(),
+  roundRobinCursor: 0,
+  updatedByAuthId: null,
+});
+
+const clampRefundPercent = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Number(n.toFixed(2))));
+};
+
+const normalizeRefundPolicySlabs = (rawSlabs) => {
+  const defaults = cloneDefaultRefundPolicySlabs();
+  const incoming = Array.isArray(rawSlabs) ? rawSlabs : [];
+  const incomingByCode = new Map(
+    incoming
+      .map((row) => ({
+        code: String(row?.code || '').trim().toUpperCase(),
+        deductionPercent: clampRefundPercent(row?.deductionPercent),
+      }))
+      .filter((row) => row.code)
+  );
+
+  return defaults.map((slab) => {
+    const next = incomingByCode.get(String(slab.code));
+    if (!next || next.deductionPercent === null) return { ...slab };
+    return {
+      ...slab,
+      deductionPercent: next.deductionPercent,
+    };
+  });
+};
+
+const normalizeRefundTimelineLabel = (value) => {
+  const label = String(value || '').trim();
+  return label || DEFAULT_REFUND_TIMELINE_LABEL;
+};
+
+const getOrCreatePlanningRefundPolicyConfig = async () => {
+  const setOnInsert = buildDefaultRefundPolicyConfigPayload();
+
+  let cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY },
+    { $setOnInsert: setOnInsert },
+    { new: true, upsert: true }
+  ).lean();
+
+  const normalizedTimelineLabel = normalizeRefundTimelineLabel(cfg?.timelineLabel);
+  const normalizedSlabs = normalizeRefundPolicySlabs(cfg?.slabs);
+  const currentSlabsJson = JSON.stringify(Array.isArray(cfg?.slabs) ? cfg.slabs : []);
+  const normalizedSlabsJson = JSON.stringify(normalizedSlabs);
+
+  const needsBackfill =
+    normalizedTimelineLabel !== String(cfg?.timelineLabel || '')
+    || currentSlabsJson !== normalizedSlabsJson;
+
+  if (!needsBackfill) {
+    return {
+      ...cfg,
+      timelineLabel: normalizedTimelineLabel,
+      slabs: normalizedSlabs,
+    };
+  }
+
+  cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY },
+    {
+      $set: {
+        timelineLabel: normalizedTimelineLabel,
+        slabs: normalizedSlabs,
+      },
+    },
+    { new: true }
+  ).lean();
+
+  return {
+    ...cfg,
+    timelineLabel: normalizedTimelineLabel,
+    slabs: normalizedSlabs,
+  };
+};
+
+const getPlanningRefundPolicy = async () => {
+  const cfg = await getOrCreatePlanningRefundPolicyConfig();
+  return {
+    timelineLabel: normalizeRefundTimelineLabel(cfg?.timelineLabel),
+    slabs: normalizeRefundPolicySlabs(cfg?.slabs),
+    updatedAt: cfg?.updatedAt || null,
+    updatedByAuthId: String(cfg?.updatedByAuthId || '').trim() || null,
+  };
+};
+
+const recalculateOpenRefundRequestResults = async (policy) => {
+  const openStatuses = [REFUND_REQUEST_STATUSES.PENDING_REVIEW, REFUND_REQUEST_STATUSES.APPROVED];
+  const candidates = await Planning.find({
+    'refundRequest.status': { $in: openStatuses },
+    refundRequest: { $ne: null },
+  })
+    .select('eventId category eventDate schedule platformFee depositPaidAmountPaise vendorConfirmationPaidAmountPaise remainingPaymentPaidAmountPaise refundRequest')
+    .lean();
+
+  const updates = [];
+  for (const planning of candidates || []) {
+    const nextResult = buildPlanningRefundResult(planning, policy);
+    const currentResult = planning?.refundRequest?.result && typeof planning.refundRequest.result === 'object'
+      ? planning.refundRequest.result
+      : null;
+
+    if (JSON.stringify(currentResult || {}) === JSON.stringify(nextResult || {})) {
+      continue;
+    }
+
+    updates.push(
+      Planning.updateOne(
+        { eventId: String(planning?.eventId || '').trim() },
+        { $set: { 'refundRequest.result': nextResult } }
+      )
+    );
+  }
+
+  if (updates.length > 0) {
+    await Promise.all(updates);
+  }
+
+  return updates.length;
+};
+
+const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthId } = {}) => {
+  const hasSlabUpdates = Array.isArray(slabs);
+  const hasTimelineUpdate = timelineLabel !== undefined;
+  if (!hasSlabUpdates && !hasTimelineUpdate) {
+    throw createApiError(400, 'No refund policy updates provided');
+  }
+
+  const existing = await getOrCreatePlanningRefundPolicyConfig();
+  const existingSlabs = normalizeRefundPolicySlabs(existing?.slabs);
+  const incomingRows = Array.isArray(slabs) ? slabs : [];
+
+  const incomingByCode = new Map(
+    incomingRows.map((row) => [
+      String(row?.code || '').trim().toUpperCase(),
+      row,
+    ])
+  );
+
+  const nextSlabs = existingSlabs.map((slab) => {
+    const code = String(slab.code || '').trim().toUpperCase();
+    if (!incomingByCode.has(code)) return slab;
+
+    const incoming = incomingByCode.get(code);
+    const deductionPercent = clampRefundPercent(incoming?.deductionPercent);
+    if (deductionPercent === null) {
+      throw createApiError(400, `deductionPercent is invalid for slab ${code}`);
+    }
+
+    return {
+      ...slab,
+      deductionPercent,
+    };
+  });
+
+  for (const [code] of incomingByCode.entries()) {
+    if (!REFUND_SLAB_BY_CODE.has(code)) {
+      throw createApiError(400, `Unknown refund slab code: ${code}`);
+    }
+  }
+
+  const nextTimelineLabel = hasTimelineUpdate
+    ? normalizeRefundTimelineLabel(timelineLabel)
+    : normalizeRefundTimelineLabel(existing?.timelineLabel);
+
+  const updated = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY },
+    {
+      $set: {
+        timelineLabel: nextTimelineLabel,
+        slabs: nextSlabs,
+        updatedByAuthId: String(updatedByAuthId || '').trim() || null,
+      },
+      $setOnInsert: {
+        key: REFUND_POLICY_CONFIG_KEY,
+        roundRobinCursor: 0,
+      },
+    },
+    { new: true, upsert: true }
+  ).lean();
+
+  const normalized = {
+    timelineLabel: normalizeRefundTimelineLabel(updated?.timelineLabel),
+    slabs: normalizeRefundPolicySlabs(updated?.slabs),
+    updatedAt: updated?.updatedAt || null,
+    updatedByAuthId: String(updated?.updatedByAuthId || '').trim() || null,
+  };
+
+  await recalculateOpenRefundRequestResults(normalized);
+
+  return normalized;
+};
+
+const nextRefundRoundRobinCursor = async () => {
+  const updated = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY },
+    {
+      $setOnInsert: {
+        key: REFUND_POLICY_CONFIG_KEY,
+        timelineLabel: DEFAULT_REFUND_TIMELINE_LABEL,
+        slabs: cloneDefaultRefundPolicySlabs(),
+        updatedByAuthId: null,
+      },
+      $inc: { roundRobinCursor: 1 },
+    },
+    { new: true, upsert: true }
+  ).lean();
+
+  const cursorAfterIncrement = Number(updated?.roundRobinCursor || 1);
+  return Math.max(0, cursorAfterIncrement - 1);
+};
 
 const normalizePromotionToken = (value) => String(value || '')
   .trim()
@@ -70,6 +380,367 @@ const buildInternalOrderServiceHeaders = () => ({
   'x-user-role': 'MANAGER',
 });
 
+const buildSystemNotificationHeaders = () => {
+  const authId = process.env.EVENT_SERVICE_SYSTEM_AUTH_ID || 'system:event-service';
+  return {
+    'x-auth-id': authId,
+    'x-user-id': authId,
+    'x-user-email': 'system@okkazo.local',
+    'x-user-username': 'event-service',
+    'x-user-role': 'ADMIN',
+  };
+};
+
+const isPublicTicketSaleWindowStarted = (planning) => {
+  const category = String(planning?.category || '').trim().toLowerCase();
+  if (category !== CATEGORY.PUBLIC) return false;
+
+  const ticketStartAt = planning?.ticketAvailability?.startAt;
+  if (!ticketStartAt) return false;
+
+  const parsed = new Date(ticketStartAt);
+  if (Number.isNaN(parsed.getTime())) return false;
+
+  return Date.now() >= parsed.getTime();
+};
+
+const getPlanningGuestTicketRecipients = async ({ eventId } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  const rows = await UserEventTicket.find({
+    eventId: normalizedEventId,
+    ticketStatus: USER_TICKET_STATUS.SUCCESS,
+  })
+    .select('userAuthId')
+    .lean();
+
+  return Array.from(
+    new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map((row) => String(row?.userAuthId || '').trim())
+        .filter(Boolean)
+    )
+  );
+};
+
+const sendPlanningGuestCancellationNotifications = async ({
+  planning,
+  recipientAuthIds = [],
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+} = {}) => {
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (normalizedRecipients.length === 0) {
+    return {
+      targetedGuests: 0,
+      delivered: 0,
+      failed: 0,
+      failedRecipients: [],
+    };
+  }
+
+  const normalizedEventId = String(planning?.eventId || '').trim();
+  const eventTitle = String(planning?.eventTitle || '').trim() || `Event ${normalizedEventId}`;
+  const actionUrl = `${resolveFrontendBaseUrl()}/user/ticket-management`;
+  const title = `Event Cancelled: ${eventTitle}`;
+  const message = [
+    `The event \"${eventTitle}\" has been cancelled by the organizer.`,
+    `If you purchased tickets, your refund has been initiated and is usually processed within ${refundTimelineLabel}.`,
+  ].join(' ');
+
+  const headers = buildSystemNotificationHeaders();
+  const requests = normalizedRecipients.map((recipientAuthId) => axios.post(
+    `${notificationServiceUrl}/system/send-to-user`,
+    {
+      recipientAuthId,
+      recipientRole: 'USER',
+      title,
+      message,
+      actionUrl,
+      category: 'EVENT',
+      type: 'EVENT_CANCELLED',
+      metadata: {
+        eventId: normalizedEventId,
+        eventType: 'planning',
+        eventTitle,
+        source: 'event-service:planning-cancel',
+      },
+    },
+    {
+      headers,
+      timeout: 10_000,
+    }
+  ));
+
+  const settled = await Promise.allSettled(requests);
+  const failedRecipients = [];
+
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') return;
+    const failedRecipient = normalizedRecipients[index];
+    if (failedRecipient) failedRecipients.push(failedRecipient);
+
+    logger.warn('Failed to send planning cancellation notification to guest', {
+      eventId: normalizedEventId,
+      recipientAuthId: failedRecipient || null,
+      message: result?.reason?.response?.data?.message || result?.reason?.message,
+    });
+  });
+
+  return {
+    targetedGuests: normalizedRecipients.length,
+    delivered: normalizedRecipients.length - failedRecipients.length,
+    failed: failedRecipients.length,
+    failedRecipients,
+  };
+};
+
+const publishPlanningGuestCancellationEmailEvent = async ({
+  planning,
+  recipientAuthIds = [],
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+  cancellationReason = null,
+} = {}) => {
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (normalizedRecipients.length === 0) {
+    return {
+      queued: false,
+      queuedRecipients: 0,
+    };
+  }
+
+  const eventId = String(planning?.eventId || '').trim();
+  const eventTitle = String(planning?.eventTitle || '').trim() || `Event ${eventId}`;
+  const eventDate = planning?.eventDate || planning?.schedule?.startAt || null;
+  const eventLocation = String(planning?.location?.name || '').trim() || null;
+
+  try {
+    await publishEvent('PLANNING_EVENT_CANCELLED_FOR_GUESTS', {
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      cancellationReason: String(cancellationReason || '').trim() || null,
+      refundTimelineLabel: String(refundTimelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL,
+      recipientAuthIds: normalizedRecipients,
+      actionUrl: `${resolveFrontendBaseUrl()}/user/ticket-management`,
+      cancelledAt: new Date().toISOString(),
+      source: 'planning-refund-request',
+    });
+
+    return {
+      queued: true,
+      queuedRecipients: normalizedRecipients.length,
+    };
+  } catch (error) {
+    logger.warn('Failed to queue planning cancellation guest email event', {
+      eventId,
+      recipients: normalizedRecipients.length,
+      message: error?.message || String(error),
+    });
+
+    return {
+      queued: false,
+      queuedRecipients: 0,
+      error: error?.message || String(error),
+    };
+  }
+};
+
+const processPlanningGuestTicketBulkRefund = async ({
+  planning,
+  recipientAuthIds = [],
+  cancellationReason = null,
+} = {}) => {
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+  const normalizedEventId = String(planning?.eventId || '').trim();
+
+  if (!normalizedEventId || normalizedRecipients.length === 0) {
+    return {
+      skipped: true,
+      reason: 'No ticket guests to refund',
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: 0,
+    };
+  }
+
+  try {
+    const response = await axios.post(
+      `${orderServiceUrl}/orders/refund/event-ticket-sales`,
+      {
+        eventId: normalizedEventId,
+        authIds: normalizedRecipients,
+        reasonCode: 'CLIENT_CANCELLED',
+        notes: {
+          source: 'planning-cancellation-auto-bulk-refund',
+          cancellationReason: String(cancellationReason || '').trim() || null,
+        },
+      },
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    return response?.data?.data || {
+      skipped: false,
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: 0,
+    };
+  } catch (error) {
+    const message = String(error?.response?.data?.message || error?.message || 'Failed to trigger bulk guest ticket refund');
+    logger.warn('Failed to trigger bulk guest ticket refund after planning cancellation', {
+      eventId: normalizedEventId,
+      recipients: normalizedRecipients.length,
+      message,
+    });
+
+    return {
+      skipped: false,
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: normalizedRecipients.length,
+      error: message,
+    };
+  }
+};
+
+const handlePlanningCancellationPostActions = async ({
+  planning,
+  cancellationReason = null,
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+} = {}) => {
+  const normalizedEventId = String(planning?.eventId || '').trim();
+  const ownerAuthId = String(planning?.authId || '').trim();
+
+  let vendorRelease = {
+    skipped: true,
+    reason: 'Planning owner context missing',
+  };
+
+  if (normalizedEventId && ownerAuthId) {
+    try {
+      vendorRelease = await vendorSelectionService.releaseReservationsForPlanning({
+        eventId: normalizedEventId,
+        authId: ownerAuthId,
+        force: true,
+      });
+    } catch (error) {
+      vendorRelease = {
+        skipped: false,
+        error: error?.message || String(error),
+      };
+      logger.warn('Failed to release vendor reservations for cancelled planning', {
+        eventId: normalizedEventId,
+        message: vendorRelease.error,
+      });
+    }
+  }
+
+  const ticketWindowStarted = isPublicTicketSaleWindowStarted(planning);
+
+  const recipientAuthIds = await getPlanningGuestTicketRecipients({ eventId: normalizedEventId });
+  if (recipientAuthIds.length === 0) {
+    return {
+      ticketWindowStarted,
+      vendorRelease,
+      guestRecipients: 0,
+      notifications: {
+        targetedGuests: 0,
+        delivered: 0,
+        failed: 0,
+        failedRecipients: [],
+      },
+      emailQueue: {
+        queued: false,
+        queuedRecipients: 0,
+      },
+      bulkGuestTicketRefund: {
+        skipped: true,
+        reason: 'No successful ticket guests found for this event',
+        totalOrders: 0,
+        refundedCount: 0,
+        failedCount: 0,
+      },
+    };
+  }
+
+  const [notifications, emailQueue, bulkGuestTicketRefund] = await Promise.all([
+    sendPlanningGuestCancellationNotifications({
+      planning,
+      recipientAuthIds,
+      refundTimelineLabel,
+    }),
+    publishPlanningGuestCancellationEmailEvent({
+      planning,
+      recipientAuthIds,
+      refundTimelineLabel,
+      cancellationReason,
+    }),
+    processPlanningGuestTicketBulkRefund({
+      planning,
+      recipientAuthIds,
+      cancellationReason,
+    }),
+  ]);
+
+  return {
+    ticketWindowStarted,
+    vendorRelease,
+    guestRecipients: recipientAuthIds.length,
+    notifications,
+    emailQueue,
+    bulkGuestTicketRefund,
+  };
+};
+
+const buildPlanningCancellationOpsRecord = ({
+  ops = null,
+  triggeredBy = CANCELLATION_OP_TRIGGERS.AUTOMATIC,
+  fallbackError = null,
+} = {}) => {
+  const details = ops && typeof ops === 'object' ? ops : {};
+  const guestRecipients = Math.max(0, Number(details?.guestRecipients || 0));
+  const notificationsFailed = Math.max(0, Number(details?.notifications?.failed || 0));
+  const refundFailed = Math.max(0, Number(details?.bulkGuestTicketRefund?.failedCount || 0));
+  const refundError = String(details?.bulkGuestTicketRefund?.error || '').trim();
+  const emailQueued = Boolean(details?.emailQueue?.queued);
+  const opError = String(fallbackError || details?.error || '').trim();
+
+  const failures = [];
+  if (opError) failures.push(opError);
+  if (guestRecipients > 0 && notificationsFailed > 0) failures.push('Some guest notifications failed');
+  if (guestRecipients > 0 && !emailQueued) failures.push('Guest cancellation email queue did not succeed');
+  if (guestRecipients > 0 && refundFailed > 0) failures.push('Some guest ticket refunds failed');
+  if (guestRecipients > 0 && refundError) failures.push(refundError);
+
+  const status = failures.length === 0
+    ? CANCELLATION_OP_STATUSES.COMPLETED
+    : CANCELLATION_OP_STATUSES.FAILED;
+
+  const now = new Date();
+  return {
+    status,
+    triggeredBy: triggeredBy === CANCELLATION_OP_TRIGGERS.MANUAL
+      ? CANCELLATION_OP_TRIGGERS.MANUAL
+      : CANCELLATION_OP_TRIGGERS.AUTOMATIC,
+    attemptedAt: now,
+    completedAt: status === CANCELLATION_OP_STATUSES.COMPLETED ? now : null,
+    error: failures.length > 0 ? failures.join(' | ').slice(0, 1200) : null,
+    details,
+  };
+};
+
 const fetchVendorPayoutsForEventFromOrderService = async (eventId) => {
   const normalizedEventId = String(eventId || '').trim();
   if (!normalizedEventId) return [];
@@ -83,6 +754,63 @@ const fetchVendorPayoutsForEventFromOrderService = async (eventId) => {
   );
 
   return Array.isArray(response?.data?.data?.payouts) ? response.data.data.payouts : [];
+};
+
+const processPlanningRefundInOrderService = async ({ planning, managerAuthId, managerNotes } = {}) => {
+  const normalizedEventId = String(planning?.eventId || '').trim();
+  const ownerAuthId = String(planning?.authId || '').trim();
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!ownerAuthId) throw createApiError(409, 'Planning owner authId is missing, cannot process refund');
+
+  const computedRefundAmountPaise = Math.max(0, Number(planning?.refundRequest?.result?.refundAmountPaise || 0));
+  if (computedRefundAmountPaise <= 0) {
+    return {
+      skipped: true,
+      refundedAt: new Date(),
+      refundTransactionRef: null,
+    };
+  }
+
+  try {
+    const response = await axios.post(
+      `${orderServiceUrl}/orders/refund`,
+      {
+        eventId: normalizedEventId,
+        authId: ownerAuthId,
+        amount: Number((computedRefundAmountPaise / 100).toFixed(2)),
+        reasonCode: 'CLIENT_CANCELLED',
+        notes: {
+          source: 'planning-refund-review',
+          refundType: 'PLANNING_REFUND',
+          managerAuthId: String(managerAuthId || '').trim() || null,
+          planningRefundRequestId: String(planning?.refundRequest?.requestId || '').trim() || null,
+          ruleCode: String(planning?.refundRequest?.result?.ruleCode || '').trim() || null,
+          deductionPercent: Number(planning?.refundRequest?.result?.deductionPercent || 0),
+          cancellationReason: String(planning?.refundRequest?.cancellationReason || '').trim() || null,
+          managerNotes: String(managerNotes || '').trim() || null,
+        },
+      },
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    const refundData = response?.data?.data || {};
+    const refundTransactionRef = String(refundData?.refundId || refundData?.transactionId || '').trim() || null;
+    const refundedAtRaw = refundData?.refundedAt;
+    const refundedAt = refundedAtRaw ? new Date(refundedAtRaw) : new Date();
+
+    return {
+      skipped: false,
+      refundedAt,
+      refundTransactionRef,
+    };
+  } catch (error) {
+    const statusCode = Number(error?.response?.status || error?.statusCode || 502);
+    const message = String(error?.response?.data?.message || error?.message || 'Failed to process planning refund');
+    throw createApiError(statusCode, message);
+  }
 };
 
 const toVendorServicePayoutKey = ({ vendorAuthId, service }) => {
@@ -168,6 +896,165 @@ const isCoordinatorAssignedRole = (assignedRole) => {
   return role.includes('coordinator');
 };
 
+const getPlanningStartDate = (planning) => {
+  if (!planning || typeof planning !== 'object') return null;
+
+  const category = String(planning?.category || '').trim().toLowerCase();
+  if (category === CATEGORY.PUBLIC) {
+    const fromSchedule = planning?.schedule?.startAt ? new Date(planning.schedule.startAt) : null;
+    if (fromSchedule && !Number.isNaN(fromSchedule.getTime())) return fromSchedule;
+  }
+
+  const fromEventDate = planning?.eventDate ? new Date(planning.eventDate) : null;
+  if (fromEventDate && !Number.isNaN(fromEventDate.getTime())) return fromEventDate;
+
+  return null;
+};
+
+const resolvePlanningGrossPaidAmountPaise = (planning) => {
+  const depositPaise = Math.max(0, Number(planning?.depositPaidAmountPaise || 0));
+  const vendorConfirmationPaise = Math.max(0, Number(planning?.vendorConfirmationPaidAmountPaise || 0));
+  const remainingPaise = Math.max(0, Number(planning?.remainingPaymentPaidAmountPaise || 0));
+  const milestoneTotal = depositPaise + vendorConfirmationPaise + remainingPaise;
+
+  if (milestoneTotal > 0) return Math.round(milestoneTotal);
+
+  const platformFeeInr = Number(planning?.platformFee || 0);
+  if (Number.isFinite(platformFeeInr) && platformFeeInr > 0) {
+    return Math.round(platformFeeInr * 100);
+  }
+
+  return 0;
+};
+
+const computeDaysUntilPlanningStart = (planning) => {
+  const eventStart = getPlanningStartDate(planning);
+  if (!eventStart) return 0;
+
+  const eventDay = startOfIstDay(eventStart);
+  const todayDay = startOfIstDay(new Date());
+  if (!eventDay || !todayDay) return 0;
+
+  const diffMs = eventDay.getTime() - todayDay.getTime();
+  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
+};
+
+const resolveRefundPolicyRule = (daysUntilEvent, slabs = DEFAULT_REFUND_POLICY_SLABS) => {
+  const days = Number(daysUntilEvent);
+  const safeDays = Number.isFinite(days) ? days : 0;
+
+  const safeSlabs = Array.isArray(slabs) && slabs.length > 0
+    ? slabs
+    : DEFAULT_REFUND_POLICY_SLABS;
+
+  const matched = safeSlabs.find((rule) => {
+    const minDays = rule?.minDays;
+    const maxDays = rule?.maxDays;
+    const minOk = minDays === null || minDays === undefined || safeDays >= Number(minDays);
+    const maxOk = maxDays === null || maxDays === undefined || safeDays <= Number(maxDays);
+    return minOk && maxOk;
+  });
+  if (matched) return matched;
+
+  return safeSlabs[safeSlabs.length - 1];
+};
+
+const buildPlanningRefundResult = (planning, policy = null) => {
+  const grossPaidAmountPaise = resolvePlanningGrossPaidAmountPaise(planning);
+  const daysUntilEvent = computeDaysUntilPlanningStart(planning);
+  const policySlabs = Array.isArray(policy?.slabs) && policy.slabs.length > 0
+    ? policy.slabs
+    : DEFAULT_REFUND_POLICY_SLABS;
+  const policyRule = resolveRefundPolicyRule(daysUntilEvent, policySlabs);
+  const deductionPercent = Number(policyRule?.deductionPercent || 0);
+  const deductionAmountPaise = Math.round((grossPaidAmountPaise * deductionPercent) / 100);
+  const refundAmountPaise = Math.max(0, grossPaidAmountPaise - deductionAmountPaise);
+  const timelineLabel = normalizeRefundTimelineLabel(policy?.timelineLabel);
+
+  return {
+    grossPaidAmountPaise,
+    deductionPercent,
+    deductionAmountPaise,
+    refundAmountPaise,
+    daysUntilEvent,
+    timelineLabel,
+    ruleCode: String(policyRule?.code || '').trim() || null,
+    currency: 'INR',
+  };
+};
+
+const pickRevenueOpsAssignee = async () => {
+  const managers = await fetchActiveManagers({ limit: 1000 });
+  const eligibleManagers = (Array.isArray(managers) ? managers : [])
+    .filter((manager) => normalizeLoose(manager?.role) === 'manager')
+    .filter((manager) => manager?.isActive !== false)
+    .filter((manager) => isRevenueOpsAssignedRole(manager?.assignedRole))
+    .map((manager) => ({
+      id: String(manager?._id || manager?.id || '').trim(),
+      authId: String(manager?.authId || '').trim(),
+      assignedRole: String(manager?.assignedRole || '').trim(),
+      name: String(manager?.name || manager?.fullName || manager?.username || '').trim(),
+    }))
+    .filter((manager) => manager.id);
+
+  if (eligibleManagers.length === 0) {
+    throw createApiError(409, 'No active Revenue Operations Specialist is available right now');
+  }
+
+  const rankedManagers = [...eligibleManagers].sort((a, b) => {
+    const nameCmp = String(a.name || '').localeCompare(String(b.name || ''));
+    if (nameCmp !== 0) return nameCmp;
+
+    return a.id.localeCompare(b.id);
+  });
+
+  const cursor = await nextRefundRoundRobinCursor();
+  const selectedIndex = cursor % rankedManagers.length;
+  return rankedManagers[selectedIndex];
+};
+
+const resolveRevenueOpsManagerContext = async ({ authId, role }) => {
+  const normalizedRole = String(role || '').trim().toUpperCase();
+  if (normalizedRole === 'ADMIN') {
+    return {
+      isAdmin: true,
+      managerId: null,
+      authId: String(authId || '').trim() || null,
+      assignedRole: 'ADMIN',
+    };
+  }
+
+  if (normalizedRole !== 'MANAGER') {
+    throw createApiError(403, 'Only manager or admin users can access refund requests');
+  }
+
+  const normalizedAuthId = String(authId || '').trim();
+  if (!normalizedAuthId) {
+    throw createApiError(401, 'Manager authentication information missing');
+  }
+
+  const user = await fetchUserByAuthId(normalizedAuthId);
+  if (!user) {
+    throw createApiError(404, 'Manager profile not found');
+  }
+
+  const managerId = String(user?._id || user?.id || '').trim();
+  if (!managerId) {
+    throw createApiError(404, 'Manager profile not found');
+  }
+
+  if (!isRevenueOpsAssignedRole(user?.assignedRole)) {
+    throw createApiError(403, 'Only Revenue Operations Specialist managers can access refund requests');
+  }
+
+  return {
+    isAdmin: false,
+    managerId,
+    authId: normalizedAuthId,
+    assignedRole: String(user?.assignedRole || '').trim() || null,
+  };
+};
+
 const normalizeRangeToIstDaySpan = (range) => {
   const startDay = toIstDayString(range?.start);
   const endDay = toIstDayString(range?.end || range?.start);
@@ -249,7 +1136,7 @@ const assertCoreStaffAvailableAcrossEvents = async ({ staffId, targetRange, plan
       .select('eventId category schedule eventDate')
       .lean(),
     Promote.find({
-      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
       ...(normalizedExcludeEventId ? { eventId: { $ne: normalizedExcludeEventId } } : {}),
       $or: [
@@ -317,7 +1204,7 @@ const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdTo
 
   const existingPromotes = await Promote.find({
     assignedManagerId: String(managerId).trim(),
-    eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+    eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
     'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
   })
     .select('eventId schedule')
@@ -1122,6 +2009,392 @@ const getPlanningApplicationsForManager = async ({ managerId, limit = 200 } = {}
 
   const cfg = await promoteConfigService.getFees();
   return (plannings || []).map((p) => normalizePlanningForApi(p, cfg.platformFee));
+};
+
+/**
+ * Create a cancellation refund request for planning owner.
+ */
+const createPlanningRefundRequest = async ({ eventId, authId, cancellationReason = null } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedAuthId = String(authId || '').trim();
+  const normalizedReason = String(cancellationReason || '').trim();
+
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!normalizedAuthId) throw createApiError(401, 'Authentication required');
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  if (String(planning.authId || '').trim() !== normalizedAuthId) {
+    throw createApiError(403, 'Only the event owner can request cancellation refund');
+  }
+
+  const lifecycleStatus = String(planning.status || '').trim();
+  if (TERMINAL_STATUSES.includes(lifecycleStatus) || lifecycleStatus === STATUS.REJECTED) {
+    throw createApiError(409, 'Refund request cannot be raised for this planning status');
+  }
+
+  const existingStatus = String(planning?.refundRequest?.status || '').trim().toUpperCase();
+  if (
+    existingStatus === REFUND_REQUEST_STATUSES.PENDING_REVIEW
+    || existingStatus === REFUND_REQUEST_STATUSES.APPROVED
+    || existingStatus === REFUND_REQUEST_STATUSES.REFUNDED
+  ) {
+    throw createApiError(409, 'A refund request already exists for this event');
+  }
+
+  const refundPolicy = await getPlanningRefundPolicy();
+  const refundResult = buildPlanningRefundResult(planning, refundPolicy);
+  if (refundResult.grossPaidAmountPaise <= 0) {
+    throw createApiError(409, 'No paid amount was found for this event, refund request cannot be created');
+  }
+
+  const assignee = await pickRevenueOpsAssignee();
+
+  const nextRefundRequest = {
+    status: REFUND_REQUEST_STATUSES.PENDING_REVIEW,
+    requestedByAuthId: normalizedAuthId,
+    requestedAt: new Date(),
+    cancellationReason: normalizedReason || null,
+    assignedManagerId: assignee.id,
+    assignedManagerRole: assignee.assignedRole || 'Revenue Operations Specialist',
+    managerReviewedByAuthId: null,
+    managerReviewedAt: null,
+    managerNotes: null,
+    result: refundResult,
+    refundedAt: null,
+    refundTransactionRef: null,
+    cancellationOps: null,
+  };
+
+  const createResult = await Planning.updateOne(
+    {
+      _id: planning._id,
+      authId: normalizedAuthId,
+      $or: [
+        { refundRequest: null },
+        { refundRequest: { $exists: false } },
+        { 'refundRequest.status': REFUND_REQUEST_STATUSES.REJECTED },
+      ],
+    },
+    {
+      $set: {
+        refundRequest: nextRefundRequest,
+        status: STATUS.CANCELLED,
+      },
+    }
+  );
+
+  if (Number(createResult?.modifiedCount || 0) !== 1) {
+    throw createApiError(409, 'A refund request already exists for this event');
+  }
+
+  const updatedPlanning = await Planning.findById(planning._id).lean();
+  if (!updatedPlanning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  let cancellationOps = {
+    skipped: true,
+    reason: 'Cancellation side-effects were not executed',
+  };
+
+  try {
+    cancellationOps = await handlePlanningCancellationPostActions({
+      planning: updatedPlanning,
+      cancellationReason: normalizedReason,
+      refundTimelineLabel: String(refundResult?.timelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL,
+    });
+  } catch (error) {
+    cancellationOps = {
+      skipped: false,
+      error: error?.message || String(error),
+    };
+    logger.warn('Planning cancellation post-actions failed after status update', {
+      eventId: normalizedEventId,
+      message: cancellationOps.error,
+    });
+  }
+
+  const cancellationOpsRecord = buildPlanningCancellationOpsRecord({
+    ops: cancellationOps,
+    triggeredBy: CANCELLATION_OP_TRIGGERS.AUTOMATIC,
+  });
+
+  try {
+    await Planning.updateOne(
+      { _id: planning._id },
+      {
+        $set: {
+          'refundRequest.cancellationOps': cancellationOpsRecord,
+        },
+      }
+    );
+    if (updatedPlanning?.refundRequest && typeof updatedPlanning.refundRequest === 'object') {
+      updatedPlanning.refundRequest.cancellationOps = cancellationOpsRecord;
+    }
+  } catch (persistError) {
+    logger.warn('Failed to persist cancellation ops summary for planning refund request', {
+      eventId: normalizedEventId,
+      message: persistError?.message || String(persistError),
+    });
+  }
+
+  const cfg = await promoteConfigService.getFees();
+  const normalized = normalizePlanningForApi(updatedPlanning, cfg.platformFee, 'USER');
+  normalized.cancellationOps = cancellationOps;
+  return normalized;
+};
+
+const triggerPlanningCancellationGuestOpsManual = async ({
+  eventId,
+  managerId,
+  managerAuthId,
+  isAdmin = false,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedManagerId = String(managerId || '').trim();
+  const normalizedManagerAuthId = String(managerAuthId || '').trim();
+
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!isAdmin && !normalizedManagerId) throw createApiError(403, 'Manager identity is required');
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+  if (!planning.refundRequest) throw createApiError(404, 'Refund request not found for this event');
+
+  const refundStatus = String(planning?.refundRequest?.status || '').trim().toUpperCase();
+  if (refundStatus === REFUND_REQUEST_STATUSES.REJECTED) {
+    throw createApiError(409, 'Cancellation guest operations are not allowed for rejected refund requests');
+  }
+
+  const planningManagerId = String(planning?.assignedManagerId || '').trim();
+  const refundManagerId = String(planning?.refundRequest?.assignedManagerId || '').trim();
+  const hasManagerAccess = isAdmin
+    || (normalizedManagerId && normalizedManagerId === planningManagerId)
+    || (normalizedManagerId && normalizedManagerId === refundManagerId);
+
+  if (!hasManagerAccess) {
+    throw createApiError(403, 'Only assigned manager, assigned Revenue Ops manager, or admin can trigger cancellation guest operations');
+  }
+
+  const existingOpsStatus = String(planning?.refundRequest?.cancellationOps?.status || '').trim().toUpperCase();
+  if (existingOpsStatus === CANCELLATION_OP_STATUSES.COMPLETED) {
+    const cfg = await promoteConfigService.getFees();
+    const normalizedExisting = normalizePlanningForApi(planning.toJSON(), cfg.platformFee, 'MANAGER');
+    return {
+      planning: normalizedExisting,
+      alreadyCompleted: true,
+    };
+  }
+
+  let cancellationOps = {
+    skipped: true,
+    reason: 'Manual cancellation guest operation did not run',
+  };
+
+  try {
+    cancellationOps = await handlePlanningCancellationPostActions({
+      planning,
+      cancellationReason: planning?.refundRequest?.cancellationReason || null,
+      refundTimelineLabel: String(planning?.refundRequest?.result?.timelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL,
+    });
+  } catch (error) {
+    cancellationOps = {
+      skipped: false,
+      error: error?.message || String(error),
+    };
+  }
+
+  const cancellationOpsRecord = buildPlanningCancellationOpsRecord({
+    ops: cancellationOps,
+    triggeredBy: CANCELLATION_OP_TRIGGERS.MANUAL,
+  });
+
+  planning.refundRequest.cancellationOps = cancellationOpsRecord;
+  if (!planning.refundRequest.managerReviewedByAuthId && normalizedManagerAuthId) {
+    planning.refundRequest.managerReviewedByAuthId = normalizedManagerAuthId;
+  }
+  if (!planning.refundRequest.managerReviewedAt) {
+    planning.refundRequest.managerReviewedAt = new Date();
+  }
+  await planning.save({ validateBeforeSave: false });
+
+  const cfg = await promoteConfigService.getFees();
+  const normalized = normalizePlanningForApi(planning.toJSON(), cfg.platformFee, 'MANAGER');
+  normalized.cancellationOps = cancellationOps;
+  return {
+    planning: normalized,
+    alreadyCompleted: false,
+  };
+};
+
+const getPlanningRefundPolicyForApi = async () => getPlanningRefundPolicy();
+
+const updatePlanningRefundPolicyForApi = async ({
+  slabs,
+  timelineLabel,
+  updatedByAuthId,
+} = {}) => updatePlanningRefundPolicy({
+  slabs,
+  timelineLabel,
+  updatedByAuthId,
+});
+
+/**
+ * Get cancellation refund request for one planning event.
+ */
+const getPlanningRefundRequestByEventId = async ({ eventId } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId }).lean();
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const cfg = await promoteConfigService.getFees();
+  return normalizePlanningForApi(planning, cfg.platformFee);
+};
+
+/**
+ * List planning refund requests for Revenue Operations Specialist managers.
+ */
+const getPlanningRefundRequestsForManager = async ({ managerId, limit = 200, statuses = [] } = {}) => {
+  const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
+  const normalizedManagerId = String(managerId || '').trim();
+
+  const normalizedStatuses = Array.isArray(statuses)
+    ? statuses
+      .map((status) => String(status || '').trim().toUpperCase())
+      .filter(Boolean)
+      .filter((status) => Object.values(REFUND_REQUEST_STATUSES).includes(status))
+    : [];
+
+  const query = {
+    refundRequest: { $ne: null },
+  };
+
+  if (normalizedManagerId) {
+    query['refundRequest.assignedManagerId'] = normalizedManagerId;
+  }
+
+  if (normalizedStatuses.length > 0) {
+    query['refundRequest.status'] = { $in: normalizedStatuses };
+  }
+
+  const selectFields = [
+    'eventId',
+    'eventTitle',
+    'category',
+    'eventType',
+    'eventDate',
+    'schedule',
+    'createdAt',
+    'authId',
+    'assignedManagerId',
+    'status',
+    'platformFee',
+    'platformFeePaid',
+    'depositPaidAmountPaise',
+    'vendorConfirmationPaidAmountPaise',
+    'remainingPaymentPaidAmountPaise',
+    'refundRequest',
+  ].join(' ');
+
+  const plannings = await Planning.find(query)
+    .sort({ 'refundRequest.requestedAt': -1, createdAt: -1 })
+    .limit(safeLimit)
+    .select(selectFields)
+    .lean();
+
+  const cfg = await promoteConfigService.getFees();
+  return (plannings || []).map((planning) => normalizePlanningForApi(planning, cfg.platformFee));
+};
+
+/**
+ * Review and update a planning refund request status.
+ */
+const reviewPlanningRefundRequest = async ({
+  eventId,
+  managerId,
+  managerAuthId,
+  nextStatus,
+  managerNotes = null,
+  refundTransactionRef = null,
+  isAdmin = false,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedManagerId = String(managerId || '').trim();
+  const normalizedManagerAuthId = String(managerAuthId || '').trim();
+  const normalizedNextStatus = String(nextStatus || '').trim().toUpperCase();
+  const normalizedNotes = String(managerNotes || '').trim();
+  const normalizedRefundRef = String(refundTransactionRef || '').trim();
+
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!Object.values(REFUND_REQUEST_STATUSES).includes(normalizedNextStatus)) {
+    throw createApiError(400, 'Invalid refund request status');
+  }
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+  if (!planning.refundRequest) throw createApiError(404, 'Refund request not found');
+
+  const assignedManagerId = String(planning?.refundRequest?.assignedManagerId || '').trim();
+  if (!isAdmin && assignedManagerId && normalizedManagerId && assignedManagerId !== normalizedManagerId) {
+    throw createApiError(403, 'Only assigned Revenue Operations Specialist can review this request');
+  }
+
+  const currentStatus = String(planning?.refundRequest?.status || '').trim().toUpperCase();
+
+  if (currentStatus === REFUND_REQUEST_STATUSES.REFUNDED) {
+    throw createApiError(409, 'Refund request is already finalized');
+  }
+
+  if (
+    currentStatus === REFUND_REQUEST_STATUSES.PENDING_REVIEW
+    && ![
+      REFUND_REQUEST_STATUSES.APPROVED,
+      REFUND_REQUEST_STATUSES.REJECTED,
+      REFUND_REQUEST_STATUSES.REFUNDED,
+    ].includes(normalizedNextStatus)
+  ) {
+    throw createApiError(409, 'Pending requests can only be approved, rejected, or marked refunded');
+  }
+
+  if (
+    currentStatus === REFUND_REQUEST_STATUSES.APPROVED
+    && ![REFUND_REQUEST_STATUSES.REFUNDED, REFUND_REQUEST_STATUSES.REJECTED].includes(normalizedNextStatus)
+  ) {
+    throw createApiError(409, 'Approved requests can only be marked refunded or rejected');
+  }
+
+  planning.refundRequest.status = normalizedNextStatus;
+  planning.refundRequest.managerReviewedByAuthId = normalizedManagerAuthId || null;
+  planning.refundRequest.managerReviewedAt = new Date();
+  planning.refundRequest.managerNotes = normalizedNotes || null;
+
+  if (normalizedNextStatus === REFUND_REQUEST_STATUSES.REFUNDED) {
+    const computedRefundAmountPaise = Math.max(0, Number(planning?.refundRequest?.result?.refundAmountPaise || 0));
+    const hasManualTransactionRef = Boolean(normalizedRefundRef);
+
+    if (!hasManualTransactionRef && computedRefundAmountPaise > 0) {
+      const processed = await processPlanningRefundInOrderService({
+        planning,
+        managerAuthId: normalizedManagerAuthId,
+        managerNotes: normalizedNotes,
+      });
+
+      planning.refundRequest.refundedAt = processed?.refundedAt || new Date();
+      planning.refundRequest.refundTransactionRef = processed?.refundTransactionRef || null;
+    } else {
+      planning.refundRequest.refundedAt = new Date();
+      planning.refundRequest.refundTransactionRef = normalizedRefundRef || null;
+    }
+  }
+
+  await planning.save({ validateBeforeSave: false });
+
+  const cfg = await promoteConfigService.getFees();
+  return normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
 };
 
 /**
@@ -2152,6 +3425,14 @@ module.exports = {
   getAdminDashboard,
   getPlanningsForManager,
   getPlanningApplicationsForManager,
+  getPlanningRefundPolicyForApi,
+  updatePlanningRefundPolicyForApi,
+  createPlanningRefundRequest,
+  getPlanningRefundRequestByEventId,
+  getPlanningRefundRequestsForManager,
+  reviewPlanningRefundRequest,
+  triggerPlanningCancellationGuestOpsManual,
+  resolveRevenueOpsManagerContext,
   updatePlanningDetails,
   updatePlanningReservationDayForOwner,
   addPlanningCoreStaff,

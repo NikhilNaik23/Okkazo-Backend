@@ -17,7 +17,7 @@ const PaymentOrderSchema = new mongoose.Schema(
     },
     orderType: {
       type: String,
-      enum: ['PLANNING EVENT', 'PLANNING EVENT DEPOSIT FEE', 'PLANNING EVENT VENDOR CONFIRMATION FEE', 'PLANNING EVENT REMAINING FEE', 'PROMOTE EVENT', 'TICKET SALE', 'REFUND'],
+      enum: ['PLANNING EVENT', 'PLANNING EVENT DEPOSIT FEE', 'PLANNING EVENT VENDOR CONFIRMATION FEE', 'PLANNING EVENT REMAINING FEE', 'PROMOTE EVENT', 'TICKET SALE', 'REFUND', 'PLANNING_REFUND'],
       required: true,
       index: true,
     },
@@ -82,6 +82,13 @@ const PaymentOrderSchema = new mongoose.Schema(
       type: String,
       trim: true,
       index: true,
+    },
+    refundReasonCode: {
+      type: String,
+      enum: ['CLIENT_CANCELLED', 'VENDOR_UNAVAILABLE', 'OKKAZO_FAILURE', 'FORCE_MAJEURE'],
+      trim: true,
+      index: true,
+      default: null,
     },
     refundReason: {
       type: String,

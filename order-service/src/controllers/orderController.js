@@ -31,6 +31,26 @@ const refundPayment = async (req, res) => {
   });
 };
 
+const refundTicketSalePayment = async (req, res) => {
+  const result = await paymentService.refundTicketSalePayment(req.body, req.user);
+
+  res.status(200).json({
+    success: true,
+    message: 'Ticket sale refund processed successfully',
+    data: result,
+  });
+};
+
+const refundEventTicketSales = async (req, res) => {
+  const result = await paymentService.refundEventTicketSales(req.body, req.user);
+
+  res.status(200).json({
+    success: true,
+    message: 'Grouped ticket refunds processed',
+    data: result,
+  });
+};
+
 const webhook = async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
   const result = await paymentService.handleWebhook(req.body, signature);
@@ -231,6 +251,8 @@ module.exports = {
   createOrder,
   verifyPayment,
   refundPayment,
+  refundTicketSalePayment,
+  refundEventTicketSales,
   webhook,
   getOrderByEventId,
   getOrdersByEventIdForAdmin,

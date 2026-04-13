@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Event Cancelled</title>
+</head>
+<body style="margin: 0; padding: 0; background: #f4f6fb; font-family: Arial, Helvetica, sans-serif; color: #1f2937;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding: 24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width: 620px; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+          <tr>
+            <td style="background: #991b1b; color: #ffffff; padding: 24px;">
+              <h1 style="margin: 0; font-size: 22px; line-height: 1.3;">Event Cancellation Update</h1>
+              <p style="margin: 8px 0 0; font-size: 14px; opacity: 0.95;">This event has been cancelled by the organizer.</p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 24px;">
+              <p style="margin: 0 0 14px; font-size: 15px;">Hi {{recipientName}},</p>
+
+              <p style="margin: 0 0 16px; font-size: 15px; line-height: 1.6;">
+                We regret to inform you that <strong>{{eventTitle}}</strong> has been cancelled.
+                If you purchased any tickets, your refund has been initiated and is typically completed within
+                <strong>{{refundTimelineLabel}}</strong>.
+              </p>
+
+              <div style="margin: 0 0 16px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px;">
+                {{#if eventDate}}
+                <p style="margin: 0 0 6px; font-size: 14px;"><strong>Date:</strong> {{eventDate}}</p>
+                {{/if}}
+                {{#if eventLocation}}
+                <p style="margin: 0; font-size: 14px;"><strong>Location:</strong> {{eventLocation}}</p>
+                {{/if}}
+              </div>
+
+              {{#if cancellationReason}}
+              <div style="margin: 0 0 16px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 10px; padding: 14px;">
+                <p style="margin: 0 0 6px; font-size: 12px; color: #9a3412; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700;">Cancellation Reason</p>
+                <p style="margin: 0; font-size: 14px; color: #7c2d12; line-height: 1.5;">{{cancellationReason}}</p>
+              </div>
+              {{/if}}
+
+              {{#if actionUrl}}
+              <p style="margin: 0 0 20px;">
+                <a href="{{actionUrl}}" style="display: inline-block; background: #0d9488; color: #ffffff; text-decoration: none; font-weight: 700; font-size: 14px; padding: 11px 16px; border-radius: 8px;">View Ticket Dashboard</a>
+              </p>
+              {{/if}}
+
+              <p style="margin: 0; font-size: 13px; color: #6b7280; line-height: 1.6;">
+                Event ID: {{eventId}}<br/>
+                Need help? Contact us at {{supportEmail}}.
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 14px 24px; background: #f9fafb; border-top: 1px solid #e5e7eb;">
+              <p style="margin: 0; font-size: 12px; color: #6b7280;">{{platformName}} Team</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

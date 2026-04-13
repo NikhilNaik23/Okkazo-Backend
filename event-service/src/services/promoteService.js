@@ -6,10 +6,10 @@ const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { PROMOTE_STATUS, ADMIN_DECISION_STATUS } = require('../utils/promoteConstants');
 const { TERMINAL_STATUSES: PLANNING_TERMINAL_STATUSES } = require('../utils/planningConstants');
-const { USER_TICKET_STATUS } = require('../utils/ticketConstants');
+const { USER_TICKET_STATUS, USER_TICKET_VERIFICATION_STATUS } = require('../utils/ticketConstants');
 const promoteConfigService = require('./promoteConfigService');
 const mongoose = require('mongoose');
-const { fetchUserById, fetchActiveManagers } = require('./userServiceClient');
+const { fetchUserById, fetchActiveManagers, fetchUserByAuthId } = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
 const { publishEvent } = require('../kafka/eventProducer');
 
@@ -17,6 +17,10 @@ const defaultOrderServiceUrl = process.env.SERVICE_HOST
   ? 'http://order-service:8087'
   : 'http://localhost:8087';
 const orderServiceUrl = process.env.ORDER_SERVICE_URL || defaultOrderServiceUrl;
+const notificationServiceUrl = (
+  process.env.NOTIFICATION_SERVICE_URL
+  || (process.env.SERVICE_HOST ? 'http://notification-service:8088' : 'http://localhost:8088')
+).replace(/\/$/, '');
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
 
 const buildInternalOrderServiceHeaders = () => ({
@@ -27,11 +31,82 @@ const buildInternalOrderServiceHeaders = () => ({
   'x-user-role': 'MANAGER',
 });
 
+const DEFAULT_REFUND_TIMELINE_LABEL = '5-7 working days';
+const PROMOTE_REFUND_REQUEST_STATUSES = {
+  PENDING_REVIEW: 'PENDING_REVIEW',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+  REFUNDED: 'REFUNDED',
+};
+
+const PROMOTE_REFUND_REASON_CODES = new Set([
+  'CLIENT_CANCELLED',
+  'VENDOR_UNAVAILABLE',
+  'OKKAZO_FAILURE',
+  'FORCE_MAJEURE',
+]);
+
+const PROMOTE_REFUND_SCENARIO_CODES = {
+  WITHIN_24_HOURS: 'WITHIN_24_HOURS',
+  BEFORE_TICKET_SALES: 'BEFORE_TICKET_SALES',
+  AFTER_TICKET_SALES: 'AFTER_TICKET_SALES',
+  OKKAZO_FAILURE: 'OKKAZO_FAILURE',
+};
+
+const PROMOTE_REFUND_SCENARIO_LABELS = {
+  [PROMOTE_REFUND_SCENARIO_CODES.WITHIN_24_HOURS]: 'Cancellation within 24 hours',
+  [PROMOTE_REFUND_SCENARIO_CODES.BEFORE_TICKET_SALES]: 'Cancellation before ticket sales',
+  [PROMOTE_REFUND_SCENARIO_CODES.AFTER_TICKET_SALES]: 'Cancellation after ticket sales',
+  [PROMOTE_REFUND_SCENARIO_CODES.OKKAZO_FAILURE]: 'Cancellation due to Okkazo failure',
+};
+
+const PROMOTE_LIABILITY_ORDER_PURPOSE = 'PROMOTE_LIABILITY_RECOVERY';
+
+const REVENUE_OPS_ASSIGNED_ROLES = new Set([
+  'REVENUE OPERATIONS SPECIALIST',
+  'REVENUE OPERATION SPECIALIST',
+  'REVENUE OPERATIONS SPECIALISTS',
+  'REVENUE OPERATION SPECIALISTS',
+]);
+
+const resolveFrontendBaseUrl = () => {
+  const fromEnv = String(process.env.FRONTEND_URL || process.env.FRONTEND_URL_FALLBACK || '').trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, '');
+  return 'http://localhost:5173';
+};
+
+const buildSystemNotificationHeaders = () => {
+  const authId = process.env.EVENT_SERVICE_SYSTEM_AUTH_ID || 'system:event-service';
+  return {
+    'x-auth-id': authId,
+    'x-user-id': authId,
+    'x-user-email': 'system@okkazo.local',
+    'x-user-username': 'event-service',
+    'x-user-role': 'ADMIN',
+  };
+};
+
+let promoteRefundRoundRobinCursor = 0;
+
 const normalizeId = (value) => String(value || '').trim();
 
 const REQUIRED_PROMOTE_MANAGER_DEPARTMENT = 'Public Event';
 
 const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const normalizeRoleToken = (value) => String(value || '')
+  .trim()
+  .toUpperCase()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ');
+
+const isRevenueOpsAssignedRole = (assignedRole) => REVENUE_OPS_ASSIGNED_ROLES.has(normalizeRoleToken(assignedRole));
+
+const normalizePromoteRefundReasonCode = (value) => {
+  const code = String(value || '').trim().toUpperCase();
+  if (!PROMOTE_REFUND_REASON_CODES.has(code)) return 'CLIENT_CANCELLED';
+  return code;
+};
 
 const normalizePromotionToken = (value) => String(value || '')
   .trim()
@@ -93,6 +168,22 @@ const toNonNegativeNumber = (value) => {
   const n = Number(value || 0);
   if (!Number.isFinite(n) || n < 0) return 0;
   return n;
+};
+
+const isPromoteAdminApproved = (promote) => {
+  return String(promote?.adminDecision?.status || '').trim().toUpperCase() === ADMIN_DECISION_STATUS.APPROVED;
+};
+
+const hasTicketAvailabilityStartedBy = (promote, at = new Date()) => {
+  const ticketStart = promote?.ticketAvailability?.startAt ? new Date(promote.ticketAvailability.startAt) : null;
+  if (!ticketStart || Number.isNaN(ticketStart.getTime())) return false;
+
+  const atDate = at instanceof Date && !Number.isNaN(at.getTime()) ? at : new Date();
+  return atDate.getTime() >= ticketStart.getTime();
+};
+
+const isPromoteLiabilityApplicableForCancellation = ({ promote, cancelledAt = new Date() } = {}) => {
+  return isPromoteAdminApproved(promote) && hasTicketAvailabilityStartedBy(promote, cancelledAt);
 };
 
 const buildPromoteTicketSalesStats = async (promote, feesConfig = {}) => {
@@ -206,6 +297,707 @@ const buildPromoteTicketSalesStats = async (promote, feesConfig = {}) => {
     netPnlInr,
     currency: 'INR',
   };
+};
+
+const getPromoteGuestTicketRecipients = async ({ eventId } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  const rows = await UserEventTicket.find({
+    eventId: normalizedEventId,
+    eventSource: 'promote',
+    ticketStatus: USER_TICKET_STATUS.SUCCESS,
+  })
+    .select('userAuthId')
+    .lean();
+
+  return Array.from(
+    new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map((row) => String(row?.userAuthId || '').trim())
+        .filter(Boolean)
+    )
+  );
+};
+
+const sendPromoteGuestCancellationNotifications = async ({
+  promote,
+  recipientAuthIds = [],
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+} = {}) => {
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (normalizedRecipients.length === 0) {
+    return {
+      targetedGuests: 0,
+      delivered: 0,
+      failed: 0,
+      failedRecipients: [],
+    };
+  }
+
+  const normalizedEventId = String(promote?.eventId || '').trim();
+  const eventTitle = String(promote?.eventTitle || '').trim() || `Event ${normalizedEventId}`;
+  const actionUrl = `${resolveFrontendBaseUrl()}/user/ticket-management`;
+  const title = `Event Cancelled & Refunded: ${eventTitle}`;
+  const message = [
+    `The event "${eventTitle}" has been cancelled by the organizer.`,
+    `Your ticket refund has been initiated and is usually processed within ${refundTimelineLabel}.`,
+  ].join(' ');
+
+  const headers = buildSystemNotificationHeaders();
+  const requests = normalizedRecipients.map((recipientAuthId) => axios.post(
+    `${notificationServiceUrl}/system/send-to-user`,
+    {
+      recipientAuthId,
+      recipientRole: 'USER',
+      title,
+      message,
+      actionUrl,
+      category: 'EVENT',
+      type: 'EVENT_CANCELLED',
+      metadata: {
+        eventId: normalizedEventId,
+        eventType: 'promote',
+        eventTitle,
+        source: 'event-service:promote-refund',
+      },
+    },
+    {
+      headers,
+      timeout: 10_000,
+    }
+  ));
+
+  const settled = await Promise.allSettled(requests);
+  const failedRecipients = [];
+
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') return;
+    const failedRecipient = normalizedRecipients[index];
+    if (failedRecipient) failedRecipients.push(failedRecipient);
+
+    logger.warn('Failed to send promote cancellation notification to guest', {
+      eventId: normalizedEventId,
+      recipientAuthId: failedRecipient || null,
+      message: result?.reason?.response?.data?.message || result?.reason?.message,
+    });
+  });
+
+  return {
+    targetedGuests: normalizedRecipients.length,
+    delivered: normalizedRecipients.length - failedRecipients.length,
+    failed: failedRecipients.length,
+    failedRecipients,
+  };
+};
+
+const publishPromoteGuestCancellationEmailEvent = async ({
+  promote,
+  recipientAuthIds = [],
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+  cancellationReason = null,
+} = {}) => {
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (normalizedRecipients.length === 0) {
+    return {
+      queued: false,
+      queuedRecipients: 0,
+    };
+  }
+
+  const eventId = String(promote?.eventId || '').trim();
+  const eventTitle = String(promote?.eventTitle || '').trim() || `Event ${eventId}`;
+  const eventDate = promote?.schedule?.startAt || null;
+  const eventLocation = String(promote?.venue?.locationName || '').trim() || null;
+
+  try {
+    await publishEvent('PLANNING_EVENT_CANCELLED_FOR_GUESTS', {
+      eventId,
+      eventType: 'promote',
+      eventTitle,
+      eventDate,
+      eventLocation,
+      cancellationReason: String(cancellationReason || '').trim() || null,
+      refundTimelineLabel: String(refundTimelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL,
+      recipientAuthIds: normalizedRecipients,
+      actionUrl: `${resolveFrontendBaseUrl()}/user/ticket-management`,
+      cancelledAt: new Date().toISOString(),
+      source: 'promote-refund-request',
+    });
+
+    return {
+      queued: true,
+      queuedRecipients: normalizedRecipients.length,
+    };
+  } catch (error) {
+    logger.warn('Failed to queue promote cancellation guest email event', {
+      eventId,
+      recipients: normalizedRecipients.length,
+      message: error?.message || String(error),
+    });
+
+    return {
+      queued: false,
+      queuedRecipients: 0,
+      error: error?.message || String(error),
+    };
+  }
+};
+
+const fetchOrdersForEventFromOrderService = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  try {
+    const response = await axios.get(
+      `${orderServiceUrl}/orders/admin/${encodeURIComponent(normalizedEventId)}`,
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    const rows = response?.data?.data?.orders;
+    return Array.isArray(rows) ? rows : [];
+  } catch (error) {
+    logger.warn('Unable to fetch payment orders from order-service while building promote refund result', {
+      eventId: normalizedEventId,
+      message: error?.response?.data?.message || error?.message || String(error),
+    });
+    return [];
+  }
+};
+
+const resolvePromotePaymentSummary = ({ orders = [], promote } = {}) => {
+  const normalizedOrders = Array.isArray(orders) ? orders : [];
+
+  const promotePaymentOrder = normalizedOrders.find((row) => {
+    const orderType = String(row?.orderType || '').trim().toUpperCase();
+    const status = String(row?.status || '').trim().toUpperCase();
+    return orderType === 'PROMOTE EVENT' && (status === 'PAID' || status === 'REFUNDED');
+  }) || null;
+
+  const rawPromotionUsedPaise = Number(promotePaymentOrder?.amount || 0);
+  const promotionUsedAmountPaise = Number.isFinite(rawPromotionUsedPaise) && rawPromotionUsedPaise > 0
+    ? Math.round(rawPromotionUsedPaise)
+    : 0;
+
+  const paidAtCandidate = promotePaymentOrder?.paidAt
+    || promotePaymentOrder?.createdAt
+    || promote?.createdAt
+    || null;
+  const paidAt = paidAtCandidate ? new Date(paidAtCandidate) : null;
+
+  return {
+    paymentOrder: promotePaymentOrder,
+    promotionUsedAmountPaise,
+    paidAt: paidAt && !Number.isNaN(paidAt.getTime()) ? paidAt : null,
+  };
+};
+
+const determinePromoteRefundScenarioCode = ({
+  reasonCode,
+  within24Hours,
+  ticketsSold,
+} = {}) => {
+  if (String(reasonCode || '').trim().toUpperCase() === 'OKKAZO_FAILURE') {
+    return PROMOTE_REFUND_SCENARIO_CODES.OKKAZO_FAILURE;
+  }
+
+  if (Number(ticketsSold || 0) > 0) {
+    return PROMOTE_REFUND_SCENARIO_CODES.AFTER_TICKET_SALES;
+  }
+
+  if (Boolean(within24Hours)) {
+    return PROMOTE_REFUND_SCENARIO_CODES.WITHIN_24_HOURS;
+  }
+
+  return PROMOTE_REFUND_SCENARIO_CODES.BEFORE_TICKET_SALES;
+};
+
+const buildPromoteRefundResult = ({
+  promote,
+  reasonCode = 'CLIENT_CANCELLED',
+  salesStats,
+  promotionUsedAmountPaise = 0,
+  paymentPaidAt = null,
+  now = new Date(),
+} = {}) => {
+  const normalizedSalesStats = salesStats && typeof salesStats === 'object' ? salesStats : {};
+  const grossRevenueInr = Number(normalizedSalesStats?.grossRevenueInr || 0);
+  const grossRevenuePaise = Number.isFinite(grossRevenueInr) && grossRevenueInr > 0
+    ? Math.round(grossRevenueInr * 100)
+    : 0;
+
+  const platformFeePercent = 2.5;
+  const platformFeeAmountPaise = Math.max(0, Math.round(grossRevenuePaise * (platformFeePercent / 100)));
+  const normalizedPromotionUsedPaise = Math.max(0, Math.round(Number(promotionUsedAmountPaise || 0)));
+
+  const ticketsSold = Math.max(0, Number(normalizedSalesStats?.ticketsSold || 0));
+  const ticketStart = promote?.ticketAvailability?.startAt ? new Date(promote.ticketAvailability.startAt) : null;
+  const ticketSalesStarted = Boolean(ticketsSold > 0)
+    || (ticketStart && !Number.isNaN(ticketStart.getTime()) ? now.getTime() >= ticketStart.getTime() : false);
+
+  const paidAt = paymentPaidAt instanceof Date && !Number.isNaN(paymentPaidAt.getTime())
+    ? paymentPaidAt
+    : (promote?.createdAt ? new Date(promote.createdAt) : null);
+  const within24Hours = paidAt && !Number.isNaN(paidAt.getTime())
+    ? (now.getTime() - paidAt.getTime()) <= 24 * 60 * 60 * 1000
+    : false;
+
+  const normalizedReasonCode = normalizePromoteRefundReasonCode(reasonCode);
+  const scenarioCode = determinePromoteRefundScenarioCode({
+    reasonCode: normalizedReasonCode,
+    within24Hours,
+    ticketsSold,
+  });
+  const scenarioLabel = PROMOTE_REFUND_SCENARIO_LABELS[scenarioCode] || scenarioCode;
+
+  let userRefundAmountPaise = 0;
+  if (
+    scenarioCode === PROMOTE_REFUND_SCENARIO_CODES.WITHIN_24_HOURS
+    || scenarioCode === PROMOTE_REFUND_SCENARIO_CODES.BEFORE_TICKET_SALES
+    || scenarioCode === PROMOTE_REFUND_SCENARIO_CODES.OKKAZO_FAILURE
+  ) {
+    userRefundAmountPaise = normalizedPromotionUsedPaise;
+  }
+
+  const totalFeesInr = toNonNegativeNumber(
+    salesStats?.totalFeesInr
+    ?? (toNonNegativeNumber(salesStats?.platformFeeInr) + toNonNegativeNumber(salesStats?.serviceChargeInr))
+  );
+  const totalFeesPaise = Math.round(totalFeesInr * 100);
+
+  const liabilityApplicable = isPromoteLiabilityApplicableForCancellation({
+    promote,
+    cancelledAt: now,
+  });
+
+  let promoterLiabilityAmountPaise = liabilityApplicable && ticketsSold > 0 ? totalFeesPaise : 0;
+  let platformLiabilityAmountPaise = 0;
+
+  if (scenarioCode === PROMOTE_REFUND_SCENARIO_CODES.OKKAZO_FAILURE) {
+    promoterLiabilityAmountPaise = 0;
+    platformLiabilityAmountPaise = userRefundAmountPaise + grossRevenuePaise + totalFeesPaise;
+  }
+
+  return {
+    scenarioCode,
+    scenarioLabel,
+    reasonCode: normalizedReasonCode,
+    ticketsSold,
+    ticketSalesStarted,
+    within24Hours,
+    grossRevenuePaise,
+    platformFeePercent,
+    platformFeeAmountPaise,
+    promotionUsedAmountPaise: normalizedPromotionUsedPaise,
+    grossPaidAmountPaise: userRefundAmountPaise,
+    refundAmountPaise: userRefundAmountPaise,
+    deductionAmountPaise: Math.max(0, normalizedPromotionUsedPaise - userRefundAmountPaise),
+    deductionPercent: normalizedPromotionUsedPaise > 0
+      ? Number((((normalizedPromotionUsedPaise - userRefundAmountPaise) / normalizedPromotionUsedPaise) * 100).toFixed(2))
+      : 0,
+    userRefundAmountPaise,
+    promoterLiabilityAmountPaise,
+    platformLiabilityAmountPaise,
+    timelineLabel: DEFAULT_REFUND_TIMELINE_LABEL,
+    currency: 'INR',
+  };
+};
+
+const pickRevenueOpsAssignee = async () => {
+  const managers = await fetchActiveManagers({ limit: 1000 });
+  const eligibleManagers = (Array.isArray(managers) ? managers : [])
+    .filter((manager) => normalizeLoose(manager?.role) === 'manager')
+    .filter((manager) => manager?.isActive !== false)
+    .filter((manager) => isRevenueOpsAssignedRole(manager?.assignedRole))
+    .map((manager) => ({
+      id: String(manager?._id || manager?.id || '').trim(),
+      authId: String(manager?.authId || '').trim(),
+      assignedRole: String(manager?.assignedRole || '').trim(),
+      name: String(manager?.name || manager?.fullName || manager?.username || '').trim(),
+    }))
+    .filter((manager) => manager.id);
+
+  if (eligibleManagers.length === 0) {
+    throw createApiError(409, 'No active Revenue Operations Specialist is available right now');
+  }
+
+  const rankedManagers = [...eligibleManagers].sort((a, b) => {
+    const nameCmp = String(a.name || '').localeCompare(String(b.name || ''));
+    if (nameCmp !== 0) return nameCmp;
+    return a.id.localeCompare(b.id);
+  });
+
+  const selectedIndex = promoteRefundRoundRobinCursor % rankedManagers.length;
+  promoteRefundRoundRobinCursor = (selectedIndex + 1) % rankedManagers.length;
+  return rankedManagers[selectedIndex];
+};
+
+const resolveRevenueOpsManagerContext = async ({ authId, role }) => {
+  const normalizedRole = String(role || '').trim().toUpperCase();
+  if (normalizedRole === 'ADMIN') {
+    return {
+      isAdmin: true,
+      managerId: null,
+      authId: String(authId || '').trim() || null,
+      assignedRole: 'ADMIN',
+    };
+  }
+
+  if (normalizedRole !== 'MANAGER') {
+    throw createApiError(403, 'Only manager or admin users can access refund requests');
+  }
+
+  const normalizedAuthId = String(authId || '').trim();
+  if (!normalizedAuthId) {
+    throw createApiError(401, 'Manager authentication information missing');
+  }
+
+  const user = await fetchUserByAuthId(normalizedAuthId);
+  if (!user) {
+    throw createApiError(404, 'Manager profile not found');
+  }
+
+  const managerId = String(user?._id || user?.id || '').trim();
+  if (!managerId) {
+    throw createApiError(404, 'Manager profile not found');
+  }
+
+  if (!isRevenueOpsAssignedRole(user?.assignedRole)) {
+    throw createApiError(403, 'Only Revenue Operations Specialist managers can access refund requests');
+  }
+
+  return {
+    isAdmin: false,
+    managerId,
+    authId: normalizedAuthId,
+    assignedRole: String(user?.assignedRole || '').trim() || null,
+  };
+};
+
+const processPromoteGuestTicketBulkRefund = async ({
+  eventId,
+  recipientAuthIds = [],
+  reasonCode = 'CLIENT_CANCELLED',
+  managerAuthId = null,
+  managerNotes = null,
+  scenarioCode = null,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedRecipients = Array.isArray(recipientAuthIds)
+    ? recipientAuthIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+
+  if (!normalizedEventId) {
+    return {
+      skipped: true,
+      reason: 'Missing event id for ticket refund',
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: 0,
+    };
+  }
+
+  const payload = {
+    eventId: normalizedEventId,
+    reasonCode: normalizePromoteRefundReasonCode(reasonCode),
+    notes: {
+      source: 'promote-cancellation-auto-bulk-refund',
+      managerAuthId: String(managerAuthId || '').trim() || null,
+      managerNotes: String(managerNotes || '').trim() || null,
+      scenarioCode: String(scenarioCode || '').trim() || null,
+    },
+  };
+
+  if (normalizedRecipients.length > 0) {
+    payload.authIds = normalizedRecipients;
+  }
+
+  try {
+    const response = await axios.post(
+      `${orderServiceUrl}/orders/refund/event-ticket-sales`,
+      payload,
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    return response?.data?.data || {
+      skipped: false,
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: 0,
+    };
+  } catch (error) {
+    const message = String(error?.response?.data?.message || error?.message || 'Failed to trigger promote bulk ticket refund');
+    return {
+      skipped: false,
+      totalOrders: 0,
+      refundedCount: 0,
+      failedCount: Math.max(1, normalizedRecipients.length),
+      error: message,
+    };
+  }
+};
+
+const processPromoteOwnerRefund = async ({
+  eventId,
+  ownerAuthId,
+  refundAmountPaise,
+  reasonCode = 'CLIENT_CANCELLED',
+  initiatedByAuthId = null,
+  managerNotes = null,
+  scenarioCode = null,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedOwnerAuthId = String(ownerAuthId || '').trim();
+  const normalizedReasonCode = normalizePromoteRefundReasonCode(reasonCode);
+
+  if (!normalizedEventId || !normalizedOwnerAuthId) {
+    return {
+      skipped: true,
+      reason: 'Missing owner refund identifiers',
+      refundedAmount: 0,
+      refundId: null,
+      transactionId: null,
+      refundedAt: null,
+    };
+  }
+
+  const amountPaise = Math.max(0, Math.round(Number(refundAmountPaise || 0)));
+  if (amountPaise <= 0) {
+    return {
+      skipped: true,
+      reason: 'Owner refund amount is zero',
+      refundedAmount: 0,
+      refundId: null,
+      transactionId: null,
+      refundedAt: null,
+    };
+  }
+
+  try {
+    const response = await axios.post(
+      `${orderServiceUrl}/orders/refund`,
+      {
+        eventId: normalizedEventId,
+        authId: normalizedOwnerAuthId,
+        amount: Number((amountPaise / 100).toFixed(2)),
+        reasonCode: normalizedReasonCode,
+        notes: {
+          source: 'promote-cancellation-owner-refund',
+          initiatedByAuthId: String(initiatedByAuthId || '').trim() || null,
+          managerNotes: String(managerNotes || '').trim() || null,
+          scenarioCode: String(scenarioCode || '').trim() || null,
+        },
+      },
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    const payload = response?.data?.data || {};
+    return {
+      skipped: false,
+      refundedAmount: Math.max(0, Number(payload?.refundedAmount || 0)),
+      refundId: String(payload?.refundId || '').trim() || null,
+      transactionId: String(payload?.transactionId || '').trim() || null,
+      refundedAt: payload?.refundedAt || null,
+    };
+  } catch (error) {
+    const message = String(error?.response?.data?.message || error?.message || 'Failed to process owner refund');
+    return {
+      skipped: false,
+      refundedAmount: 0,
+      refundId: null,
+      transactionId: null,
+      refundedAt: null,
+      error: message,
+    };
+  }
+};
+
+const toPaiseFromInr = (value) => {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  return Math.round(amount * 100);
+};
+
+const resolvePromoteLiabilityAmountPaise = ({ promote, fallbackSalesStats = null } = {}) => {
+  const reasonCode = normalizePromoteRefundReasonCode(promote?.refundRequest?.reasonCode);
+  if (reasonCode === 'OKKAZO_FAILURE') return 0;
+
+  const requestedAtRaw = promote?.refundRequest?.requestedAt;
+  const requestedAt = requestedAtRaw ? new Date(requestedAtRaw) : new Date();
+  if (!isPromoteLiabilityApplicableForCancellation({ promote, cancelledAt: requestedAt })) {
+    return 0;
+  }
+
+  const hasResultLiabilityField = Boolean(
+    promote?.refundRequest?.result
+    && Object.prototype.hasOwnProperty.call(promote.refundRequest.result, 'promoterLiabilityAmountPaise')
+  );
+  if (hasResultLiabilityField) {
+    return Math.max(0, Number(promote?.refundRequest?.result?.promoterLiabilityAmountPaise || 0));
+  }
+
+  const ticketSalesStats = fallbackSalesStats || promote?.ticketSalesStats || null;
+  const ticketsSold = toNonNegativeNumber(ticketSalesStats?.ticketsSold);
+  if (ticketsSold <= 0) return 0;
+
+  const totalFeesInr = toNonNegativeNumber(
+    ticketSalesStats?.totalFeesInr
+    ?? (toNonNegativeNumber(ticketSalesStats?.platformFeeInr) + toNonNegativeNumber(ticketSalesStats?.serviceChargeInr))
+  );
+  return toPaiseFromInr(totalFeesInr);
+};
+
+const processPromoteLiabilityRecoveryOrder = async ({
+  eventId,
+  ownerAuthId,
+  amountPaise,
+  initiatedByAuthId = null,
+  reasonCode = 'CLIENT_CANCELLED',
+  scenarioCode = null,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedOwnerAuthId = String(ownerAuthId || '').trim();
+  const normalizedReasonCode = normalizePromoteRefundReasonCode(reasonCode);
+  const recoveryAmountPaise = Math.max(0, Math.round(Number(amountPaise || 0)));
+
+  if (!normalizedEventId || !normalizedOwnerAuthId) {
+    return {
+      skipped: true,
+      reason: 'Missing liability recovery identifiers',
+      amountPaise: 0,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      keyId: null,
+      currency: 'INR',
+    };
+  }
+
+  if (recoveryAmountPaise <= 0) {
+    return {
+      skipped: true,
+      reason: 'Liability recovery amount is zero',
+      amountPaise: 0,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      keyId: null,
+      currency: 'INR',
+    };
+  }
+
+  try {
+    const response = await axios.post(
+      `${orderServiceUrl}/orders/create`,
+      {
+        eventId: normalizedEventId,
+        authId: normalizedOwnerAuthId,
+        orderType: 'PROMOTE EVENT',
+        amount: Number((recoveryAmountPaise / 100).toFixed(2)),
+        currency: 'INR',
+        notes: {
+          source: 'promote-cancellation-liability-recovery',
+          orderPurpose: PROMOTE_LIABILITY_ORDER_PURPOSE,
+          liabilityRecovery: true,
+          initiatedByAuthId: String(initiatedByAuthId || '').trim() || null,
+          reasonCode: normalizedReasonCode,
+          scenarioCode: String(scenarioCode || '').trim() || null,
+        },
+      },
+      {
+        timeout: upstreamTimeoutMs,
+        headers: buildInternalOrderServiceHeaders(),
+      }
+    );
+
+    const payload = response?.data?.data || {};
+    return {
+      skipped: false,
+      amountPaise: Math.max(0, Number(payload?.amount || recoveryAmountPaise)),
+      paymentOrderId: String(payload?.orderId || '').trim() || null,
+      razorpayOrderId: String(payload?.razorpayOrderId || '').trim() || null,
+      transactionId: String(payload?.transactionId || '').trim() || null,
+      keyId: String(payload?.keyId || '').trim() || null,
+      currency: String(payload?.currency || 'INR').trim() || 'INR',
+    };
+  } catch (error) {
+    return {
+      skipped: false,
+      amountPaise: recoveryAmountPaise,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      keyId: null,
+      currency: 'INR',
+      error: String(error?.response?.data?.message || error?.message || 'Failed to create liability recovery order'),
+    };
+  }
+};
+
+const sendPromoteOwnerLiabilityRecoveryNotification = async ({
+  promote,
+  ownerAuthId,
+  amountPaise,
+} = {}) => {
+  const normalizedOwnerAuthId = String(ownerAuthId || '').trim();
+  const eventId = String(promote?.eventId || '').trim();
+  if (!normalizedOwnerAuthId || !eventId) {
+    return { sent: false, reason: 'Missing liability notification context' };
+  }
+
+  const title = String(promote?.eventTitle || '').trim() || `Event ${eventId}`;
+  const amountInr = Number((Math.max(0, Number(amountPaise || 0)) / 100).toFixed(2));
+  const actionUrl = `${resolveFrontendBaseUrl()}/user/event-management`;
+
+  try {
+    await axios.post(
+      `${notificationServiceUrl}/system/send-to-user`,
+      {
+        recipientAuthId: normalizedOwnerAuthId,
+        recipientRole: 'USER',
+        title: `Liability Payment Required: ${title}`,
+        message: `Your event was cancelled and guest refunds were processed. Please pay the liability amount of INR ${amountInr.toFixed(2)} to settle platform fees.`,
+        actionUrl,
+        category: 'EVENT',
+        type: 'LIABILITY_RECOVERY',
+        metadata: {
+          eventId,
+          eventType: 'promote',
+          amountPaise: Math.max(0, Number(amountPaise || 0)),
+          source: 'event-service:promote-liability-recovery',
+        },
+      },
+      {
+        headers: buildSystemNotificationHeaders(),
+        timeout: 10_000,
+      }
+    );
+
+    return { sent: true };
+  } catch (error) {
+    logger.warn('Failed to send promote liability recovery notification to owner', {
+      eventId,
+      ownerAuthId: normalizedOwnerAuthId,
+      message: error?.response?.data?.message || error?.message || String(error),
+    });
+
+    return { sent: false, error: error?.message || String(error) };
+  }
 };
 
 let immediateAutoAssignCursor = 0;
@@ -326,7 +1118,7 @@ const assertManagerAvailable = async ({ managerId, eventIdToExclude } = {}) => {
 
   const activeAssignmentQuery = {
     assignedManagerId: normalizedManagerId,
-    eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+    eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
     'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
   };
   if (eventIdToExclude) {
@@ -534,7 +1326,7 @@ const addPromoteCoreStaff = async ({ eventId, staffId, actorRole, actorManagerId
   const [conflictPromote, conflictPlanning] = await Promise.all([
     Promote.findOne({
       eventId: { $ne: trimmedEventId },
-      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
       $or: [
         { assignedManagerId: trimmedStaffId },
@@ -637,6 +1429,19 @@ const releasePromoteGeneratedRevenuePayout = async ({ eventId, actorRole, actorA
   const promote = await Promote.findOne({ eventId: trimmedEventId });
   if (!promote) throw createApiError(404, 'Promote record not found');
   const ownerAuthId = String(promote.authId || '').trim();
+
+  const promoteEventStatus = String(promote?.eventStatus || '').trim().toUpperCase();
+  const promoteRefundStatus = String(promote?.refundRequest?.status || '').trim().toUpperCase();
+  const cancelledStatuses = new Set(['CANCELLED', 'CANCELED', 'REFUNDED']);
+  const refundBlockedStatuses = new Set([
+    PROMOTE_REFUND_REQUEST_STATUSES.PENDING_REVIEW,
+    PROMOTE_REFUND_REQUEST_STATUSES.APPROVED,
+    PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+  ]);
+
+  if (cancelledStatuses.has(promoteEventStatus) || refundBlockedStatuses.has(promoteRefundStatus)) {
+    throw createApiError(409, 'Generated revenue payout is disabled for cancelled promote events. Collect platform liability from the event creator.');
+  }
 
   if (normalizedRole === 'MANAGER') {
     const normalizedActorManagerId = String(actorManagerId || '').trim();
@@ -758,6 +1563,205 @@ const releasePromoteGeneratedRevenuePayout = async ({ eventId, actorRole, actorA
       alreadyProcessed: false,
     },
   };
+};
+
+const recoverPromoteCancellationLiability = async ({ eventId, actorRole, actorAuthId, actorManagerId } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  if (!['MANAGER', 'ADMIN'].includes(normalizedRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can recover promote cancellation liability');
+  }
+
+  const promote = await Promote.findOne({ eventId: trimmedEventId });
+  if (!promote) throw createApiError(404, 'Promote record not found');
+  if (!promote.refundRequest) {
+    throw createApiError(409, 'Cancellation refund request not found for this promote event');
+  }
+
+  if (normalizedRole === 'MANAGER') {
+    const normalizedActorManagerId = String(actorManagerId || '').trim();
+    if (!normalizedActorManagerId) throw createApiError(403, 'Manager identity is required');
+    if (String(promote.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+      throw createApiError(403, 'You are not assigned to this event');
+    }
+  }
+
+  const promoteEventStatus = String(promote?.eventStatus || '').trim().toUpperCase();
+  const promoteRefundStatus = String(promote?.refundRequest?.status || '').trim().toUpperCase();
+  const cancelledStatuses = new Set(['CANCELLED', 'CANCELED', 'REFUNDED']);
+  const refundRelevantStatuses = new Set([
+    PROMOTE_REFUND_REQUEST_STATUSES.PENDING_REVIEW,
+    PROMOTE_REFUND_REQUEST_STATUSES.APPROVED,
+    PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+  ]);
+
+  if (!cancelledStatuses.has(promoteEventStatus) && !refundRelevantStatuses.has(promoteRefundStatus)) {
+    throw createApiError(409, 'Liability recovery is available only for cancelled promote events');
+  }
+
+  const existingRecovery = promote?.refundRequest?.liabilityRecovery || null;
+  const existingStatus = String(existingRecovery?.status || '').trim().toUpperCase();
+  if (existingStatus === 'PAID') {
+    const existing = await getPromoteByEventId(trimmedEventId);
+    return {
+      ...existing,
+      liabilityRecoverySummary: {
+        alreadyRecovered: true,
+      },
+    };
+  }
+
+  if (existingStatus === 'PENDING_PAYMENT' && String(existingRecovery?.paymentOrderId || '').trim()) {
+    const existing = await getPromoteByEventId(trimmedEventId);
+    return {
+      ...existing,
+      liabilityRecoverySummary: {
+        alreadyPending: true,
+      },
+    };
+  }
+
+  const feesConfig = await promoteConfigService.getFees();
+  const salesStats = await buildPromoteTicketSalesStats(promote.toJSON(), feesConfig);
+  const liabilityAmountPaise = resolvePromoteLiabilityAmountPaise({
+    promote,
+    fallbackSalesStats: salesStats,
+  });
+
+  if (liabilityAmountPaise <= 0) {
+    promote.refundRequest = promote.refundRequest || {};
+    promote.refundRequest.liabilityRecovery = {
+      status: 'NOT_REQUIRED',
+      amountPaise: 0,
+      currency: 'INR',
+      ownerAuthId: String(promote?.authId || '').trim() || null,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      initiatedByAuthId: String(actorAuthId || '').trim() || null,
+      initiatedAt: new Date(),
+      paidAt: null,
+      lastError: null,
+    };
+    await promote.save({ validateBeforeSave: false });
+
+    const updatedNoRecovery = await getPromoteByEventId(trimmedEventId);
+    return {
+      ...updatedNoRecovery,
+      liabilityRecoverySummary: {
+        alreadyRecovered: false,
+        alreadyPending: false,
+        notRequired: true,
+      },
+    };
+  }
+
+  const reasonCode = normalizePromoteRefundReasonCode(promote?.refundRequest?.reasonCode);
+  const scenarioCode = String(promote?.refundRequest?.result?.scenarioCode || '').trim() || null;
+  const ownerAuthId = String(promote?.authId || '').trim();
+  const initiatedByAuthId = String(actorAuthId || '').trim() || null;
+
+  const liabilityOrder = await processPromoteLiabilityRecoveryOrder({
+    eventId: trimmedEventId,
+    ownerAuthId,
+    amountPaise: liabilityAmountPaise,
+    initiatedByAuthId,
+    reasonCode,
+    scenarioCode,
+  });
+
+  promote.refundRequest = promote.refundRequest || {};
+  if (liabilityOrder?.error) {
+    promote.refundRequest.liabilityRecovery = {
+      status: 'FAILED',
+      amountPaise: liabilityAmountPaise,
+      currency: liabilityOrder?.currency || 'INR',
+      ownerAuthId: ownerAuthId || null,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      initiatedByAuthId,
+      initiatedAt: new Date(),
+      paidAt: null,
+      lastError: liabilityOrder.error,
+    };
+    await promote.save({ validateBeforeSave: false });
+    throw createApiError(502, liabilityOrder.error);
+  }
+
+  promote.refundRequest.liabilityRecovery = {
+    status: 'PENDING_PAYMENT',
+    amountPaise: Math.max(0, Number(liabilityOrder?.amountPaise || liabilityAmountPaise)),
+    currency: liabilityOrder?.currency || 'INR',
+    ownerAuthId: ownerAuthId || null,
+    paymentOrderId: liabilityOrder?.paymentOrderId || null,
+    razorpayOrderId: liabilityOrder?.razorpayOrderId || null,
+    transactionId: liabilityOrder?.transactionId || null,
+    initiatedByAuthId,
+    initiatedAt: new Date(),
+    paidAt: null,
+    lastError: null,
+  };
+
+  await promote.save({ validateBeforeSave: false });
+
+  await sendPromoteOwnerLiabilityRecoveryNotification({
+    promote,
+    ownerAuthId,
+    amountPaise: promote.refundRequest.liabilityRecovery.amountPaise,
+  });
+
+  const updated = await getPromoteByEventId(trimmedEventId);
+  return {
+    ...updated,
+    liabilityRecoverySummary: {
+      alreadyRecovered: false,
+      alreadyPending: false,
+      notRequired: false,
+    },
+  };
+};
+
+const markPromoteLiabilityRecovered = async ({
+  eventId,
+  paymentOrderId = null,
+  razorpayOrderId = null,
+  transactionId = null,
+  paidAt = null,
+} = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const promote = await Promote.findOne({ eventId: trimmedEventId });
+  if (!promote) throw createApiError(404, 'Promote record not found');
+
+  const currentRecovery = promote?.refundRequest?.liabilityRecovery || null;
+  const currentStatus = String(currentRecovery?.status || '').trim().toUpperCase();
+  if (currentStatus === 'PAID') return promote;
+
+  const parsedPaidAt = paidAt ? new Date(paidAt) : new Date();
+  const effectivePaidAt = Number.isNaN(parsedPaidAt.getTime()) ? new Date() : parsedPaidAt;
+
+  const amountPaise = resolvePromoteLiabilityAmountPaise({ promote });
+  promote.refundRequest = promote.refundRequest || {};
+  promote.refundRequest.liabilityRecovery = {
+    status: 'PAID',
+    amountPaise: Math.max(0, Number(currentRecovery?.amountPaise || amountPaise || 0)),
+    currency: String(currentRecovery?.currency || 'INR').trim() || 'INR',
+    ownerAuthId: String(currentRecovery?.ownerAuthId || promote?.authId || '').trim() || null,
+    paymentOrderId: String(paymentOrderId || currentRecovery?.paymentOrderId || '').trim() || null,
+    razorpayOrderId: String(razorpayOrderId || currentRecovery?.razorpayOrderId || '').trim() || null,
+    transactionId: String(transactionId || currentRecovery?.transactionId || '').trim() || null,
+    initiatedByAuthId: String(currentRecovery?.initiatedByAuthId || '').trim() || null,
+    initiatedAt: currentRecovery?.initiatedAt || new Date(),
+    paidAt: effectivePaidAt,
+    lastError: null,
+  };
+
+  await promote.save({ validateBeforeSave: false });
+  return promote;
 };
 
 /**
@@ -889,15 +1893,92 @@ const markPromotePaid = async (eventId) => {
 
 // ─── Update status (manager / admin) ─────────────────────────────────────────
 
-const updatePromoteStatus = async (eventId, eventStatus, assignedManagerId = null) => {
+const updatePromoteStatus = async (
+  eventId,
+  eventStatus,
+  assignedManagerId = null,
+  { updatedByAuthId = null, updatedByRole = null, updatedByManagerId = null } = {}
+) => {
   if (!eventId) throw createApiError(400, 'Event ID is required');
 
   const promote = await Promote.findOne({ eventId: eventId.trim() });
   if (!promote) throw createApiError(404, 'Promote record not found');
 
-  const allowedTransitions = [PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE];
+  const allowedTransitions = [PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED];
   if (!allowedTransitions.includes(eventStatus)) {
     throw createApiError(400, `eventStatus must be one of: ${allowedTransitions.join(', ')}`);
+  }
+
+  if (eventStatus === PROMOTE_STATUS.CANCELLED) {
+    return createPromoteRefundRequest({
+      eventId: promote.eventId,
+      authId: String(promote.authId || '').trim(),
+      cancellationReason: String(updatedByRole || '').trim().toUpperCase() === 'ADMIN'
+        ? 'Cancelled by platform (admin action)'
+        : 'Cancelled by platform (manager action)',
+      reasonCode: 'OKKAZO_FAILURE',
+      initiatedByAuthId: String(updatedByAuthId || '').trim() || null,
+    });
+  }
+
+  if (eventStatus === PROMOTE_STATUS.COMPLETE || eventStatus === PROMOTE_STATUS.CLOSED) {
+    const normalizedRole = String(updatedByRole || '').trim().toUpperCase();
+
+    if (normalizedRole === 'MANAGER') {
+      const normalizedActorManagerId = String(updatedByManagerId || '').trim();
+      if (!normalizedActorManagerId) {
+        throw createApiError(403, 'Manager identity is required to close promote event');
+      }
+      if (String(promote.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+        throw createApiError(403, 'Only the assigned manager can close this promote event');
+      }
+    }
+
+    const promoteEventStatus = String(promote?.eventStatus || '').trim().toUpperCase();
+    const promoteRefundStatus = String(promote?.refundRequest?.status || '').trim().toUpperCase();
+    const cancelledStatuses = new Set(['CANCELLED', 'CANCELED', 'REFUNDED']);
+    const refundRelevantStatuses = new Set([
+      PROMOTE_REFUND_REQUEST_STATUSES.PENDING_REVIEW,
+      PROMOTE_REFUND_REQUEST_STATUSES.APPROVED,
+      PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+    ]);
+
+    const cancellationFlowActive =
+      cancelledStatuses.has(promoteEventStatus) || refundRelevantStatuses.has(promoteRefundStatus);
+
+    if (cancellationFlowActive) {
+      const liabilityRecoveryStatus = String(promote?.refundRequest?.liabilityRecovery?.status || '').trim().toUpperCase();
+      const liabilitySettledByStatus = liabilityRecoveryStatus === 'PAID' || liabilityRecoveryStatus === 'NOT_REQUIRED';
+
+      if (!liabilitySettledByStatus) {
+        const feesConfig = await promoteConfigService.getFees();
+        const salesStats = await buildPromoteTicketSalesStats(promote.toJSON(), feesConfig);
+        const liabilityAmountPaise = resolvePromoteLiabilityAmountPaise({
+          promote,
+          fallbackSalesStats: salesStats,
+        });
+
+        if (liabilityAmountPaise > 0) {
+          throw createApiError(409, 'Cannot close promote event until creator liability is paid');
+        }
+
+        promote.refundRequest = promote.refundRequest || {};
+        promote.refundRequest.liabilityRecovery = {
+          ...(promote.refundRequest.liabilityRecovery || {}),
+          status: 'NOT_REQUIRED',
+          amountPaise: 0,
+          currency: 'INR',
+          ownerAuthId: String(promote?.authId || '').trim() || null,
+          paymentOrderId: null,
+          razorpayOrderId: null,
+          transactionId: null,
+          initiatedByAuthId: String(updatedByAuthId || '').trim() || null,
+          initiatedAt: promote?.refundRequest?.liabilityRecovery?.initiatedAt || new Date(),
+          paidAt: null,
+          lastError: null,
+        };
+      }
+    }
   }
 
   promote.eventStatus = eventStatus;
@@ -924,7 +2005,7 @@ const updatePromoteStatus = async (eventId, eventStatus, assignedManagerId = nul
     }
   }
 
-  await promote.save();
+  await promote.save({ validateBeforeSave: false });
   logger.info(`Promote status updated: ${eventId} → ${eventStatus}`);
   return promote;
 };
@@ -1006,7 +2087,7 @@ const tryAutoAssignManager = async (
     {
       eventId: String(eventId).trim(),
       assignedManagerId: null,
-      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
       'adminDecision.status': ADMIN_DECISION_STATUS.APPROVED,
       'adminDecision.decidedAt': { $ne: null },
     },
@@ -1047,7 +2128,7 @@ const tryAutoAssignManager = async (
       const promote = await Promote.findOne({ eventId: String(eventId).trim() })
         .select('platformFeePaid assignedManagerId eventStatus adminDecision.status')
         .lean();
-      if (promote && ![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE].includes(promote.eventStatus)) {
+      if (promote && ![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED].includes(promote.eventStatus)) {
         const computedStatus = !promote.platformFeePaid
           ? PROMOTE_STATUS.PAYMENT_REQUIRED
           : (!promote.assignedManagerId
@@ -1060,7 +2141,7 @@ const tryAutoAssignManager = async (
           await Promote.updateOne(
             {
               eventId: String(eventId).trim(),
-              eventStatus: { $nin: [PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE] },
+              eventStatus: { $nin: [PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
             },
             { $set: { eventStatus: computedStatus } }
           );
@@ -1171,7 +2252,7 @@ const getUnavailableManagerIds = async ({ eventId = null } = {}) => {
   const [existingPromotes, existingPlannings, targetRange] = await Promise.all([
     Promote.find({
       assignedManagerId: { $ne: null },
-      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
       ...(normalizedEventId ? { eventId: { $ne: normalizedEventId } } : {}),
     })
@@ -1278,6 +2359,611 @@ const getPromotesForManager = async ({ managerId, limit = 200 } = {}) => {
   return promotes || [];
 };
 
+const createPromoteRefundRequest = async ({
+  eventId,
+  authId,
+  cancellationReason = null,
+  reasonCode = null,
+  initiatedByAuthId = null,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedAuthId = String(authId || '').trim();
+  const normalizedInitiatorAuthId = String(initiatedByAuthId || authId || '').trim();
+  const normalizedReason = String(cancellationReason || '').trim();
+  const normalizedReasonCode = normalizePromoteRefundReasonCode(reasonCode);
+
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!normalizedAuthId) throw createApiError(401, 'Authentication required');
+
+  const promote = await Promote.findOne({ eventId: normalizedEventId });
+  if (!promote) throw createApiError(404, 'Promote not found');
+
+  if (String(promote.authId || '').trim() !== normalizedAuthId) {
+    throw createApiError(403, 'Only the event owner can request cancellation refund');
+  }
+
+  const lifecycleStatus = String(promote.eventStatus || '').trim().toUpperCase();
+  if (lifecycleStatus === PROMOTE_STATUS.COMPLETE || lifecycleStatus === PROMOTE_STATUS.CANCELLED || lifecycleStatus === PROMOTE_STATUS.CLOSED) {
+    throw createApiError(409, 'Refund request cannot be raised for this promote status');
+  }
+
+  const existingStatus = String(promote?.refundRequest?.status || '').trim().toUpperCase();
+  if (
+    existingStatus === PROMOTE_REFUND_REQUEST_STATUSES.PENDING_REVIEW
+    || existingStatus === PROMOTE_REFUND_REQUEST_STATUSES.APPROVED
+    || existingStatus === PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED
+  ) {
+    throw createApiError(409, 'A refund request already exists for this event');
+  }
+
+  const [feesConfig, orders] = await Promise.all([
+    promoteConfigService.getFees(),
+    fetchOrdersForEventFromOrderService(normalizedEventId),
+  ]);
+  const salesStats = await buildPromoteTicketSalesStats(promote.toJSON(), feesConfig);
+  const paymentSummary = resolvePromotePaymentSummary({ orders, promote });
+  const refundResult = buildPromoteRefundResult({
+    promote,
+    reasonCode: normalizedReasonCode,
+    salesStats,
+    promotionUsedAmountPaise: paymentSummary.promotionUsedAmountPaise,
+    paymentPaidAt: paymentSummary.paidAt,
+    now: new Date(),
+  });
+
+  const now = new Date();
+
+  const nextRefundRequest = {
+    status: PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+    requestedByAuthId: normalizedAuthId,
+    requestedAt: now,
+    reasonCode: normalizedReasonCode,
+    cancellationReason: normalizedReason || null,
+    assignedManagerId: null,
+    assignedManagerRole: null,
+    managerReviewedByAuthId: normalizedInitiatorAuthId || normalizedAuthId,
+    managerReviewedAt: now,
+    managerNotes: normalizedReason || null,
+    result: refundResult,
+    refundedAt: now,
+    refundTransactionRef: null,
+    bulkRefundSummary: null,
+  };
+
+  const createResult = await Promote.updateOne(
+    {
+      _id: promote._id,
+      authId: normalizedAuthId,
+      $or: [
+        { refundRequest: null },
+        { refundRequest: { $exists: false } },
+        { 'refundRequest.status': PROMOTE_REFUND_REQUEST_STATUSES.REJECTED },
+      ],
+    },
+    {
+      $set: {
+        refundRequest: nextRefundRequest,
+        eventStatus: PROMOTE_STATUS.CANCELLED,
+      },
+    }
+  );
+
+  if (Number(createResult?.modifiedCount || 0) !== 1) {
+    throw createApiError(409, 'A refund request already exists for this event');
+  }
+
+  const updatedPromote = await Promote.findById(promote._id);
+  if (!updatedPromote) {
+    throw createApiError(404, 'Promote not found');
+  }
+
+  const recipientAuthIds = await getPromoteGuestTicketRecipients({ eventId: normalizedEventId });
+  const ownerRefundAmountPaise = Math.max(0, Number(updatedPromote?.refundRequest?.result?.userRefundAmountPaise || 0));
+  const scenarioCode = String(updatedPromote?.refundRequest?.result?.scenarioCode || '').trim() || null;
+  const timelineLabel = String(updatedPromote?.refundRequest?.result?.timelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL;
+  const cancelledAt = new Date();
+
+  let bulkResult = {
+    skipped: true,
+    reason: 'No successful ticket guests found for this event',
+    totalOrders: 0,
+    refundedCount: 0,
+    failedCount: 0,
+  };
+
+  if (recipientAuthIds.length > 0) {
+    bulkResult = await processPromoteGuestTicketBulkRefund({
+      eventId: normalizedEventId,
+      recipientAuthIds,
+      reasonCode: normalizedReasonCode,
+      managerAuthId: normalizedInitiatorAuthId || normalizedAuthId,
+      managerNotes: normalizedReason,
+      scenarioCode,
+    });
+
+    const failedCount = Math.max(0, Number(bulkResult?.failedCount || 0));
+    if (failedCount > 0) {
+      throw createApiError(502, `Failed to process ${failedCount} guest ticket refunds`);
+    }
+  }
+
+  let ownerRefund = {
+    skipped: true,
+    reason: 'Owner refund amount is zero',
+    refundedAmount: 0,
+    refundId: null,
+    transactionId: null,
+    refundedAt: null,
+  };
+  if (ownerRefundAmountPaise > 0) {
+    ownerRefund = await processPromoteOwnerRefund({
+      eventId: normalizedEventId,
+      ownerAuthId: normalizedAuthId,
+      refundAmountPaise: ownerRefundAmountPaise,
+      reasonCode: normalizedReasonCode,
+      initiatedByAuthId: normalizedInitiatorAuthId || normalizedAuthId,
+      managerNotes: normalizedReason,
+      scenarioCode,
+    });
+
+    if (ownerRefund?.error) {
+      throw createApiError(502, ownerRefund.error);
+    }
+  }
+
+  const liabilityAmountPaise = resolvePromoteLiabilityAmountPaise({
+    promote: updatedPromote,
+    fallbackSalesStats: salesStats,
+  });
+
+  let liabilityRecoveryState = {
+    status: 'NOT_REQUIRED',
+    amountPaise: 0,
+    currency: 'INR',
+    ownerAuthId: normalizedAuthId,
+    paymentOrderId: null,
+    razorpayOrderId: null,
+    transactionId: null,
+    initiatedByAuthId: normalizedInitiatorAuthId || normalizedAuthId || null,
+    initiatedAt: new Date(),
+    paidAt: null,
+    lastError: null,
+  };
+
+  if (liabilityAmountPaise > 0) {
+    const liabilityOrder = await processPromoteLiabilityRecoveryOrder({
+      eventId: normalizedEventId,
+      ownerAuthId: normalizedAuthId,
+      amountPaise: liabilityAmountPaise,
+      initiatedByAuthId: normalizedInitiatorAuthId || normalizedAuthId,
+      reasonCode: normalizedReasonCode,
+      scenarioCode,
+    });
+
+    if (liabilityOrder?.error) {
+      liabilityRecoveryState = {
+        status: 'FAILED',
+        amountPaise: liabilityAmountPaise,
+        currency: liabilityOrder?.currency || 'INR',
+        ownerAuthId: normalizedAuthId,
+        paymentOrderId: null,
+        razorpayOrderId: null,
+        transactionId: null,
+        initiatedByAuthId: normalizedInitiatorAuthId || normalizedAuthId || null,
+        initiatedAt: new Date(),
+        paidAt: null,
+        lastError: liabilityOrder.error,
+      };
+    } else {
+      liabilityRecoveryState = {
+        status: 'PENDING_PAYMENT',
+        amountPaise: Math.max(0, Number(liabilityOrder?.amountPaise || liabilityAmountPaise)),
+        currency: liabilityOrder?.currency || 'INR',
+        ownerAuthId: normalizedAuthId,
+        paymentOrderId: liabilityOrder?.paymentOrderId || null,
+        razorpayOrderId: liabilityOrder?.razorpayOrderId || null,
+        transactionId: liabilityOrder?.transactionId || null,
+        initiatedByAuthId: normalizedInitiatorAuthId || normalizedAuthId || null,
+        initiatedAt: new Date(),
+        paidAt: null,
+        lastError: null,
+      };
+
+      await sendPromoteOwnerLiabilityRecoveryNotification({
+        promote: updatedPromote,
+        ownerAuthId: normalizedAuthId,
+        amountPaise: liabilityRecoveryState.amountPaise,
+      });
+    }
+  }
+
+  updatedPromote.refundRequest.bulkRefundSummary = bulkResult;
+  updatedPromote.refundRequest.refundTransactionRef = ownerRefund?.refundId
+    || ownerRefund?.transactionId
+    || `PROMOTE-CANCEL-${Date.now()}`;
+  updatedPromote.refundRequest.refundedAt = ownerRefund?.refundedAt
+    ? new Date(ownerRefund.refundedAt)
+    : cancelledAt;
+  updatedPromote.refundRequest.liabilityRecovery = liabilityRecoveryState;
+
+  const cancellationReasonText = `Event cancelled: ${String(updatedPromote?.refundRequest?.cancellationReason || 'Promoter requested cancellation').trim()}`;
+  const ticketUpdateResult = await UserEventTicket.updateMany(
+    {
+      eventId: normalizedEventId,
+      eventSource: 'promote',
+      ticketStatus: USER_TICKET_STATUS.SUCCESS,
+    },
+    {
+      $set: {
+        ticketStatus: USER_TICKET_STATUS.CANCELED,
+        'verification.status': USER_TICKET_VERIFICATION_STATUS.PENDING,
+        'verification.verifiedAt': null,
+        'verification.verifiedByAuthId': null,
+        'verification.lastScannedAt': null,
+        'cancellation.requestId': String(updatedPromote?.refundRequest?.requestId || '').trim() || null,
+        'cancellation.cancelledAt': cancelledAt,
+        'cancellation.reason': cancellationReasonText,
+        'cancellation.reasonCode': normalizedReasonCode,
+        'cancellation.flags.eventCancelled': true,
+        'cancellation.flags.okkazoFailure': normalizedReasonCode === 'OKKAZO_FAILURE',
+        'cancellation.timelineLabel': timelineLabel,
+        'cancellation.refundPaymentOrderId': String(ownerRefund?.refundId || '').trim()
+          || String(updatedPromote?.refundRequest?.refundTransactionRef || '').trim()
+          || null,
+        'cancellation.refundedAt': cancelledAt,
+      },
+    }
+  );
+
+  if (ticketUpdateResult && ticketUpdateResult.acknowledged === false) {
+    throw createApiError(502, 'Failed to update promote guest ticket cancellation status');
+  }
+
+  try {
+    await Promise.all([
+      sendPromoteGuestCancellationNotifications({
+        promote: updatedPromote,
+        recipientAuthIds,
+        refundTimelineLabel: timelineLabel,
+      }),
+      publishPromoteGuestCancellationEmailEvent({
+        promote: updatedPromote,
+        recipientAuthIds,
+        refundTimelineLabel: timelineLabel,
+        cancellationReason: updatedPromote?.refundRequest?.cancellationReason || null,
+      }),
+    ]);
+  } catch (guestCommsError) {
+    logger.warn('Promote guest cancellation communications failed after user cancellation request', {
+      eventId: normalizedEventId,
+      message: guestCommsError?.message || String(guestCommsError),
+    });
+  }
+
+  await updatedPromote.save({ validateBeforeSave: false });
+
+  return getPromoteByEventId(normalizedEventId);
+};
+
+const getPromoteRefundRequestByEventId = async ({ eventId } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+
+  return getPromoteByEventId(normalizedEventId);
+};
+
+const getPromoteRefundRequestsForManager = async ({ managerId, limit = 200, statuses = [] } = {}) => {
+  const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
+  const normalizedManagerId = String(managerId || '').trim();
+
+  const normalizedStatuses = Array.isArray(statuses)
+    ? statuses
+      .map((status) => String(status || '').trim().toUpperCase())
+      .filter(Boolean)
+      .filter((status) => Object.values(PROMOTE_REFUND_REQUEST_STATUSES).includes(status))
+    : [];
+
+  const query = {
+    refundRequest: { $ne: null },
+  };
+
+  if (normalizedManagerId) {
+    query['refundRequest.assignedManagerId'] = normalizedManagerId;
+  }
+
+  if (normalizedStatuses.length > 0) {
+    query['refundRequest.status'] = { $in: normalizedStatuses };
+  }
+
+  const rows = await Promote.find(query)
+    .sort({ 'refundRequest.requestedAt': -1, createdAt: -1 })
+    .limit(safeLimit)
+    .select([
+      'eventId',
+      'eventTitle',
+      'eventStatus',
+      'createdAt',
+      'authId',
+      'assignedManagerId',
+      'platformFee',
+      'serviceChargePercent',
+      'ticketAnalytics',
+      'ticketAvailability',
+      'refundRequest',
+    ].join(' '))
+    .lean();
+
+  const cfg = await promoteConfigService.getFees();
+  const fallbackPlatformFee = cfg.platformFee;
+  const fallbackServiceChargePercent = cfg.serviceChargePercent;
+
+  return (rows || []).map((row) => ({
+    ...row,
+    platformFee: (row.platformFee === undefined || row.platformFee === null) ? fallbackPlatformFee : row.platformFee,
+    serviceChargePercent: (row.serviceChargePercent === undefined || row.serviceChargePercent === null)
+      ? fallbackServiceChargePercent
+      : row.serviceChargePercent,
+  }));
+};
+
+const reviewPromoteRefundRequest = async ({
+  eventId,
+  managerId,
+  managerAuthId,
+  nextStatus,
+  managerNotes = null,
+  refundTransactionRef = null,
+  isAdmin = false,
+} = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  const normalizedManagerId = String(managerId || '').trim();
+  const normalizedManagerAuthId = String(managerAuthId || '').trim();
+  const normalizedNextStatus = String(nextStatus || '').trim().toUpperCase();
+  const normalizedNotes = String(managerNotes || '').trim();
+  const normalizedRefundRef = String(refundTransactionRef || '').trim();
+
+  if (!normalizedEventId) throw createApiError(400, 'eventId is required');
+  if (!Object.values(PROMOTE_REFUND_REQUEST_STATUSES).includes(normalizedNextStatus)) {
+    throw createApiError(400, 'Invalid refund request status');
+  }
+
+  const promote = await Promote.findOne({ eventId: normalizedEventId });
+  if (!promote) throw createApiError(404, 'Promote not found');
+  if (!promote.refundRequest) throw createApiError(404, 'Refund request not found');
+
+  const assignedManagerId = String(promote?.refundRequest?.assignedManagerId || '').trim();
+  if (!isAdmin && assignedManagerId && normalizedManagerId && assignedManagerId !== normalizedManagerId) {
+    throw createApiError(403, 'Only assigned Revenue Operations Specialist can review this request');
+  }
+
+  const currentStatus = String(promote?.refundRequest?.status || '').trim().toUpperCase();
+  if (currentStatus === PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED) {
+    throw createApiError(409, 'Refund request is already finalized');
+  }
+
+  if (
+    currentStatus === PROMOTE_REFUND_REQUEST_STATUSES.PENDING_REVIEW
+    && ![
+      PROMOTE_REFUND_REQUEST_STATUSES.APPROVED,
+      PROMOTE_REFUND_REQUEST_STATUSES.REJECTED,
+      PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+    ].includes(normalizedNextStatus)
+  ) {
+    throw createApiError(409, 'Pending requests can only be approved, rejected, or marked refunded');
+  }
+
+  if (
+    currentStatus === PROMOTE_REFUND_REQUEST_STATUSES.APPROVED
+    && ![
+      PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED,
+      PROMOTE_REFUND_REQUEST_STATUSES.REJECTED,
+    ].includes(normalizedNextStatus)
+  ) {
+    throw createApiError(409, 'Approved requests can only be marked refunded or rejected');
+  }
+
+  promote.refundRequest.status = normalizedNextStatus;
+  promote.refundRequest.managerReviewedByAuthId = normalizedManagerAuthId || null;
+  promote.refundRequest.managerReviewedAt = new Date();
+  promote.refundRequest.managerNotes = normalizedNotes || null;
+
+  if (normalizedNextStatus === PROMOTE_REFUND_REQUEST_STATUSES.REFUNDED) {
+    const ownerRefundAmountPaise = Math.max(0, Number(promote?.refundRequest?.result?.userRefundAmountPaise || 0));
+    const reasonCode = normalizePromoteRefundReasonCode(promote?.refundRequest?.reasonCode);
+    const scenarioCode = String(promote?.refundRequest?.result?.scenarioCode || '').trim() || null;
+    const recipientAuthIds = await getPromoteGuestTicketRecipients({ eventId: normalizedEventId });
+
+    if (!normalizedRefundRef && recipientAuthIds.length > 0) {
+      const bulkResult = await processPromoteGuestTicketBulkRefund({
+        eventId: normalizedEventId,
+        recipientAuthIds,
+        reasonCode,
+        managerAuthId: normalizedManagerAuthId,
+        managerNotes: normalizedNotes,
+        scenarioCode,
+      });
+
+      const failedCount = Math.max(0, Number(bulkResult?.failedCount || 0));
+      if (failedCount > 0) {
+        throw createApiError(502, `Failed to process ${failedCount} guest ticket refunds`);
+      }
+
+      promote.refundRequest.bulkRefundSummary = bulkResult;
+    } else if (!normalizedRefundRef) {
+      promote.refundRequest.bulkRefundSummary = {
+        skipped: true,
+        reason: 'No successful ticket guests found for this event',
+        totalOrders: 0,
+        refundedCount: 0,
+        failedCount: 0,
+      };
+    } else {
+      promote.refundRequest.bulkRefundSummary = null;
+    }
+
+    let ownerRefundRef = normalizedRefundRef || null;
+    if (!ownerRefundRef && ownerRefundAmountPaise > 0) {
+      const ownerRefund = await processPromoteOwnerRefund({
+        eventId: normalizedEventId,
+        ownerAuthId: String(promote?.authId || '').trim(),
+        refundAmountPaise: ownerRefundAmountPaise,
+        reasonCode,
+        initiatedByAuthId: normalizedManagerAuthId,
+        managerNotes: normalizedNotes,
+        scenarioCode,
+      });
+
+      if (ownerRefund?.error) {
+        throw createApiError(502, ownerRefund.error);
+      }
+
+      ownerRefundRef = ownerRefund?.refundId || ownerRefund?.transactionId || null;
+      promote.refundRequest.refundedAt = ownerRefund?.refundedAt ? new Date(ownerRefund.refundedAt) : new Date();
+    } else {
+      promote.refundRequest.refundedAt = new Date();
+    }
+
+    let liabilitySalesStats = null;
+    try {
+      const feesConfig = await promoteConfigService.getFees();
+      liabilitySalesStats = await buildPromoteTicketSalesStats(promote.toJSON(), feesConfig);
+    } catch (liabilityStatsError) {
+      logger.warn('Failed to compute promote liability ticket sales stats during refund finalization', {
+        eventId: normalizedEventId,
+        message: liabilityStatsError?.message || String(liabilityStatsError),
+      });
+    }
+
+    const liabilityAmountPaise = resolvePromoteLiabilityAmountPaise({
+      promote,
+      fallbackSalesStats: liabilitySalesStats,
+    });
+
+    let liabilityRecoveryState = {
+      status: 'NOT_REQUIRED',
+      amountPaise: 0,
+      currency: 'INR',
+      ownerAuthId: String(promote?.authId || '').trim() || null,
+      paymentOrderId: null,
+      razorpayOrderId: null,
+      transactionId: null,
+      initiatedByAuthId: normalizedManagerAuthId || null,
+      initiatedAt: new Date(),
+      paidAt: null,
+      lastError: null,
+    };
+
+    if (liabilityAmountPaise > 0) {
+      const liabilityOrder = await processPromoteLiabilityRecoveryOrder({
+        eventId: normalizedEventId,
+        ownerAuthId: String(promote?.authId || '').trim(),
+        amountPaise: liabilityAmountPaise,
+        initiatedByAuthId: normalizedManagerAuthId,
+        reasonCode,
+        scenarioCode,
+      });
+
+      if (liabilityOrder?.error) {
+        liabilityRecoveryState = {
+          status: 'FAILED',
+          amountPaise: liabilityAmountPaise,
+          currency: liabilityOrder?.currency || 'INR',
+          ownerAuthId: String(promote?.authId || '').trim() || null,
+          paymentOrderId: null,
+          razorpayOrderId: null,
+          transactionId: null,
+          initiatedByAuthId: normalizedManagerAuthId || null,
+          initiatedAt: new Date(),
+          paidAt: null,
+          lastError: liabilityOrder.error,
+        };
+      } else {
+        liabilityRecoveryState = {
+          status: 'PENDING_PAYMENT',
+          amountPaise: Math.max(0, Number(liabilityOrder?.amountPaise || liabilityAmountPaise)),
+          currency: liabilityOrder?.currency || 'INR',
+          ownerAuthId: String(promote?.authId || '').trim() || null,
+          paymentOrderId: liabilityOrder?.paymentOrderId || null,
+          razorpayOrderId: liabilityOrder?.razorpayOrderId || null,
+          transactionId: liabilityOrder?.transactionId || null,
+          initiatedByAuthId: normalizedManagerAuthId || null,
+          initiatedAt: new Date(),
+          paidAt: null,
+          lastError: null,
+        };
+
+        await sendPromoteOwnerLiabilityRecoveryNotification({
+          promote,
+          ownerAuthId: String(promote?.authId || '').trim(),
+          amountPaise: liabilityRecoveryState.amountPaise,
+        });
+      }
+    }
+
+    promote.refundRequest.refundTransactionRef = ownerRefundRef || `PROMOTE-CANCEL-${Date.now()}`;
+    promote.refundRequest.liabilityRecovery = liabilityRecoveryState;
+
+    const cancelledAt = new Date();
+    const cancellationReasonText = `Event cancelled: ${String(promote?.refundRequest?.cancellationReason || 'Promoter requested cancellation').trim()}`;
+    const timelineLabel = String(promote?.refundRequest?.result?.timelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL;
+
+    const ticketUpdateResult = await UserEventTicket.updateMany(
+      {
+        eventId: normalizedEventId,
+        eventSource: 'promote',
+        ticketStatus: USER_TICKET_STATUS.SUCCESS,
+      },
+      {
+        $set: {
+          ticketStatus: USER_TICKET_STATUS.CANCELED,
+          'verification.status': USER_TICKET_VERIFICATION_STATUS.PENDING,
+          'verification.verifiedAt': null,
+          'verification.verifiedByAuthId': null,
+          'verification.lastScannedAt': null,
+          'cancellation.requestId': String(promote?.refundRequest?.requestId || '').trim() || null,
+          'cancellation.cancelledAt': cancelledAt,
+          'cancellation.reason': cancellationReasonText,
+          'cancellation.reasonCode': reasonCode,
+          'cancellation.flags.eventCancelled': true,
+          'cancellation.flags.okkazoFailure': reasonCode === 'OKKAZO_FAILURE',
+          'cancellation.timelineLabel': timelineLabel,
+          'cancellation.refundPaymentOrderId': String(promote?.refundRequest?.refundTransactionRef || '').trim() || null,
+          'cancellation.refundedAt': cancelledAt,
+        },
+      }
+    );
+
+    if (ticketUpdateResult && ticketUpdateResult.acknowledged === false) {
+      throw createApiError(502, 'Failed to update promote guest ticket cancellation status');
+    }
+
+    try {
+      await Promise.all([
+        sendPromoteGuestCancellationNotifications({
+          promote,
+          recipientAuthIds,
+          refundTimelineLabel: timelineLabel,
+        }),
+        publishPromoteGuestCancellationEmailEvent({
+          promote,
+          recipientAuthIds,
+          refundTimelineLabel: timelineLabel,
+          cancellationReason: promote?.refundRequest?.cancellationReason || null,
+        }),
+      ]);
+    } catch (guestCommsError) {
+      logger.warn('Promote guest cancellation communications failed after refund finalization', {
+        eventId: normalizedEventId,
+        message: guestCommsError?.message || String(guestCommsError),
+      });
+    }
+  }
+
+  await promote.save({ validateBeforeSave: false });
+
+  return getPromoteByEventId(normalizedEventId);
+};
+
 /**
  * Update promote core details (Manager/Admin)
  */
@@ -1332,7 +3018,13 @@ module.exports = {
   createPromote,
   getMyPromotes,
   getPromoteByEventId,
+  createPromoteRefundRequest,
+  getPromoteRefundRequestByEventId,
+  getPromoteRefundRequestsForManager,
+  reviewPromoteRefundRequest,
+  resolveRevenueOpsManagerContext,
   releasePromoteGeneratedRevenuePayout,
+  recoverPromoteCancellationLiability,
   triggerPromoteEmailBlastPromotionAction,
   updatePromoteDetails,
   addPromoteCoreStaff,
@@ -1340,6 +3032,7 @@ module.exports = {
   getAllPromotes,
   getPromotesForManager,
   markPromotePaid,
+  markPromoteLiabilityRecovered,
   updatePromoteStatus,
   assignManager,
   assignManagerWithMetadata,

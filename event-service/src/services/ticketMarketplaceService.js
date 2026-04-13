@@ -1,7 +1,9 @@
 const Planning = require('../models/Planning');
 const Promote = require('../models/Promote');
 const UserEventTicket = require('../models/UserEventTicket');
+const PlanningRefundPolicyConfig = require('../models/PlanningRefundPolicyConfig');
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 const { CATEGORY, STATUS } = require('../utils/planningConstants');
 const { ADMIN_DECISION_STATUS, PROMOTE_STATUS } = require('../utils/promoteConstants');
 const { USER_TICKET_STATUS, USER_TICKET_VERIFICATION_STATUS } = require('../utils/ticketConstants');
@@ -10,6 +12,8 @@ const logger = require('../utils/logger');
 const { fetchUserByAuthId, resolveUserServiceIdFromAuthId } = require('./userServiceClient');
 const promoteConfigService = require('./promoteConfigService');
 const { signTicketQrToken, verifyTicketQrToken } = require('../utils/ticketQrToken');
+const { startOfIstDay, parseIstDayStart } = require('../utils/istDateTime');
+const { publishEvent } = require('../kafka/eventProducer');
 
 const ORDER_SERVICE_URL = (process.env.ORDER_SERVICE_URL || 'http://order-service:8087').replace(/\/$/, '');
 const NOTIFICATION_SERVICE_URL = (
@@ -18,6 +22,64 @@ const NOTIFICATION_SERVICE_URL = (
 ).replace(/\/$/, '');
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_SCAN_HISTORY = 200;
+const REFUND_POLICY_CONFIG_KEY_TICKET_USER = 'ticket-user-default';
+const DEFAULT_TICKET_REFUND_TIMELINE_LABEL = '5-7 working days';
+
+const DEFAULT_TICKET_REFUND_POLICY_SLABS = [
+  {
+    code: 'GE_30_DAYS',
+    label: '30 days or more before event',
+    minDays: 30,
+    maxDays: null,
+    refundPercent: 100,
+  },
+  {
+    code: 'DAYS_15_TO_29',
+    label: '15 to 29 days before event',
+    minDays: 15,
+    maxDays: 29,
+    refundPercent: 90,
+  },
+  {
+    code: 'DAYS_7_TO_14',
+    label: '7 to 14 days before event',
+    minDays: 7,
+    maxDays: 14,
+    refundPercent: 75,
+  },
+  {
+    code: 'DAYS_3_TO_6',
+    label: '3 to 6 days before event',
+    minDays: 3,
+    maxDays: 6,
+    refundPercent: 60,
+  },
+  {
+    code: 'DAYS_2',
+    label: '2 days before event',
+    minDays: 2,
+    maxDays: 2,
+    refundPercent: 40,
+  },
+  {
+    code: 'DAYS_1',
+    label: '1 day before event',
+    minDays: 1,
+    maxDays: 1,
+    refundPercent: 10,
+  },
+  {
+    code: 'SAME_DAY_OR_PAST',
+    label: 'Same day or past event date',
+    minDays: null,
+    maxDays: 0,
+    refundPercent: 0,
+  },
+];
+
+const TICKET_REFUND_SLAB_BY_CODE = new Map(
+  DEFAULT_TICKET_REFUND_POLICY_SLABS.map((slab) => [String(slab.code), slab])
+);
 
 const toPositiveInt = (value, fallback) => {
   const n = Number.parseInt(value, 10);
@@ -96,6 +158,167 @@ const resolveTicketSelectedDay = ({ selectedDay, schedule } = {}) => {
   const explicit = normalizeDayKey(selectedDay);
   if (explicit) return explicit;
   return resolveSelectedDayFromSchedule(schedule) || null;
+};
+
+const cloneDefaultTicketRefundPolicySlabs = () => DEFAULT_TICKET_REFUND_POLICY_SLABS.map((slab) => ({ ...slab }));
+
+const buildDefaultTicketRefundPolicyConfigPayload = () => ({
+  key: REFUND_POLICY_CONFIG_KEY_TICKET_USER,
+  timelineLabel: DEFAULT_TICKET_REFUND_TIMELINE_LABEL,
+  slabs: cloneDefaultTicketRefundPolicySlabs(),
+  roundRobinCursor: 0,
+  updatedByAuthId: null,
+});
+
+const clampRefundPercent = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Number(n.toFixed(2))));
+};
+
+const normalizeTicketRefundTimelineLabel = (value) => {
+  const label = String(value || '').trim();
+  return label || DEFAULT_TICKET_REFUND_TIMELINE_LABEL;
+};
+
+const normalizeTicketRefundPolicySlabs = (rawSlabs) => {
+  const defaults = cloneDefaultTicketRefundPolicySlabs();
+  const incoming = Array.isArray(rawSlabs) ? rawSlabs : [];
+  const incomingByCode = new Map(
+    incoming
+      .map((row) => ({
+        code: String(row?.code || '').trim().toUpperCase(),
+        refundPercent: clampRefundPercent(row?.refundPercent),
+      }))
+      .filter((row) => row.code)
+  );
+
+  return defaults.map((slab) => {
+    const next = incomingByCode.get(String(slab.code));
+    if (!next || next.refundPercent === null) return { ...slab };
+    return {
+      ...slab,
+      refundPercent: next.refundPercent,
+    };
+  });
+};
+
+const getOrCreateTicketRefundPolicyConfig = async () => {
+  const setOnInsert = buildDefaultTicketRefundPolicyConfigPayload();
+
+  let cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY_TICKET_USER },
+    { $setOnInsert: setOnInsert },
+    { new: true, upsert: true }
+  ).lean();
+
+  const normalizedTimelineLabel = normalizeTicketRefundTimelineLabel(cfg?.timelineLabel);
+  const normalizedSlabs = normalizeTicketRefundPolicySlabs(cfg?.slabs);
+  const currentSlabsJson = JSON.stringify(Array.isArray(cfg?.slabs) ? cfg.slabs : []);
+  const normalizedSlabsJson = JSON.stringify(normalizedSlabs);
+
+  const needsBackfill =
+    normalizedTimelineLabel !== String(cfg?.timelineLabel || '')
+    || currentSlabsJson !== normalizedSlabsJson;
+
+  if (!needsBackfill) {
+    return {
+      ...cfg,
+      timelineLabel: normalizedTimelineLabel,
+      slabs: normalizedSlabs,
+    };
+  }
+
+  cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY_TICKET_USER },
+    {
+      $set: {
+        timelineLabel: normalizedTimelineLabel,
+        slabs: normalizedSlabs,
+      },
+    },
+    { new: true }
+  ).lean();
+
+  return {
+    ...cfg,
+    timelineLabel: normalizedTimelineLabel,
+    slabs: normalizedSlabs,
+  };
+};
+
+const getTicketRefundPolicy = async () => {
+  const cfg = await getOrCreateTicketRefundPolicyConfig();
+  return {
+    timelineLabel: normalizeTicketRefundTimelineLabel(cfg?.timelineLabel),
+    slabs: normalizeTicketRefundPolicySlabs(cfg?.slabs),
+    updatedAt: cfg?.updatedAt || null,
+    updatedByAuthId: String(cfg?.updatedByAuthId || '').trim() || null,
+  };
+};
+
+const updateTicketRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthId } = {}) => {
+  const hasSlabUpdates = Array.isArray(slabs);
+  const hasTimelineUpdate = timelineLabel !== undefined;
+  if (!hasSlabUpdates && !hasTimelineUpdate) {
+    throw createApiError(400, 'No ticket refund policy updates provided');
+  }
+
+  const existing = await getOrCreateTicketRefundPolicyConfig();
+  const existingSlabs = normalizeTicketRefundPolicySlabs(existing?.slabs);
+  const incomingRows = Array.isArray(slabs) ? slabs : [];
+  const incomingByCode = new Map(
+    incomingRows.map((row) => [String(row?.code || '').trim().toUpperCase(), row])
+  );
+
+  const nextSlabs = existingSlabs.map((slab) => {
+    const code = String(slab.code || '').trim().toUpperCase();
+    if (!incomingByCode.has(code)) return slab;
+
+    const incoming = incomingByCode.get(code);
+    const refundPercent = clampRefundPercent(incoming?.refundPercent);
+    if (refundPercent === null) {
+      throw createApiError(400, `refundPercent is invalid for slab ${code}`);
+    }
+
+    return {
+      ...slab,
+      refundPercent,
+    };
+  });
+
+  for (const [code] of incomingByCode.entries()) {
+    if (!TICKET_REFUND_SLAB_BY_CODE.has(code)) {
+      throw createApiError(400, `Unknown ticket refund slab code: ${code}`);
+    }
+  }
+
+  const nextTimelineLabel = hasTimelineUpdate
+    ? normalizeTicketRefundTimelineLabel(timelineLabel)
+    : normalizeTicketRefundTimelineLabel(existing?.timelineLabel);
+
+  const updated = await PlanningRefundPolicyConfig.findOneAndUpdate(
+    { key: REFUND_POLICY_CONFIG_KEY_TICKET_USER },
+    {
+      $set: {
+        timelineLabel: nextTimelineLabel,
+        slabs: nextSlabs,
+        updatedByAuthId: String(updatedByAuthId || '').trim() || null,
+      },
+      $setOnInsert: {
+        key: REFUND_POLICY_CONFIG_KEY_TICKET_USER,
+        roundRobinCursor: 0,
+      },
+    },
+    { new: true, upsert: true }
+  ).lean();
+
+  return {
+    timelineLabel: normalizeTicketRefundTimelineLabel(updated?.timelineLabel),
+    slabs: normalizeTicketRefundPolicySlabs(updated?.slabs),
+    updatedAt: updated?.updatedAt || null,
+    updatedByAuthId: String(updated?.updatedByAuthId || '').trim() || null,
+  };
 };
 
 const appendTicketScanHistory = (existing, entry) => {
@@ -486,8 +709,13 @@ const resolveEventForPurchase = async (eventId) => {
   const promote = await Promote.findOne({
     eventId: trimmedEventId,
     platformFeePaid: true,
-    eventStatus: { $nin: [PROMOTE_STATUS.PAYMENT_REQUIRED, PROMOTE_STATUS.COMPLETE] },
+    eventStatus: { $nin: [PROMOTE_STATUS.PAYMENT_REQUIRED, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
     'adminDecision.status': ADMIN_DECISION_STATUS.APPROVED,
+    $or: [
+      { refundRequest: null },
+      { refundRequest: { $exists: false } },
+      { 'refundRequest.status': 'REJECTED' },
+    ],
     'ticketAvailability.startAt': { $lte: now },
     'ticketAvailability.endAt': { $gte: now },
   }).lean();
@@ -690,6 +918,8 @@ const mapTicketForFrontend = (ticket) => {
       scanCount: Number(ticket?.verification?.scanCount || 0),
       scanHistory: mapScanHistoryForApi(ticket?.verification?.scanHistory),
     },
+    payment: ticket?.payment || null,
+    cancellation: ticket?.cancellation || null,
     paidAt: ticket.paidAt,
     createdAt: ticket.createdAt,
     qrToken,
@@ -824,7 +1054,12 @@ const getTicketMarketplaceEvents = async ({ page = 1, limit = 20 } = {}) => {
 
   const promoteQuery = {
     platformFeePaid: true,
-    eventStatus: { $nin: [PROMOTE_STATUS.PAYMENT_REQUIRED, PROMOTE_STATUS.COMPLETE] },
+    eventStatus: { $nin: [PROMOTE_STATUS.PAYMENT_REQUIRED, PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
+    $or: [
+      { refundRequest: null },
+      { refundRequest: { $exists: false } },
+      { 'refundRequest.status': 'REJECTED' },
+    ],
     'adminDecision.status': ADMIN_DECISION_STATUS.APPROVED,
     'ticketAvailability.startAt': { $lte: now },
     'ticketAvailability.endAt': { $gte: now },
@@ -1318,6 +1553,508 @@ const verifyTicketQr = async ({ token, scannedByAuthId, scannedByRole } = {}) =>
   };
 };
 
+const resolveTicketEventDateForRefund = (ticket) => {
+  const selectedDay = normalizeDayKey(ticket?.tickets?.selectedDay);
+  if (selectedDay) {
+    const selectedDayStart = parseIstDayStart(selectedDay);
+    if (selectedDayStart) return selectedDayStart;
+  }
+
+  const startAt = ticket?.schedule?.startAt ? new Date(ticket.schedule.startAt) : null;
+  if (startAt && !Number.isNaN(startAt.getTime())) {
+    return startAt;
+  }
+
+  return null;
+};
+
+const computeDaysBeforeTicketEvent = (ticket, cancelledAt = new Date()) => {
+  const eventDate = resolveTicketEventDateForRefund(ticket);
+  if (!eventDate) return 0;
+
+  const eventDay = startOfIstDay(eventDate);
+  const cancelDay = startOfIstDay(cancelledAt);
+  if (!eventDay || !cancelDay) return 0;
+
+  const diffMs = eventDay.getTime() - cancelDay.getTime();
+  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
+};
+
+const resolveTicketRefundPolicyRule = (daysBeforeEvent, slabs = DEFAULT_TICKET_REFUND_POLICY_SLABS) => {
+  const days = Number(daysBeforeEvent);
+  const safeDays = Number.isFinite(days) ? days : 0;
+  const safeSlabs = Array.isArray(slabs) && slabs.length > 0
+    ? slabs
+    : DEFAULT_TICKET_REFUND_POLICY_SLABS;
+
+  const matched = safeSlabs.find((rule) => {
+    const minDays = rule?.minDays;
+    const maxDays = rule?.maxDays;
+    const minOk = minDays === null || minDays === undefined || safeDays >= Number(minDays);
+    const maxOk = maxDays === null || maxDays === undefined || safeDays <= Number(maxDays);
+    return minOk && maxOk;
+  });
+
+  if (matched) return matched;
+  return safeSlabs[safeSlabs.length - 1];
+};
+
+const resolveTicketFinancialsForRefund = (ticket) => {
+  const fallbackBasePaise = Math.max(0, Math.round(Number(ticket?.tickets?.totalAmount || 0) * 100));
+  const serviceChargePercentRaw = Number(ticket?.payment?.serviceChargePercent || 0);
+  const serviceChargePercent = Number.isFinite(serviceChargePercentRaw)
+    ? Math.max(0, Math.min(100, Number(serviceChargePercentRaw.toFixed(2))))
+    : 0;
+
+  const baseTicketAmountPaise = Math.max(
+    0,
+    Math.round(Number(ticket?.payment?.baseTicketAmountPaise || fallbackBasePaise))
+  );
+
+  const serviceFeePaiseFromTicket = Number(ticket?.payment?.serviceFeePaise || 0);
+  const platformFeePaiseFromTicket = Number(ticket?.payment?.platformFeePaise || 0);
+
+  const serviceFeePaise = Number.isFinite(serviceFeePaiseFromTicket) && serviceFeePaiseFromTicket >= 0
+    ? Math.round(serviceFeePaiseFromTicket)
+    : Math.round(baseTicketAmountPaise * (serviceChargePercent / 100));
+
+  const platformFeePaise = Number.isFinite(platformFeePaiseFromTicket) && platformFeePaiseFromTicket >= 0
+    ? Math.round(platformFeePaiseFromTicket)
+    : Math.round(baseTicketAmountPaise * (serviceChargePercent / 100));
+
+  const totalAmountPaidPaiseRaw = Number(ticket?.payment?.totalAmountPaidPaise || 0);
+  const computedTotal = baseTicketAmountPaise + serviceFeePaise + platformFeePaise;
+  const totalAmountPaidPaise = Number.isFinite(totalAmountPaidPaiseRaw) && totalAmountPaidPaiseRaw > 0
+    ? Math.round(totalAmountPaidPaiseRaw)
+    : computedTotal;
+
+  return {
+    totalAmountPaidPaise,
+    baseTicketAmountPaise,
+    platformFeePaise,
+    serviceFeePaise,
+    ticketsBooked: Math.max(0, Number(ticket?.tickets?.noOfTickets || ticket?.payment?.ticketsBooked || 0)),
+  };
+};
+
+const buildInternalOrderServiceHeaders = () => ({
+  'x-auth-id': 'event-service',
+  'x-user-id': '',
+  'x-user-email': '',
+  'x-user-username': 'event-service',
+  'x-user-role': 'MANAGER',
+});
+
+const toFiniteNonNegativeInt = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+};
+
+const releaseTicketInventoryForResale = async ({ ticket } = {}) => {
+  const eventId = String(ticket?.eventId || '').trim();
+  const eventSource = String(ticket?.eventSource || '').trim();
+  const requestedTotal = toFiniteNonNegativeInt(ticket?.tickets?.noOfTickets);
+  const selectedTiers = Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [];
+  const selectedDay = normalizeDayKey(ticket?.tickets?.selectedDay);
+
+  if (!eventId || requestedTotal < 1) {
+    return;
+  }
+
+  if (eventSource === 'planning-public') {
+    const planning = await Planning.findOne({ eventId });
+    if (!planning) {
+      throw createApiError(404, 'Event not found while restoring ticket inventory');
+    }
+
+    if (!planning.tickets || typeof planning.tickets !== 'object') {
+      planning.tickets = {};
+    }
+
+    planning.tickets.totalTickets = toFiniteNonNegativeInt(planning?.tickets?.totalTickets) + requestedTotal;
+
+    if (!Array.isArray(planning.tickets.tiers)) {
+      planning.tickets.tiers = [];
+    }
+
+    for (const selectedTier of selectedTiers) {
+      const tierName = String(selectedTier?.name || '').trim();
+      const tierQuantity = toFiniteNonNegativeInt(selectedTier?.noOfTickets);
+      if (!tierName || tierQuantity < 1) continue;
+
+      const tierIndex = planning.tickets.tiers.findIndex(
+        (tier) => normalizeTierNameKey(tier?.tierName) === normalizeTierNameKey(tierName)
+      );
+
+      if (tierIndex < 0) {
+        planning.tickets.tiers.push({
+          tierName,
+          ticketPrice: Number(selectedTier?.price || 0),
+          ticketCount: tierQuantity,
+        });
+      } else {
+        planning.tickets.tiers[tierIndex].ticketCount =
+          toFiniteNonNegativeInt(planning.tickets.tiers[tierIndex]?.ticketCount) + tierQuantity;
+      }
+    }
+
+    if (selectedDay) {
+      if (!Array.isArray(planning.tickets.dayWiseAllocations)) {
+        planning.tickets.dayWiseAllocations = [];
+      }
+
+      let dayRow = planning.tickets.dayWiseAllocations.find(
+        (row) => normalizeDayKey(row?.day) === selectedDay
+      );
+
+      if (!dayRow) {
+        dayRow = {
+          day: selectedDay,
+          ticketCount: 0,
+          tierBreakdown: [],
+        };
+        planning.tickets.dayWiseAllocations.push(dayRow);
+      }
+
+      dayRow.ticketCount = toFiniteNonNegativeInt(dayRow?.ticketCount) + requestedTotal;
+
+      if (!Array.isArray(dayRow.tierBreakdown)) {
+        dayRow.tierBreakdown = [];
+      }
+
+      for (const selectedTier of selectedTiers) {
+        const tierName = String(selectedTier?.name || '').trim();
+        const tierQuantity = toFiniteNonNegativeInt(selectedTier?.noOfTickets);
+        if (!tierName || tierQuantity < 1) continue;
+
+        const tierRowIndex = dayRow.tierBreakdown.findIndex(
+          (row) => normalizeTierNameKey(row?.tierName) === normalizeTierNameKey(tierName)
+        );
+
+        if (tierRowIndex < 0) {
+          dayRow.tierBreakdown.push({
+            tierName,
+            ticketCount: tierQuantity,
+          });
+        } else {
+          dayRow.tierBreakdown[tierRowIndex].ticketCount =
+            toFiniteNonNegativeInt(dayRow.tierBreakdown[tierRowIndex]?.ticketCount) + tierQuantity;
+        }
+      }
+    }
+
+    await planning.save({ validateBeforeSave: false });
+    return;
+  }
+
+  if (eventSource === 'promote') {
+    const promote = await Promote.findOne({ eventId });
+    if (!promote) {
+      throw createApiError(404, 'Event not found while restoring ticket inventory');
+    }
+
+    if (!promote.tickets || typeof promote.tickets !== 'object') {
+      promote.tickets = {};
+    }
+
+    promote.tickets.noOfTickets = toFiniteNonNegativeInt(promote?.tickets?.noOfTickets) + requestedTotal;
+
+    if (!Array.isArray(promote.tickets.tiers)) {
+      promote.tickets.tiers = [];
+    }
+
+    for (const selectedTier of selectedTiers) {
+      const tierName = String(selectedTier?.name || '').trim();
+      const tierQuantity = toFiniteNonNegativeInt(selectedTier?.noOfTickets);
+      if (!tierName || tierQuantity < 1) continue;
+
+      const tierIndex = promote.tickets.tiers.findIndex(
+        (tier) => normalizeTierNameKey(tier?.name) === normalizeTierNameKey(tierName)
+      );
+
+      if (tierIndex < 0) {
+        promote.tickets.tiers.push({
+          name: tierName,
+          price: Number(selectedTier?.price || 0),
+          quantity: tierQuantity,
+        });
+      } else {
+        promote.tickets.tiers[tierIndex].quantity =
+          toFiniteNonNegativeInt(promote.tickets.tiers[tierIndex]?.quantity) + tierQuantity;
+      }
+    }
+
+    if (selectedDay) {
+      if (!Array.isArray(promote.tickets.dayWiseAllocations)) {
+        promote.tickets.dayWiseAllocations = [];
+      }
+
+      let dayRow = promote.tickets.dayWiseAllocations.find(
+        (row) => normalizeDayKey(row?.day) === selectedDay
+      );
+
+      if (!dayRow) {
+        dayRow = {
+          day: selectedDay,
+          ticketCount: 0,
+          tierBreakdown: [],
+        };
+        promote.tickets.dayWiseAllocations.push(dayRow);
+      }
+
+      dayRow.ticketCount = toFiniteNonNegativeInt(dayRow?.ticketCount) + requestedTotal;
+
+      if (!Array.isArray(dayRow.tierBreakdown)) {
+        dayRow.tierBreakdown = [];
+      }
+
+      for (const selectedTier of selectedTiers) {
+        const tierName = String(selectedTier?.name || '').trim();
+        const tierQuantity = toFiniteNonNegativeInt(selectedTier?.noOfTickets);
+        if (!tierName || tierQuantity < 1) continue;
+
+        const tierRowIndex = dayRow.tierBreakdown.findIndex(
+          (row) => normalizeTierNameKey(row?.tierName) === normalizeTierNameKey(tierName)
+        );
+
+        if (tierRowIndex < 0) {
+          dayRow.tierBreakdown.push({
+            tierName,
+            ticketCount: tierQuantity,
+          });
+        } else {
+          dayRow.tierBreakdown[tierRowIndex].ticketCount =
+            toFiniteNonNegativeInt(dayRow.tierBreakdown[tierRowIndex]?.ticketCount) + tierQuantity;
+        }
+      }
+    }
+
+    const currentSold = toFiniteNonNegativeInt(promote?.ticketAnalytics?.ticketsSold);
+    const nextSold = Math.max(0, currentSold - requestedTotal);
+    promote.ticketAnalytics = {
+      ...(promote.ticketAnalytics?.toObject ? promote.ticketAnalytics.toObject() : promote.ticketAnalytics || {}),
+      ticketsSold: nextSold,
+      ticketsYetToSell: Math.max(0, toFiniteNonNegativeInt(promote?.tickets?.noOfTickets)),
+    };
+
+    await promote.save({ validateBeforeSave: false });
+  }
+};
+
+const cancelMyTicket = async ({ ticketId, userAuthId, userId, reason, flags } = {}) => {
+  const authId = String(userAuthId || '').trim();
+  if (!authId) {
+    throw createApiError(401, 'Authentication required');
+  }
+
+  const normalizedTicketId = String(ticketId || '').trim();
+  if (!normalizedTicketId) {
+    throw createApiError(400, 'Ticket ID is required');
+  }
+
+  const ticket = await UserEventTicket.findOne({
+    ticketId: normalizedTicketId,
+    userAuthId: authId,
+  });
+
+  if (!ticket) {
+    throw createApiError(404, 'Ticket not found');
+  }
+
+  if (String(ticket?.ticketStatus || '').trim().toUpperCase() === USER_TICKET_STATUS.CANCELED) {
+    return {
+      alreadyCancelled: true,
+      ticket: mapTicketForFrontend(ticket.toObject()),
+      refund: {
+        requestId: ticket?.cancellation?.requestId || null,
+        reasonCode: ticket?.cancellation?.reasonCode || null,
+        refundedAt: ticket?.cancellation?.refundedAt || null,
+        refundedAmountInInr: Number(((Number(ticket?.cancellation?.refundAmountPaise || 0) || 0) / 100).toFixed(2)),
+      },
+    };
+  }
+
+  const normalizedStatus = String(ticket?.ticketStatus || '').trim().toUpperCase();
+  if (normalizedStatus !== USER_TICKET_STATUS.SUCCESS || !ticket?.isPaid) {
+    throw createApiError(409, 'Only paid and confirmed tickets can be cancelled');
+  }
+
+  const verificationStatus = String(ticket?.verification?.status || '').trim().toUpperCase();
+  if (verificationStatus === USER_TICKET_VERIFICATION_STATUS.VERIFIED) {
+    throw createApiError(409, 'Checked-in tickets cannot be cancelled');
+  }
+
+  const cancellationReason = String(reason || '').trim() || 'Cancelled by user';
+  const normalizedFlags = {
+    eventCancelled: Boolean(flags?.eventCancelled),
+    okkazoFailure: Boolean(flags?.okkazoFailure),
+  };
+
+  const cancelledAt = new Date();
+  const eventDate = resolveTicketEventDateForRefund(ticket);
+  const daysBeforeEvent = computeDaysBeforeTicketEvent(ticket, cancelledAt);
+  const financials = resolveTicketFinancialsForRefund(ticket);
+  const policy = await getTicketRefundPolicy();
+
+  let reasonCode = 'CLIENT_CANCELLED';
+  let refundPercent = 0;
+  let refundRuleCode = null;
+  let refundableAmountBasePaise = financials.baseTicketAmountPaise;
+
+  if (normalizedFlags.okkazoFailure || normalizedFlags.eventCancelled) {
+    refundPercent = 100;
+    refundRuleCode = 'EVENT_CANCELLED_OR_OKKAZO_FAILURE';
+    refundableAmountBasePaise = financials.totalAmountPaidPaise;
+    reasonCode = normalizedFlags.okkazoFailure ? 'OKKAZO_FAILURE' : 'VENDOR_UNAVAILABLE';
+  } else {
+    const rule = resolveTicketRefundPolicyRule(daysBeforeEvent, policy?.slabs || []);
+    refundPercent = Number(rule?.refundPercent || 0);
+    refundRuleCode = String(rule?.code || '').trim() || null;
+    reasonCode = 'CLIENT_CANCELLED';
+  }
+
+  const refundAmountPaise = Math.max(
+    0,
+    Math.round((Math.max(0, refundableAmountBasePaise) * Math.max(0, refundPercent)) / 100)
+  );
+
+  const requestId = uuidv4();
+  let refundResponse = null;
+  if (refundAmountPaise > 0) {
+    try {
+      const response = await axios.post(
+        `${ORDER_SERVICE_URL}/orders/refund/ticket-sale`,
+        {
+          eventId: ticket.eventId,
+          authId,
+          ticketId: normalizedTicketId,
+          amount: Number((refundAmountPaise / 100).toFixed(2)),
+          reasonCode,
+          notes: {
+            refundType: 'REFUND',
+            cancellationRequestId: requestId,
+            cancellationReason,
+            refundRuleCode,
+            refundPercent,
+            cancellationMode: normalizedFlags.okkazoFailure || normalizedFlags.eventCancelled
+              ? 'EVENT_CANCELLED'
+              : 'USER_CANCELLED',
+          },
+        },
+        {
+          headers: buildInternalOrderServiceHeaders(),
+          timeout: 10_000,
+        }
+      );
+      refundResponse = response?.data?.data || null;
+    } catch (error) {
+      const upstreamMessage = error?.response?.data?.message || error?.message || 'Failed to process ticket refund';
+      throw createApiError(error?.response?.status || 500, upstreamMessage);
+    }
+  }
+
+  await releaseTicketInventoryForResale({ ticket });
+
+  ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+  ticket.cancellation = {
+    requestId,
+    cancelledAt,
+    eventDate,
+    reason: cancellationReason,
+    reasonCode,
+    flags: normalizedFlags,
+    policyRuleCode: refundRuleCode,
+    refundPercent,
+    refundAmountPaise,
+    totalAmountPaidPaise: financials.totalAmountPaidPaise,
+    baseTicketAmountPaise: financials.baseTicketAmountPaise,
+    platformFeePaise: financials.platformFeePaise,
+    serviceFeePaise: financials.serviceFeePaise,
+    daysBeforeEvent,
+    timelineLabel: normalizeTicketRefundTimelineLabel(policy?.timelineLabel),
+    refundPaymentOrderId: refundResponse?.paymentOrderId || null,
+    refundedAt: refundResponse?.refundedAt ? new Date(refundResponse.refundedAt) : cancelledAt,
+  };
+  await ticket.save({ validateBeforeSave: false });
+
+  try {
+    await publishEvent('TICKET_CANCELLED_BY_USER', {
+      eventId: String(ticket?.eventId || '').trim(),
+      authId,
+      ticketId: normalizedTicketId,
+      eventTitle: String(ticket?.eventTitle || '').trim() || 'Event',
+      eventStartAt: ticket?.schedule?.startAt || null,
+      selectedDay: ticket?.tickets?.selectedDay || null,
+      cancelledAt: cancelledAt.toISOString(),
+      cancellationReason,
+      reasonCode,
+      refundPercent,
+      refundAmountPaise,
+      refundAmountInInr: Number((refundAmountPaise / 100).toFixed(2)),
+      timelineLabel: normalizeTicketRefundTimelineLabel(policy?.timelineLabel),
+      actionUrl: '/user/my-events',
+    });
+  } catch (publishError) {
+    logger.warn('Failed to publish ticket cancellation event', {
+      eventId: ticket?.eventId,
+      ticketId: normalizedTicketId,
+      authId,
+      message: publishError?.message,
+    });
+  }
+
+  const refundRequestPayload = {
+    requestId,
+    requestedBy: {
+      userId: String(userId || authId || '').trim(),
+      role: 'USER',
+    },
+    eventId: String(ticket?.eventId || '').trim(),
+    ticketOrderId: normalizedTicketId,
+    cancellation: {
+      cancelledAt,
+      eventDate,
+      reason: cancellationReason,
+    },
+    financials: {
+      totalAmountPaid: Number((financials.totalAmountPaidPaise / 100).toFixed(2)),
+      baseTicketAmount: Number((financials.baseTicketAmountPaise / 100).toFixed(2)),
+      platformFee: Number((financials.platformFeePaise / 100).toFixed(2)),
+      serviceFee: Number((financials.serviceFeePaise / 100).toFixed(2)),
+      ticketsBooked: Number(financials.ticketsBooked || 0),
+    },
+    flags: {
+      eventCancelled: normalizedFlags.eventCancelled,
+      okkazoFailure: normalizedFlags.okkazoFailure,
+    },
+  };
+
+  return {
+    alreadyCancelled: false,
+    ticket: mapTicketForFrontend(ticket.toObject()),
+    refundRequest: refundRequestPayload,
+    refund: {
+      reasonCode,
+      refundPercent,
+      ruleCode: refundRuleCode,
+      daysBeforeEvent,
+      timelineLabel: normalizeTicketRefundTimelineLabel(policy?.timelineLabel),
+      refundAmountPaise,
+      refundAmountInInr: Number((refundAmountPaise / 100).toFixed(2)),
+      totalAmountPaidInInr: Number((financials.totalAmountPaidPaise / 100).toFixed(2)),
+      baseTicketAmountInInr: Number((financials.baseTicketAmountPaise / 100).toFixed(2)),
+      platformFeeInInr: Number((financials.platformFeePaise / 100).toFixed(2)),
+      serviceFeeInInr: Number((financials.serviceFeePaise / 100).toFixed(2)),
+      refundedAt: refundResponse?.refundedAt || cancelledAt.toISOString(),
+      refundOrderId: refundResponse?.refundId || null,
+      paymentOrderId: refundResponse?.paymentOrderId || null,
+      eventCancelled: normalizedFlags.eventCancelled,
+      okkazoFailure: normalizedFlags.okkazoFailure,
+    },
+  };
+};
+
 const getMyTicketByTicketId = async ({ ticketId, userAuthId } = {}) => {
   const authId = String(userAuthId || '').trim();
   if (!authId) {
@@ -1413,7 +2150,9 @@ const getMyTickets = async ({ userAuthId } = {}) => {
 
   const rows = await UserEventTicket.find({
     userAuthId: authId,
-    ticketStatus: USER_TICKET_STATUS.SUCCESS,
+    ticketStatus: {
+      $in: [USER_TICKET_STATUS.SUCCESS, USER_TICKET_STATUS.CANCELED],
+    },
   })
     .sort({ paidAt: -1, createdAt: -1 })
     .lean();
@@ -1873,10 +2612,62 @@ const markTicketSalePaid = async (payload = {}) => {
   ticket.ticketStatus = USER_TICKET_STATUS.SUCCESS;
   ticket.paidAt = payload?.paidAt ? new Date(payload.paidAt) : new Date();
   ticket.expiresAt = null;
+  ticket.paymentOrderId = String(payload?.paymentOrderId || '').trim() || null;
+  ticket.transactionId = String(payload?.transactionId || '').trim() || null;
+
+  const notes = payload?.notes && typeof payload.notes === 'object' ? payload.notes : {};
+  const serviceChargePercentRaw = Number(notes?.serviceChargePercent || 0);
+  const serviceChargePercent = Number.isFinite(serviceChargePercentRaw)
+    ? Math.max(0, Math.min(100, Number(serviceChargePercentRaw.toFixed(2))))
+    : 0;
+
+  const baseTicketAmountInInrRaw = Number(notes?.baseTicketAmountInInr);
+  const fallbackBaseTicketAmountInInr = Number(ticket?.tickets?.totalAmount || 0);
+  const baseTicketAmountInInr = Number.isFinite(baseTicketAmountInInrRaw) && baseTicketAmountInInrRaw >= 0
+    ? baseTicketAmountInInrRaw
+    : (Number.isFinite(fallbackBaseTicketAmountInInr) && fallbackBaseTicketAmountInInr >= 0
+      ? fallbackBaseTicketAmountInInr
+      : 0);
+
+  const serviceFeeInInrRaw = Number(notes?.serviceFeeInInr);
+  const platformFeeInInrRaw = Number(notes?.platformFeeInInr);
+  const computedFeeInInr = baseTicketAmountInInr > 0 ? (baseTicketAmountInInr * (serviceChargePercent / 100)) : 0;
+  const serviceFeeInInr = Number.isFinite(serviceFeeInInrRaw) && serviceFeeInInrRaw >= 0
+    ? serviceFeeInInrRaw
+    : computedFeeInInr;
+  const platformFeeInInr = Number.isFinite(platformFeeInInrRaw) && platformFeeInInrRaw >= 0
+    ? platformFeeInInrRaw
+    : computedFeeInInr;
+
+  const checkoutTotalInInrRaw = Number(notes?.checkoutTotalInInr);
+  const computedTotalInInr = baseTicketAmountInInr + serviceFeeInInr + platformFeeInInr;
+  const totalAmountPaidInInr = Number.isFinite(checkoutTotalInInrRaw) && checkoutTotalInInrRaw > 0
+    ? checkoutTotalInInrRaw
+    : computedTotalInInr;
+
+  ticket.payment = {
+    totalAmountPaidPaise: Math.max(0, Math.round(totalAmountPaidInInr * 100)),
+    baseTicketAmountPaise: Math.max(0, Math.round(baseTicketAmountInInr * 100)),
+    platformFeePaise: Math.max(0, Math.round(platformFeeInInr * 100)),
+    serviceFeePaise: Math.max(0, Math.round(serviceFeeInInr * 100)),
+    serviceChargePercent,
+    ticketsBooked: Math.max(0, Number(ticket?.tickets?.noOfTickets || notes?.ticketQuantity || 0)),
+    currency: String(payload?.currency || ticket?.tickets?.currency || 'INR').trim() || 'INR',
+    paidAt: ticket.paidAt,
+  };
+
   await ticket.save();
 
   return mapTicketForFrontend(ticket.toObject());
 };
+
+const getTicketRefundPolicyForApi = async () => getTicketRefundPolicy();
+
+const updateTicketRefundPolicyForApi = async ({ slabs, timelineLabel, updatedByAuthId } = {}) => updateTicketRefundPolicy({
+  slabs,
+  timelineLabel,
+  updatedByAuthId,
+});
 
 module.exports = {
   getTicketMarketplaceEvents,
@@ -1885,9 +2676,12 @@ module.exports = {
   confirmFreeTicketPurchase,
   getMyTickets,
   getMyTicketByTicketId,
+  cancelMyTicket,
   getEventTicketGuests,
   exportEventTicketGuestsCsv,
   notifyEventTicketGuests,
   markTicketSalePaid,
   verifyTicketQr,
+  getTicketRefundPolicyForApi,
+  updateTicketRefundPolicyForApi,
 };

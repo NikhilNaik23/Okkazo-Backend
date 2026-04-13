@@ -1,5 +1,7 @@
 const promoteConfigService = require('../services/promoteConfigService');
 const promotionConfigService = require('../services/promotionConfigService');
+const planningService = require('../services/planningService');
+const ticketMarketplaceService = require('../services/ticketMarketplaceService');
 const logger = require('../utils/logger');
 const { getState: getManagerAutoAssignState, setEnabledOverride } = require('../jobs/managerAutoAssignRuntimeConfig');
 const { startManagerAutoAssignJob, stopManagerAutoAssignJob } = require('../jobs/managerAutoAssignJob');
@@ -94,6 +96,90 @@ module.exports = {
   updateFees,
   getPromotions,
   updatePromotions,
+  getRefundPolicy: async (req, res) => {
+    try {
+      const data = await planningService.getPlanningRefundPolicyForApi();
+      return res.status(200).json({
+        success: true,
+        data,
+      });
+    } catch (error) {
+      logger.error('Error in getRefundPolicy:', error);
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Failed to fetch refund policy',
+      });
+    }
+  },
+
+  updateRefundPolicy: async (req, res) => {
+    try {
+      await planningService.resolveRevenueOpsManagerContext({
+        authId: req.user?.authId,
+        role: req.user?.role,
+      });
+
+      const data = await planningService.updatePlanningRefundPolicyForApi({
+        slabs: req.body?.slabs,
+        timelineLabel: req.body?.timelineLabel,
+        updatedByAuthId: req.user?.authId,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Refund policy updated successfully',
+        data,
+      });
+    } catch (error) {
+      logger.error('Error in updateRefundPolicy:', error);
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Failed to update refund policy',
+      });
+    }
+  },
+  getTicketRefundPolicy: async (req, res) => {
+    try {
+      const data = await ticketMarketplaceService.getTicketRefundPolicyForApi();
+      return res.status(200).json({
+        success: true,
+        data,
+      });
+    } catch (error) {
+      logger.error('Error in getTicketRefundPolicy:', error);
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Failed to fetch ticket refund policy',
+      });
+    }
+  },
+
+  updateTicketRefundPolicy: async (req, res) => {
+    try {
+      await planningService.resolveRevenueOpsManagerContext({
+        authId: req.user?.authId,
+        role: req.user?.role,
+      });
+
+      const data = await ticketMarketplaceService.updateTicketRefundPolicyForApi({
+        slabs: req.body?.slabs,
+        timelineLabel: req.body?.timelineLabel,
+        updatedByAuthId: req.user?.authId,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'Ticket refund policy updated successfully',
+        data,
+      });
+    } catch (error) {
+      logger.error('Error in updateTicketRefundPolicy:', error);
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Failed to update ticket refund policy',
+      });
+    }
+  },
   // GET /config/manager-autoassign (Admin only)
   getManagerAutoAssign: async (req, res) => {
     try {
