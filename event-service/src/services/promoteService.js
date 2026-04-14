@@ -1000,6 +1000,68 @@ const sendPromoteOwnerLiabilityRecoveryNotification = async ({
   }
 };
 
+const sendPromoteOwnerAdminRejectionNotification = async ({
+  promote,
+  ownerAuthId,
+  refundedAmountPaise = 0,
+  refundInitiated = false,
+} = {}) => {
+  const normalizedOwnerAuthId = String(ownerAuthId || '').trim();
+  const eventId = String(promote?.eventId || '').trim();
+  if (!normalizedOwnerAuthId || !eventId) {
+    return { sent: false, reason: 'Missing owner rejection notification context' };
+  }
+
+  const eventTitle = String(promote?.eventTitle || '').trim() || `Event ${eventId}`;
+  const safeRefundPaise = Math.max(0, Math.round(Number(refundedAmountPaise || 0)));
+  const refundInr = Number((safeRefundPaise / 100).toFixed(2));
+  const actionUrl = `${resolveFrontendBaseUrl()}/user/event-management`;
+
+  let message;
+  if (refundInitiated && safeRefundPaise > 0) {
+    message = `Your promote event "${eventTitle}" was rejected by admin. A full refund of INR ${refundInr.toFixed(2)} has been initiated to your original payment method.`;
+  } else if (safeRefundPaise > 0) {
+    message = `Your promote event "${eventTitle}" was rejected by admin. Your payment of INR ${refundInr.toFixed(2)} has already been refunded.`;
+  } else {
+    message = `Your promote event "${eventTitle}" was rejected by admin. No captured payment was found for this event, so no refund transaction was required.`;
+  }
+
+  try {
+    await axios.post(
+      `${notificationServiceUrl}/system/send-to-user`,
+      {
+        recipientAuthId: normalizedOwnerAuthId,
+        recipientRole: 'USER',
+        title: `Event Rejected: ${eventTitle}`,
+        message,
+        actionUrl,
+        category: 'EVENT',
+        type: 'EVENT_REJECTED',
+        metadata: {
+          eventId,
+          eventType: 'promote',
+          refundedAmountPaise: safeRefundPaise,
+          refundInitiated: Boolean(refundInitiated),
+          source: 'event-service:promote-admin-reject',
+        },
+      },
+      {
+        headers: buildSystemNotificationHeaders(),
+        timeout: 10_000,
+      }
+    );
+
+    return { sent: true };
+  } catch (error) {
+    logger.warn('Failed to send promote admin rejection notification to owner', {
+      eventId,
+      ownerAuthId: normalizedOwnerAuthId,
+      message: error?.response?.data?.message || error?.message || String(error),
+    });
+    return { sent: false, error: error?.message || String(error) };
+  }
+};
+
 let immediateAutoAssignCursor = 0;
 
 const rotateListFromCursor = (ids = []) => {
@@ -2194,12 +2256,70 @@ const decidePromote = async (
   if (!promote) throw createApiError(404, 'Promote record not found');
 
   if (normalizedDecision === 'REJECT') {
+    const normalizedOwnerAuthId = String(promote?.authId || '').trim();
+    const orders = await fetchOrdersForEventFromOrderService(promote.eventId);
+    const ownerOrders = (Array.isArray(orders) ? orders : []).filter(
+      (row) => String(row?.authId || '').trim() === normalizedOwnerAuthId
+    );
+
+    const paidOwnerPromoteAmountPaise = ownerOrders.reduce((sum, row) => {
+      const status = String(row?.status || '').trim().toUpperCase();
+      const orderType = String(row?.orderType || '').trim().toUpperCase();
+      if (status !== 'PAID' || orderType !== 'PROMOTE EVENT') return sum;
+
+      const amountPaise = Math.max(0, Number(row?.amount || 0));
+      return sum + (Number.isFinite(amountPaise) ? amountPaise : 0);
+    }, 0);
+
+    const alreadyRefundedOwnerAmountPaise = ownerOrders.reduce((sum, row) => {
+      const status = String(row?.status || '').trim().toUpperCase();
+      const orderType = String(row?.orderType || '').trim().toUpperCase();
+      if (status !== 'REFUNDED') return sum;
+      if (!['PROMOTE EVENT', 'REFUND', 'PLANNING_REFUND'].includes(orderType)) return sum;
+
+      const amountPaise = Math.max(0, Number(row?.refundedAmount || row?.amount || 0));
+      return sum + (Number.isFinite(amountPaise) ? amountPaise : 0);
+    }, 0);
+
+    let ownerRefund = {
+      skipped: true,
+      reason: paidOwnerPromoteAmountPaise > 0
+        ? null
+        : (alreadyRefundedOwnerAmountPaise > 0
+          ? 'Owner promote payment already refunded'
+          : 'Owner promote payment not found or not paid'),
+      refundedAmount: Math.max(0, alreadyRefundedOwnerAmountPaise),
+      refundId: null,
+      transactionId: null,
+      refundedAt: null,
+      refundInitiated: false,
+    };
+
+    if (paidOwnerPromoteAmountPaise > 0) {
+      ownerRefund = await processPromoteOwnerRefund({
+        eventId: String(promote.eventId || '').trim(),
+        ownerAuthId: normalizedOwnerAuthId,
+        refundAmountPaise: paidOwnerPromoteAmountPaise,
+        reasonCode: 'OKKAZO_FAILURE',
+        initiatedByAuthId: decidedByAuthId || null,
+        managerNotes: rejectionReason ? String(rejectionReason).trim().slice(0, 500) : null,
+        scenarioCode: PROMOTE_REFUND_SCENARIO_CODES.OKKAZO_FAILURE,
+      });
+
+      if (ownerRefund?.error) {
+        throw createApiError(502, ownerRefund.error);
+      }
+
+      ownerRefund.refundInitiated = !ownerRefund?.skipped && Number(ownerRefund?.refundedAmount || 0) > 0;
+    }
+
     promote.adminDecision = {
       status: ADMIN_DECISION_STATUS.REJECTED,
       decidedAt: now,
       decidedByAuthId: decidedByAuthId || null,
       rejectionReason: rejectionReason ? String(rejectionReason).trim().slice(0, 500) : null,
     };
+    promote.eventStatus = PROMOTE_STATUS.CLOSED;
     promote.assignedManagerId = null;
     promote.managerAssignment = {
       assignedAt: null,
@@ -2208,6 +2328,14 @@ const decidePromote = async (
     };
 
     await promote.save();
+
+    await sendPromoteOwnerAdminRejectionNotification({
+      promote,
+      ownerAuthId: normalizedOwnerAuthId,
+      refundedAmountPaise: Math.max(0, Number(ownerRefund?.refundedAmount || 0)),
+      refundInitiated: Boolean(ownerRefund?.refundInitiated),
+    });
+
     logger.info(`Promote ${eventId} rejected by ${decidedByAuthId || 'admin'}`);
     return promote;
   }
@@ -2309,6 +2437,7 @@ const getAdminDashboard = async ({ limit = 200 } = {}) => {
     Promote.find({
       assignedManagerId: null,
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
+      eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
     })
       .sort({ createdAt: -1 })
       .limit(safeLimit)
