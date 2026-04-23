@@ -65,6 +65,12 @@ const ticketCancellationEmailDedupeTtlMs = parseInt(
 );
 const sentTicketCancellationEmails = new Map();
 
+const publicQuoteEstimateDedupeTtlMs = parseInt(
+  process.env.PUBLIC_QUOTE_EMAIL_DEDUPE_TTL_MS || '86400000',
+  10
+);
+const sentPublicQuoteEstimateEmails = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
@@ -151,6 +157,15 @@ const pruneTicketCancellationSentCache = () => {
   for (const [key, ts] of sentTicketCancellationEmails.entries()) {
     if (now - ts > ticketCancellationEmailDedupeTtlMs) {
       sentTicketCancellationEmails.delete(key);
+    }
+  }
+};
+
+const prunePublicQuoteEstimateSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentPublicQuoteEstimateEmails.entries()) {
+    if (now - ts > publicQuoteEstimateDedupeTtlMs) {
+      sentPublicQuoteEstimateEmails.delete(key);
     }
   }
 };
@@ -973,6 +988,54 @@ const handleVendorRequestRejectedAlternatives = async (event) => {
   sentAlternativesEmails.set(dedupeKey, Date.now());
 };
 
+const handlePublicQuoteEstimateRequested = async (event) => {
+  const {
+    requestId,
+    recipientEmail,
+    recipientName,
+    eventType,
+    attendees,
+    phone,
+    submittedAt,
+    message,
+    selectedServices,
+    estimatedServices,
+    totalEstimatedRange,
+  } = event || {};
+
+  if (!requestId || !recipientEmail || !Array.isArray(estimatedServices)) {
+    logger.error('PUBLIC_QUOTE_ESTIMATE_REQUESTED missing required fields', { event });
+    return;
+  }
+
+  prunePublicQuoteEstimateSentCache();
+  const dedupeKey = String(requestId || '').trim() || `${String(recipientEmail || '').trim().toLowerCase()}:${String(submittedAt || '')}`;
+  if (sentPublicQuoteEstimateEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate public quote estimate email', { requestId, recipientEmail });
+    return;
+  }
+
+  await emailService.sendPublicQuoteEstimateEmail(recipientEmail, {
+    requestId,
+    recipientName: recipientName || 'there',
+    eventType,
+    attendees,
+    phone,
+    submittedAt,
+    message,
+    selectedServices: Array.isArray(selectedServices) ? selectedServices : [],
+    estimatedServices,
+    totalEstimatedRange,
+  });
+
+  sentPublicQuoteEstimateEmails.set(dedupeKey, Date.now());
+  logger.info('Processed PUBLIC_QUOTE_ESTIMATE_REQUESTED email', {
+    requestId,
+    recipientEmail,
+    services: estimatedServices.length,
+  });
+};
+
 const fetchUserByAuthId = async (authId) => {
   try {
     const response = await axios.get(`${userServiceUrl}/auth/${encodeURIComponent(authId)}`, {
@@ -1588,6 +1651,11 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'PLANNING_QUOTE_LOCKED':
       if (topic === eventTopic) {
         await handlePlanningQuoteLocked(payload);
+      }
+      break;
+    case 'PUBLIC_QUOTE_ESTIMATE_REQUESTED':
+      if (topic === eventTopic) {
+        await handlePublicQuoteEstimateRequested(payload);
       }
       break;
     case 'PLANNING_REMAINING_PAYMENT_CONFIRMED':

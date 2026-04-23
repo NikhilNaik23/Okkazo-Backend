@@ -7,7 +7,9 @@ const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 const axios = require('axios');
+const Joi = require('joi');
 const vendorReservationService = require('../services/vendorReservationService');
+const { randomUUID } = require('crypto');
 const {
   toIstDayString,
   normalizeIstDayInput,
@@ -23,6 +25,174 @@ const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '1000
 const HIGH_DEMAND_START_DAYS = 6;
 const HIGH_DEMAND_END_DAYS = 20;
 const PLANNING_LIFECYCLE_STATUSES = new Set(['CONFIRMED', 'LIVE', 'COMPLETED', 'COMPLETE', 'CLOSED']);
+const PUBLIC_QUOTE_MAX_SERVICES = 10;
+const PUBLIC_QUOTE_ALLOWED_EMAIL_DOMAINS = new Set([
+  'gmail.com',
+  'outlook.com',
+  'yahoo.com',
+  'icloud.com',
+]);
+
+const PUBLIC_QUOTE_EMAIL_DOMAIN_REGEX = /^[^\s@]+@([^\s@]+)$/;
+
+const isAllowedPublicQuoteEmailDomain = (email) => {
+  const normalized = String(email || '').trim().toLowerCase();
+  const match = normalized.match(PUBLIC_QUOTE_EMAIL_DOMAIN_REGEX);
+  if (!match) return false;
+  const domain = String(match[1] || '').toLowerCase();
+  return PUBLIC_QUOTE_ALLOWED_EMAIL_DOMAINS.has(domain);
+};
+
+const sanitizeSingleLineText = (value) => String(value || '')
+  .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const sanitizeMultiLineText = (value) => String(value || '')
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]+/g, ' ')
+  .trim();
+
+const PUBLIC_QUOTE_REQUEST_SCHEMA = Joi.object({
+  name: Joi.string()
+    .trim()
+    .min(2)
+    .max(80)
+    .pattern(/^[A-Za-z][A-Za-z\s.'-]*$/)
+    .required(),
+  email: Joi.string()
+    .trim()
+    .lowercase()
+    .email({ tlds: { allow: false } })
+    .custom((value, helpers) => {
+      if (!isAllowedPublicQuoteEmailDomain(value)) {
+        return helpers.error('string.publicQuoteAllowedDomain');
+      }
+      return value;
+    }, 'allowed email domain validation')
+    .required(),
+  phone: Joi.string()
+    .trim()
+    .pattern(/^\+?[0-9][0-9\s()-]{6,19}$/)
+    .required(),
+  eventType: Joi.string()
+    .trim()
+    .min(2)
+    .max(60)
+    .pattern(/^[A-Za-z0-9][A-Za-z0-9\s&/.'-]*$/)
+    .required(),
+  attendees: Joi.string()
+    .trim()
+    .valid('<50', '50-100', '100-300', '300-500', '500+')
+    .required(),
+  services: Joi.array()
+    .items(
+      Joi.string()
+        .trim()
+        .min(2)
+        .max(80)
+        .pattern(/^[A-Za-z0-9][A-Za-z0-9\s&/:(),.'-]*$/)
+    )
+    .min(1)
+    .max(PUBLIC_QUOTE_MAX_SERVICES)
+    .required(),
+  message: Joi.string()
+    .trim()
+    .max(500)
+    .pattern(/^[^<>]*$/)
+    .allow('', null)
+    .optional(),
+}).required().unknown(false).messages({
+  'string.publicQuoteAllowedDomain': 'Email domain must be gmail.com, outlook.com, yahoo.com, or icloud.com',
+});
+
+const normalizePublicQuoteServiceLabel = (value) => String(value || '').trim();
+
+const resolvePublicQuoteCategories = (serviceLabel) => {
+  const normalized = normalizePublicQuoteServiceLabel(serviceLabel).toLowerCase();
+  if (!normalized) return [];
+
+  if (normalized.includes('venue')) return ['Venue'];
+  if (normalized.includes('cater')) return ['Catering & Drinks'];
+  if (normalized.includes('decor')) return ['Decor & Styling'];
+  if (normalized.includes('photo')) return ['Photography', 'Videography'];
+  if (normalized.includes('music') || normalized.includes('sound')) {
+    return ['Sound & Lighting', 'Entertainment & Artists'];
+  }
+  if (normalized.includes('security')) return ['Security & Safety'];
+  if (normalized.includes('other')) return ['Other'];
+  return [];
+};
+
+const formatInr = (value) => `₹${Math.round(Number(value || 0)).toLocaleString('en-IN')}`;
+
+const formatInrRange = (min, max) => {
+  const minN = Number(min);
+  const maxN = Number(max);
+  if (!Number.isFinite(minN) || minN <= 0) return '—';
+  const safeMax = Number.isFinite(maxN) && maxN >= minN ? maxN : minN;
+  return `${formatInr(minN)} - ${formatInr(safeMax)}`;
+};
+
+const parsePositiveServicePrice = (service) => {
+  const candidates = [
+    service?.price,
+    service?.priceMin,
+    service?.priceMax,
+    service?.servicePrice?.min,
+    service?.servicePrice?.max,
+  ];
+
+  for (const candidate of candidates) {
+    const n = Number(candidate);
+    if (Number.isFinite(n) && n > 0) {
+      return n;
+    }
+  }
+
+  return null;
+};
+
+const computeAverageRangeFromPrices = (prices = []) => {
+  const sanitized = prices
+    .map((p) => Number(p))
+    .filter((p) => Number.isFinite(p) && p > 0);
+
+  if (sanitized.length === 0) return null;
+
+  const avg = sanitized.reduce((sum, p) => sum + p, 0) / sanitized.length;
+  const observedMin = sanitized.reduce((min, p) => (p < min ? p : min), sanitized[0]);
+  const observedMax = sanitized.reduce((max, p) => (p > max ? p : max), sanitized[0]);
+
+  let minEstimate;
+  let maxEstimate;
+
+  if (sanitized.length === 1) {
+    minEstimate = avg * 0.9;
+    maxEstimate = avg * 1.1;
+  } else {
+    const variance = sanitized.reduce((sum, p) => sum + ((p - avg) ** 2), 0) / sanitized.length;
+    const stdDev = Math.sqrt(Math.max(0, variance));
+    const spread = Math.max(avg * 0.1, stdDev);
+    minEstimate = avg - spread;
+    maxEstimate = avg + spread;
+  }
+
+  let minInr = Math.round(Math.max(1, minEstimate, observedMin));
+  let maxInr = Math.round(Math.min(Math.max(maxEstimate, minInr), observedMax > 0 ? observedMax : maxEstimate));
+
+  if (!Number.isFinite(maxInr) || maxInr < minInr) {
+    maxInr = minInr;
+  }
+
+  const averageInr = Math.round(avg);
+
+  return {
+    averageInr,
+    minInr,
+    maxInr,
+    label: formatInrRange(minInr, maxInr),
+  };
+};
 
 const listAcceptedVendorAuthIdsForEvent = async (eventId) => {
   const normalizedEventId = String(eventId || '').trim();
@@ -392,6 +562,180 @@ const createPlanning = async (req, res) => {
     res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
+    });
+  }
+};
+
+/**
+ * Public custom quote request endpoint.
+ * POST /public/quote-request
+ */
+const submitPublicQuoteRequest = async (req, res) => {
+  try {
+    const { value, error } = PUBLIC_QUOTE_REQUEST_SCHEMA.validate(req.body || {}, {
+      abortEarly: false,
+      convert: true,
+      stripUnknown: true,
+    });
+
+    if (error) {
+      const firstMessage = error.details?.[0]?.message || 'Invalid quote request payload';
+      return res.status(400).json({
+        success: false,
+        message: firstMessage,
+      });
+    }
+
+    const name = sanitizeSingleLineText(value.name);
+    const email = sanitizeSingleLineText(value.email).toLowerCase();
+    const phone = sanitizeSingleLineText(value.phone);
+    const eventType = sanitizeSingleLineText(value.eventType);
+    const attendees = sanitizeSingleLineText(value.attendees);
+    const message = value.message == null || String(value.message).trim() === ''
+      ? null
+      : sanitizeMultiLineText(value.message);
+
+    const selectedServices = Array.from(
+      new Set(
+        (Array.isArray(value?.services) ? value.services : [])
+          .map((service) => normalizePublicQuoteServiceLabel(service))
+          .map((service) => sanitizeSingleLineText(service))
+          .filter(Boolean)
+      )
+    ).slice(0, PUBLIC_QUOTE_MAX_SERVICES);
+
+    if (selectedServices.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please select at least one service',
+      });
+    }
+
+    const serviceEntries = selectedServices.map((serviceLabel) => ({
+      serviceLabel,
+      categories: resolvePublicQuoteCategories(serviceLabel),
+    }));
+
+    const uniqueCategories = Array.from(
+      new Set(serviceEntries.flatMap((entry) => entry.categories))
+    );
+
+    if (uniqueCategories.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected services are not supported for quote estimation',
+      });
+    }
+
+    const categorySamples = await Promise.all(
+      uniqueCategories.map(async (serviceCategory) => {
+        try {
+          const services = await fetchAllVendorsBasedOnService({
+            serviceCategory,
+            limit: 100,
+            skip: 0,
+            preferAvailabilityEndpoint: false,
+          });
+
+          const prices = services
+            .map((service) => parsePositiveServicePrice(service))
+            .filter((price) => price != null);
+
+          return [serviceCategory, { sampleSize: prices.length, prices }];
+        } catch (error) {
+          logger.warn('Failed to fetch vendor services for public quote category', {
+            serviceCategory,
+            message: error?.message,
+          });
+          return [serviceCategory, { sampleSize: 0, prices: [] }];
+        }
+      })
+    );
+
+    const categorySampleMap = new Map(categorySamples);
+
+    const estimatedServices = serviceEntries.map((entry) => {
+      const prices = entry.categories.flatMap((category) => {
+        const sample = categorySampleMap.get(category);
+        return Array.isArray(sample?.prices) ? sample.prices : [];
+      });
+
+      const sampleSize = prices.length;
+      const estimatedRange = computeAverageRangeFromPrices(prices);
+
+      return {
+        serviceLabel: entry.serviceLabel,
+        mappedCategories: entry.categories,
+        sampleSize,
+        averagePriceInr: estimatedRange?.averageInr || null,
+        estimatedRange: estimatedRange
+          ? {
+            minInr: estimatedRange.minInr,
+            maxInr: estimatedRange.maxInr,
+            label: estimatedRange.label,
+          }
+          : null,
+      };
+    });
+
+    const estimatedRanges = estimatedServices
+      .map((entry) => entry.estimatedRange)
+      .filter(Boolean);
+
+    if (estimatedRanges.length === 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'No active vendor pricing found for the selected services',
+      });
+    }
+
+    const totalMinInr = estimatedRanges.reduce((sum, range) => sum + Number(range.minInr || 0), 0);
+    const totalMaxInr = estimatedRanges.reduce((sum, range) => sum + Number(range.maxInr || 0), 0);
+    const totalRangeLabel = formatInrRange(totalMinInr, totalMaxInr);
+
+    const requestId = randomUUID();
+    const submittedAt = new Date().toISOString();
+
+    await publishEvent(
+      'PUBLIC_QUOTE_ESTIMATE_REQUESTED',
+      {
+        requestId,
+        submittedAt,
+        recipientName: name,
+        recipientEmail: email,
+        phone,
+        eventType,
+        attendees,
+        message,
+        selectedServices,
+        estimatedServices,
+        totalEstimatedRange: {
+          minInr: totalMinInr,
+          maxInr: totalMaxInr,
+          label: totalRangeLabel,
+        },
+      },
+      requestId
+    );
+
+    return res.status(202).json({
+      success: true,
+      message: 'Quote request submitted. Estimate email queued successfully.',
+      data: {
+        requestId,
+        totalEstimatedRange: totalRangeLabel,
+        estimatedServices: estimatedServices.map((entry) => ({
+          serviceLabel: entry.serviceLabel,
+          sampleSize: entry.sampleSize,
+          estimatedRange: entry.estimatedRange?.label || null,
+        })),
+      },
+    });
+  } catch (error) {
+    logger.error('Error in submitPublicQuoteRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to submit quote request',
     });
   }
 };
@@ -1318,6 +1662,37 @@ const triggerPlanningEmailBlastPromotionAction = async (req, res) => {
 };
 
 /**
+ * Trigger SOCIAL SYNERGY promotion action (Manager/Admin)
+ * POST /planning/:eventId/promotion-actions/social-synergy
+ */
+const triggerPlanningSocialSynergyPromotionAction = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const result = await planningService.triggerPlanningSocialSynergyPromotionAction({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result?.simulated
+        ? 'Social Synergy preview generated (dry run mode)'
+        : 'Social Synergy post published on Instagram successfully',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in triggerPlanningSocialSynergyPromotionAction:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to trigger social synergy',
+    });
+  }
+};
+
+/**
  * Confirm a planning selection (Owner)
  * POST /planning/:eventId/confirm
  */
@@ -1759,6 +2134,7 @@ const getVendorsForPlanning = async (req, res) => {
 };
 
 module.exports = {
+  submitPublicQuoteRequest,
   createPlanning,
   getMyPlannings,
   getPlanningByEventId,
@@ -1787,4 +2163,5 @@ module.exports = {
   removePlanningCoreStaff,
   releasePlanningGeneratedRevenuePayout,
   triggerPlanningEmailBlastPromotionAction,
+  triggerPlanningSocialSynergyPromotionAction,
 };

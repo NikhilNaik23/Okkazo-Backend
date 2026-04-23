@@ -6,7 +6,13 @@ const { upload } = require('../middleware/upload');
 
 const router = express.Router();
 
-// All routes require at least USER role (gateway already enforces auth)
+// Most routes require authenticated roles (except explicitly marked public routes)
+
+// Public route: custom quote request for unauthenticated visitors
+router.post(
+  '/public/quote-request',
+  planningController.submitPublicQuoteRequest
+);
 
 // POST /planning - Create a new planning
 // Uses multer to handle optional eventBanner file upload (public events)
@@ -157,6 +163,13 @@ router.post(
   '/planning/:eventId/promotion-actions/email-blast',
   authorizeRoles(['MANAGER', 'ADMIN']),
   planningController.triggerPlanningEmailBlastPromotionAction
+);
+
+// POST /planning/:eventId/promotion-actions/social-synergy - Trigger social synergy promotion
+router.post(
+  '/planning/:eventId/promotion-actions/social-synergy',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  planningController.triggerPlanningSocialSynergyPromotionAction
 );
 
 // GET /planning/:eventId/vendors - Fetch vendors for a service category

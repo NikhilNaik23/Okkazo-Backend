@@ -148,6 +148,13 @@ router.post(
   promoteController.triggerPromoteEmailBlastPromotionAction
 );
 
+// POST /promote/:eventId/promotion-actions/social-synergy - Trigger social synergy promotion
+router.post(
+  '/promote/:eventId/promotion-actions/social-synergy',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  promoteController.triggerPromoteSocialSynergyPromotionAction
+);
+
 // PATCH /promote/:eventId/status — Update event status (Manager/Admin)
 router.patch(
   '/promote/:eventId/status',

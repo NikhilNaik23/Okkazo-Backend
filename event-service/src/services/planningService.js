@@ -35,6 +35,11 @@ const {
   shiftDateKeepingIstTime,
   toIstDayString,
 } = require('../utils/istDateTime');
+const {
+  resolveSocialSynergyTemplateKey,
+  buildSocialSynergyCaption,
+  postSocialSynergyPromotion,
+} = require('./instagramPromotionService');
 
 const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
   [CATEGORY.PUBLIC]: 'Public Event',
@@ -2856,6 +2861,99 @@ const triggerPlanningEmailBlastPromotionAction = async ({ eventId, actorRole, ac
 };
 
 /**
+ * Trigger SOCIAL SYNERGY promotion action for public planning events.
+ */
+const triggerPlanningSocialSynergyPromotionAction = async ({ eventId, actorRole, actorAuthId, actorManagerId } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  if (!['MANAGER', 'ADMIN'].includes(normalizedRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can trigger social synergy');
+  }
+
+  const planning = await Planning.findOne({ eventId: trimmedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const category = String(planning.category || '').trim().toLowerCase();
+  if (category !== CATEGORY.PUBLIC) {
+    throw createApiError(409, 'Social Synergy promotion is supported only for public planning events');
+  }
+
+  if (normalizedRole === 'MANAGER') {
+    const normalizedActorManagerId = String(actorManagerId || '').trim();
+    if (!normalizedActorManagerId) throw createApiError(403, 'Manager identity is required');
+    if (String(planning.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+      throw createApiError(403, 'You are not assigned to this planning');
+    }
+  }
+
+  if (!hasPromotionSelected(planning.promotionType, 'Social Synergy')) {
+    throw createApiError(409, 'Social Synergy is not selected for this planning event');
+  }
+
+  const requestId = `PSS-${trimmedEventId}-${Date.now()}`;
+  const requestedAt = new Date().toISOString();
+  const eventDate = planning?.schedule?.startAt || planning?.eventDate || null;
+  const parsedEventDate = eventDate ? new Date(eventDate) : null;
+  const eventDateIso = parsedEventDate && !Number.isNaN(parsedEventDate.getTime())
+    ? parsedEventDate.toISOString()
+    : null;
+  const eventLocation = planning?.location?.name || planning?.location || null;
+  const eventTypeLabel = String(planning?.eventType || planning?.customEventType || '').trim() || 'Other';
+  const eventUrl = `${resolveFrontendBaseUrl()}/user/event/${encodeURIComponent(trimmedEventId)}`;
+  const templateKey = resolveSocialSynergyTemplateKey(eventTypeLabel);
+  const caption = buildSocialSynergyCaption({
+    eventType: eventTypeLabel,
+    eventTitle: planning?.eventTitle,
+    eventDescription: planning?.eventDescription,
+    eventDate: eventDateIso,
+    eventLocation,
+    eventUrl,
+    templateKey,
+  });
+
+  const postResult = await postSocialSynergyPromotion({
+    eventId: trimmedEventId,
+    eventType: eventTypeLabel,
+    eventTitle: String(planning?.eventTitle || '').trim() || null,
+    eventDescription: String(planning?.eventDescription || '').trim() || null,
+    eventDate: eventDateIso,
+    eventLocation: eventLocation ? String(eventLocation).trim() : null,
+    eventBannerUrl: String(planning?.eventBanner?.url || planning?.eventBanner || '').trim() || null,
+    eventUrl,
+    templateKey,
+    caption,
+  });
+
+  await publishEvent('PROMOTION_SOCIAL_SYNERGY_POSTED', {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'planning',
+    promotionType: 'SOCIAL_SYNERGY',
+    requestedByAuthId: String(actorAuthId || '').trim() || null,
+    requestedByRole: normalizedRole,
+    requestedAt,
+    socialTemplate: templateKey,
+    instagramPostId: postResult?.mediaId || null,
+    instagramPermalink: postResult?.permalink || null,
+    simulated: Boolean(postResult?.simulated),
+  });
+
+  return {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'planning',
+    promotionType: 'SOCIAL_SYNERGY',
+    requestedAt,
+    socialTemplate: templateKey,
+    instagramPostId: postResult?.mediaId || null,
+    instagramPermalink: postResult?.permalink || null,
+    simulated: Boolean(postResult?.simulated),
+  };
+};
+
+/**
  * Submit post-completion feedback for planning event (Owner)
  */
 const submitPlanningFeedback = async ({ eventId, authId, platformFeedback, vendorFeedback } = {}) => {
@@ -3445,5 +3543,6 @@ module.exports = {
   removePlanningCoreStaff,
   releasePlanningGeneratedRevenuePayout,
   triggerPlanningEmailBlastPromotionAction,
+  triggerPlanningSocialSynergyPromotionAction,
   submitPlanningFeedback,
 };

@@ -12,6 +12,11 @@ const mongoose = require('mongoose');
 const { fetchUserById, fetchActiveManagers, fetchUserByAuthId } = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
 const { publishEvent } = require('../kafka/eventProducer');
+const {
+  resolveSocialSynergyTemplateKey,
+  buildSocialSynergyCaption,
+  postSocialSynergyPromotion,
+} = require('./instagramPromotionService');
 
 const defaultOrderServiceUrl = process.env.SERVICE_HOST
   ? 'http://order-service:8087'
@@ -1886,6 +1891,94 @@ const triggerPromoteEmailBlastPromotionAction = async ({ eventId, actorRole, act
   };
 };
 
+/**
+ * Trigger SOCIAL SYNERGY promotion action for promote events.
+ */
+const triggerPromoteSocialSynergyPromotionAction = async ({ eventId, actorRole, actorAuthId, actorManagerId } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  if (!['MANAGER', 'ADMIN'].includes(normalizedRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can trigger social synergy');
+  }
+
+  const promote = await Promote.findOne({ eventId: trimmedEventId });
+  if (!promote) throw createApiError(404, 'Promote record not found');
+
+  if (normalizedRole === 'MANAGER') {
+    const normalizedActorManagerId = String(actorManagerId || '').trim();
+    if (!normalizedActorManagerId) throw createApiError(403, 'Manager identity is required');
+    if (String(promote.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+      throw createApiError(403, 'You are not assigned to this event');
+    }
+  }
+
+  if (!hasPromotionSelected(promote.promotion, 'Social Synergy')) {
+    throw createApiError(409, 'Social Synergy is not selected for this promote event');
+  }
+
+  const requestId = `PSS-${trimmedEventId}-${Date.now()}`;
+  const requestedAt = new Date().toISOString();
+  const eventDate = promote?.schedule?.startAt || null;
+  const parsedEventDate = eventDate ? new Date(eventDate) : null;
+  const eventDateIso = parsedEventDate && !Number.isNaN(parsedEventDate.getTime())
+    ? parsedEventDate.toISOString()
+    : null;
+  const eventLocation = promote?.venue?.locationName || null;
+  const eventTypeLabel = String(promote?.eventCategory || promote?.customCategory || '').trim() || 'Other';
+  const eventUrl = `${resolveFrontendBaseUrl()}/user/event/${encodeURIComponent(trimmedEventId)}`;
+  const templateKey = resolveSocialSynergyTemplateKey(eventTypeLabel);
+  const caption = buildSocialSynergyCaption({
+    eventType: eventTypeLabel,
+    eventTitle: promote?.eventTitle,
+    eventDescription: promote?.eventDescription,
+    eventDate: eventDateIso,
+    eventLocation,
+    eventUrl,
+    templateKey,
+  });
+
+  const postResult = await postSocialSynergyPromotion({
+    eventId: trimmedEventId,
+    eventType: eventTypeLabel,
+    eventTitle: String(promote?.eventTitle || '').trim() || null,
+    eventDescription: String(promote?.eventDescription || '').trim() || null,
+    eventDate: eventDateIso,
+    eventLocation: eventLocation ? String(eventLocation).trim() : null,
+    eventBannerUrl: String(promote?.eventBanner?.url || promote?.eventBanner || '').trim() || null,
+    eventUrl,
+    templateKey,
+    caption,
+  });
+
+  await publishEvent('PROMOTION_SOCIAL_SYNERGY_POSTED', {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'promote',
+    promotionType: 'SOCIAL_SYNERGY',
+    requestedByAuthId: String(actorAuthId || '').trim() || null,
+    requestedByRole: normalizedRole,
+    requestedAt,
+    socialTemplate: templateKey,
+    instagramPostId: postResult?.mediaId || null,
+    instagramPermalink: postResult?.permalink || null,
+    simulated: Boolean(postResult?.simulated),
+  });
+
+  return {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'promote',
+    promotionType: 'SOCIAL_SYNERGY',
+    requestedAt,
+    socialTemplate: templateKey,
+    instagramPostId: postResult?.mediaId || null,
+    instagramPermalink: postResult?.permalink || null,
+    simulated: Boolean(postResult?.simulated),
+  };
+};
+
 // ─── Read all (admin / manager) ──────────────────────────────────────────────
 
 const getAllPromotes = async (filters = {}, page = 1, limit = 10) => {
@@ -3155,6 +3248,7 @@ module.exports = {
   releasePromoteGeneratedRevenuePayout,
   recoverPromoteCancellationLiability,
   triggerPromoteEmailBlastPromotionAction,
+  triggerPromoteSocialSynergyPromotionAction,
   updatePromoteDetails,
   addPromoteCoreStaff,
   removePromoteCoreStaff,

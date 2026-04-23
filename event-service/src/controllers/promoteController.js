@@ -615,6 +615,37 @@ const triggerPromoteEmailBlastPromotionAction = async (req, res) => {
   }
 };
 
+/**
+ * Trigger SOCIAL SYNERGY promotion action (Manager/Admin)
+ * POST /promote/:eventId/promotion-actions/social-synergy
+ */
+const triggerPromoteSocialSynergyPromotionAction = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const result = await promoteService.triggerPromoteSocialSynergyPromotionAction({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result?.simulated
+        ? 'Social Synergy preview generated (dry run mode)'
+        : 'Social Synergy post published on Instagram successfully',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in triggerPromoteSocialSynergyPromotionAction:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to trigger social synergy',
+    });
+  }
+};
+
 // ─── Update promote status (manager / admin) ──────────────────────────────────
 /**
  * PATCH /promote/:eventId/status
@@ -859,6 +890,7 @@ module.exports = {
   releasePromoteGeneratedRevenuePayout,
   recoverPromoteCancellationLiability,
   triggerPromoteEmailBlastPromotionAction,
+  triggerPromoteSocialSynergyPromotionAction,
   getAllPromotes,
   getManagerPromoteEvents,
   createPromoteRefundRequest,

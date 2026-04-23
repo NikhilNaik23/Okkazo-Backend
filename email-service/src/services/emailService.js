@@ -636,6 +636,71 @@ const sendVendorRejectedAlternativesEmail = async (email, details) => {
 };
 
 /**
+ * Send estimate email for a public custom quote request.
+ */
+const sendPublicQuoteEstimateEmail = async (email, details) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      requestId,
+      recipientName,
+      eventType,
+      attendees,
+      phone,
+      submittedAt,
+      message,
+      selectedServices,
+      estimatedServices,
+      totalEstimatedRange,
+    } = details || {};
+
+    if (!requestId) {
+      throw new Error('requestId is required');
+    }
+
+    const template = await loadTemplate('public-quote-estimate');
+    const submittedOn = submittedAt
+      ? new Date(submittedAt)
+      : new Date();
+
+    const submittedAtLabel = Number.isNaN(submittedOn.getTime())
+      ? new Date().toLocaleString('en-IN')
+      : submittedOn.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      });
+
+    const html = template({
+      requestId,
+      recipientName: recipientName || 'there',
+      eventType: eventType || 'Event',
+      attendees: attendees || null,
+      phone: phone || null,
+      submittedAt: submittedAtLabel,
+      message: message || null,
+      selectedServices: Array.isArray(selectedServices) ? selectedServices : [],
+      estimatedServices: Array.isArray(estimatedServices) ? estimatedServices : [],
+      totalEstimatedRange: totalEstimatedRange?.label || totalEstimatedRange || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Your Okkazo Price Estimate - ${eventType || 'Event'}`, html);
+    logger.info('Public quote estimate email sent', { email, requestId });
+  } catch (error) {
+    logger.error('Error sending public quote estimate email:', error);
+    throw error;
+  }
+};
+
+/**
  * Send finalized quotation email to a user (commission hidden; prices are client totals).
  */
 const sendPlanningQuoteLockedUserEmail = async (email, details) => {
@@ -1000,6 +1065,7 @@ module.exports = {
   sendUserGeneratedRevenueReceivedEmail,
   sendPromotionEmailBlastEmail,
   sendVendorRejectedAlternativesEmail,
+  sendPublicQuoteEstimateEmail,
   sendPlanningQuoteLockedUserEmail,
   sendPlanningQuoteLockedVendorEmail,
   sendPlanningFinalSettlementThankYouEmail,
