@@ -156,16 +156,69 @@ const clampRefundPercent = (value) => {
   return Math.max(0, Math.min(100, Number(n.toFixed(2))));
 };
 
+const areSlabPercentsEqualByCode = (left, right, percentField) => {
+  const leftRows = Array.isArray(left) ? left : [];
+  const rightRows = Array.isArray(right) ? right : [];
+  if (leftRows.length !== rightRows.length) return false;
+
+  const rightByCode = new Map(
+    rightRows.map((row) => [
+      String(row?.code || '').trim().toUpperCase(),
+      clampRefundPercent(row?.[percentField]),
+    ])
+  );
+
+  for (const row of leftRows) {
+    const code = String(row?.code || '').trim().toUpperCase();
+    const leftPercent = clampRefundPercent(row?.[percentField]);
+    const rightPercent = rightByCode.get(code);
+    if (leftPercent !== rightPercent) return false;
+  }
+
+  return true;
+};
+
+const coercePolicySlabRows = (rawRows) => {
+  if (Array.isArray(rawRows)) return rawRows;
+
+  if (typeof rawRows === 'string') {
+    try {
+      const parsed = JSON.parse(rawRows);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  if (rawRows && typeof rawRows === 'object') {
+    const values = Object.values(rawRows);
+    if (values.length === 0) return [];
+    if (values.every((row) => row && typeof row === 'object')) {
+      return values;
+    }
+  }
+
+  return null;
+};
+
+const isRefundPolicyDebugEnabled = () => String(process.env.DEBUG_REFUND_POLICY || '').trim().toLowerCase() === 'true';
+
 const normalizeRefundPolicySlabs = (rawSlabs) => {
   const defaults = cloneDefaultRefundPolicySlabs();
   const incoming = Array.isArray(rawSlabs) ? rawSlabs : [];
   const incomingByCode = new Map(
     incoming
-      .map((row) => ({
-        code: String(row?.code || '').trim().toUpperCase(),
-        deductionPercent: clampRefundPercent(row?.deductionPercent),
-      }))
-      .filter((row) => row.code)
+      .map((row) => {
+        const code = String(row?.code || '').trim().toUpperCase();
+        return [
+          code,
+          {
+            code,
+            deductionPercent: clampRefundPercent(row?.deductionPercent),
+          },
+        ];
+      })
+      .filter(([code]) => Boolean(code))
   );
 
   return defaults.map((slab) => {
@@ -184,13 +237,21 @@ const normalizeRefundTimelineLabel = (value) => {
 };
 
 const getOrCreatePlanningRefundPolicyConfig = async () => {
-  const setOnInsert = buildDefaultRefundPolicyConfigPayload();
+  const query = { key: REFUND_POLICY_CONFIG_KEY };
 
-  let cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
-    { key: REFUND_POLICY_CONFIG_KEY },
-    { $setOnInsert: setOnInsert },
-    { new: true, upsert: true }
-  ).lean();
+  let cfg = await PlanningRefundPolicyConfig.findOne(query).lean();
+  if (!cfg) {
+    try {
+      await PlanningRefundPolicyConfig.create(buildDefaultRefundPolicyConfigPayload());
+    } catch (error) {
+      if (error?.code !== 11000) throw error;
+    }
+    cfg = await PlanningRefundPolicyConfig.findOne(query).lean();
+  }
+
+  if (!cfg) {
+    throw createApiError(500, 'Failed to initialize refund policy config');
+  }
 
   const normalizedTimelineLabel = normalizeRefundTimelineLabel(cfg?.timelineLabel);
   const normalizedSlabs = normalizeRefundPolicySlabs(cfg?.slabs);
@@ -209,16 +270,21 @@ const getOrCreatePlanningRefundPolicyConfig = async () => {
     };
   }
 
-  cfg = await PlanningRefundPolicyConfig.findOneAndUpdate(
-    { key: REFUND_POLICY_CONFIG_KEY },
+  await PlanningRefundPolicyConfig.updateOne(
+    query,
     {
       $set: {
         timelineLabel: normalizedTimelineLabel,
         slabs: normalizedSlabs,
       },
-    },
-    { new: true }
-  ).lean();
+    }
+  );
+
+  cfg = await PlanningRefundPolicyConfig.findOne(query).lean();
+
+  if (!cfg) {
+    throw createApiError(500, 'Failed to read refund policy config after update');
+  }
 
   return {
     ...cfg,
@@ -273,7 +339,12 @@ const recalculateOpenRefundRequestResults = async (policy) => {
 };
 
 const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthId } = {}) => {
-  const hasSlabUpdates = Array.isArray(slabs);
+  const coercedSlabRows = slabs === undefined ? undefined : coercePolicySlabRows(slabs);
+  if (slabs !== undefined && coercedSlabRows === null) {
+    throw createApiError(400, 'slabs must be an array of refund slab objects');
+  }
+
+  const hasSlabUpdates = Array.isArray(coercedSlabRows);
   const hasTimelineUpdate = timelineLabel !== undefined;
   if (!hasSlabUpdates && !hasTimelineUpdate) {
     throw createApiError(400, 'No refund policy updates provided');
@@ -281,7 +352,7 @@ const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthI
 
   const existing = await getOrCreatePlanningRefundPolicyConfig();
   const existingSlabs = normalizeRefundPolicySlabs(existing?.slabs);
-  const incomingRows = Array.isArray(slabs) ? slabs : [];
+  const incomingRows = Array.isArray(coercedSlabRows) ? coercedSlabRows : [];
 
   const incomingByCode = new Map(
     incomingRows.map((row) => [
@@ -289,6 +360,16 @@ const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthI
       row,
     ])
   );
+
+  if (isRefundPolicyDebugEnabled()) {
+    logger.info('[refund-policy][planning] incoming payload snapshot', {
+      updatedByAuthId: String(updatedByAuthId || '').trim() || null,
+      timelineLabel,
+      incomingRows,
+      incomingCodes: Array.from(incomingByCode.keys()),
+      existingSlabs,
+    });
+  }
 
   const nextSlabs = existingSlabs.map((slab) => {
     const code = String(slab.code || '').trim().toUpperCase();
@@ -306,6 +387,13 @@ const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthI
     };
   });
 
+  if (isRefundPolicyDebugEnabled()) {
+    logger.info('[refund-policy][planning] computed slabs snapshot', {
+      existingSlabs,
+      nextSlabs,
+    });
+  }
+
   for (const [code] of incomingByCode.entries()) {
     if (!REFUND_SLAB_BY_CODE.has(code)) {
       throw createApiError(400, `Unknown refund slab code: ${code}`);
@@ -316,7 +404,15 @@ const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthI
     ? normalizeRefundTimelineLabel(timelineLabel)
     : normalizeRefundTimelineLabel(existing?.timelineLabel);
 
-  const updated = await PlanningRefundPolicyConfig.findOneAndUpdate(
+  const hasSlabChanges = hasSlabUpdates
+    ? areSlabPercentsEqualByCode(nextSlabs, existingSlabs, 'deductionPercent') === false
+    : false;
+  const hasTimelineChanges = nextTimelineLabel !== normalizeRefundTimelineLabel(existing?.timelineLabel);
+  if (!hasSlabChanges && !hasTimelineChanges) {
+    throw createApiError(400, 'No refund policy changes detected');
+  }
+
+  await PlanningRefundPolicyConfig.updateOne(
     { key: REFUND_POLICY_CONFIG_KEY },
     {
       $set: {
@@ -329,8 +425,13 @@ const updatePlanningRefundPolicy = async ({ slabs, timelineLabel, updatedByAuthI
         roundRobinCursor: 0,
       },
     },
-    { new: true, upsert: true }
-  ).lean();
+    { upsert: true }
+  );
+
+  const updated = await PlanningRefundPolicyConfig.findOne({ key: REFUND_POLICY_CONFIG_KEY }).lean();
+  if (!updated) {
+    throw createApiError(500, 'Failed to read updated refund policy config');
+  }
 
   const normalized = {
     timelineLabel: normalizeRefundTimelineLabel(updated?.timelineLabel),
