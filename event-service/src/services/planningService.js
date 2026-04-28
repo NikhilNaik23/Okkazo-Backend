@@ -3237,7 +3237,7 @@ const markPlanningPaid = async (eventId) => {
     planning.platformFeePaid = true;
     // Keep legacy flag in sync for any older consumers / DB rows.
     planning.isPaid = true;
-    await planning.save();
+    await planning.save({ validateBeforeSave: false });
     logger.info(`Planning marked as paid: ${eventId}`);
   }
 

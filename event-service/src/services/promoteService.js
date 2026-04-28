@@ -1389,9 +1389,21 @@ const addPromoteCoreStaff = async ({ eventId, staffId, actorRole, actorManagerId
     throw createApiError(403, 'You are not assigned to this event');
   }
 
-  // Enforce availability: staff cannot be assigned to other active events.
-  const [conflictPromote, conflictPlanning] = await Promise.all([
-    Promote.findOne({
+  // Enforce availability using the same overlap rule as the availability dropdown.
+  const targetRange = promoteToRange(promote);
+
+  const [existingPlannings, existingPromotes] = await Promise.all([
+    Planning.find({
+      eventId: { $ne: trimmedEventId },
+      status: { $nin: PLANNING_TERMINAL_STATUSES },
+      $or: [
+        { assignedManagerId: trimmedStaffId },
+        { coreStaffIds: trimmedStaffId },
+      ],
+    })
+      .select('eventId category schedule eventDate')
+      .lean(),
+    Promote.find({
       eventId: { $ne: trimmedEventId },
       eventStatus: { $nin: [PROMOTE_STATUS.COMPLETE, PROMOTE_STATUS.CANCELLED, PROMOTE_STATUS.CLOSED] },
       'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
@@ -1400,28 +1412,37 @@ const addPromoteCoreStaff = async ({ eventId, staffId, actorRole, actorManagerId
         { coreStaffIds: trimmedStaffId },
       ],
     })
-      .select('eventId')
-      .lean(),
-    Planning.findOne({
-      eventId: { $ne: trimmedEventId },
-      status: { $nin: PLANNING_TERMINAL_STATUSES },
-      $or: [
-        { assignedManagerId: trimmedStaffId },
-        { coreStaffIds: trimmedStaffId },
-      ],
-    })
-      .select('eventId')
+      .select('eventId schedule')
       .lean(),
   ]);
 
-  if (conflictPromote || conflictPlanning) {
-    throw createApiError(409, 'Staff is already assigned to another active event');
+  const hasPlanningConflict = (existingPlannings || []).some((row) => {
+    const planningRange = String(row?.category || '').trim().toLowerCase() === 'public'
+      ? {
+          start: row?.schedule?.startAt,
+          end: row?.schedule?.endAt,
+        }
+      : {
+          start: row?.eventDate,
+          end: row?.eventDate,
+        };
+    return rangesOverlap(targetRange, planningRange);
+  });
+
+  if (hasPlanningConflict) {
+    throw createApiError(409, 'Coordinator is already assigned to another event for overlapping dates');
+  }
+
+  const hasPromoteConflict = (existingPromotes || []).some((row) => rangesOverlap(targetRange, promoteToRange(row)));
+
+  if (hasPromoteConflict) {
+    throw createApiError(409, 'Coordinator is already assigned to another event for overlapping dates');
   }
 
   const existing = Array.isArray(promote.coreStaffIds) ? promote.coreStaffIds.map(String) : [];
   if (!existing.includes(trimmedStaffId)) {
     promote.coreStaffIds = [...existing, trimmedStaffId];
-    await promote.save();
+    await promote.save({ validateBeforeSave: false });
   }
 
   const cfg = await promoteConfigService.getFees();

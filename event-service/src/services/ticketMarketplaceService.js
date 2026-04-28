@@ -22,6 +22,7 @@ const NOTIFICATION_SERVICE_URL = (
 ).replace(/\/$/, '');
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_SCAN_HISTORY = 200;
+const CHECKIN_WINDOW_MS = 60 * 60 * 1000;
 const REFUND_POLICY_CONFIG_KEY_TICKET_USER = 'ticket-user-default';
 const DEFAULT_TICKET_REFUND_TIMELINE_LABEL = '5-7 working days';
 
@@ -1564,16 +1565,6 @@ const verifyTicketQr = async ({ token, scannedByAuthId, scannedByRole } = {}) =>
 
   const now = new Date();
 
-  const startAt = ticket?.schedule?.startAt ? new Date(ticket.schedule.startAt) : null;
-  if (startAt && !Number.isNaN(startAt.getTime()) && now < startAt) {
-    throw createApiError(409, 'Event check-in has not started yet');
-  }
-
-  const endAt = ticket?.schedule?.endAt ? new Date(ticket.schedule.endAt) : null;
-  if (endAt && !Number.isNaN(endAt.getTime()) && now > endAt) {
-    throw createApiError(409, 'Event has ended and check-in is closed');
-  }
-
   const verificationStatus = String(ticket?.verification?.status || '').trim().toUpperCase() === USER_TICKET_VERIFICATION_STATUS.VERIFIED
     ? USER_TICKET_VERIFICATION_STATUS.VERIFIED
     : USER_TICKET_VERIFICATION_STATUS.PENDING;
@@ -1611,28 +1602,21 @@ const verifyTicketQr = async ({ token, scannedByAuthId, scannedByRole } = {}) =>
 
     await ticket.save({ validateBeforeSave: false });
 
-    return {
-      valid: true,
-      alreadyScanned: true,
-      message: "It's already scanned",
-      ticketId: ticket.ticketId,
-      eventId: ticket.eventId,
-      userAuthId: ticket.userAuthId,
-      eventTitle: ticket.eventTitle,
-      eventSource: ticket.eventSource,
-      ticketStatus: ticket.ticketStatus,
-      verificationStatus: USER_TICKET_VERIFICATION_STATUS.VERIFIED,
-      quantity: Number(ticket?.tickets?.noOfTickets || 0),
-      tiers: Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [],
-      selectedDay: ticket?.tickets?.selectedDay || selectedDay || null,
-      paidAt: ticket.paidAt || null,
-      verifiedAt: ticket?.verification?.verifiedAt || null,
-      lastScannedAt: now.toISOString(),
-      scanCount: previousScanCount + 1,
-      scannedByAuthId: ticket?.verification?.verifiedByAuthId || null,
-      scannedByRole: scannerRole,
-      scanHistory: mapScanHistoryForApi(scanHistory),
-    };
+    throw createApiError(409, 'Ticket has already been scanned');
+  }
+
+  const startAt = ticket?.schedule?.startAt ? new Date(ticket.schedule.startAt) : null;
+  if (startAt && !Number.isNaN(startAt.getTime())) {
+    const windowStart = new Date(startAt.getTime() - CHECKIN_WINDOW_MS);
+    const windowEnd = new Date(startAt.getTime() + CHECKIN_WINDOW_MS);
+
+    if (now < windowStart) {
+      throw createApiError(409, 'Event check-in opens 1 hour before scheduled start');
+    }
+
+    if (now > windowEnd) {
+      throw createApiError(409, 'Event check-in closed 1 hour after scheduled start');
+    }
   }
 
   const scanHistory = appendTicketScanHistory(ticket?.verification?.scanHistory, {
@@ -2720,6 +2704,78 @@ const markTicketSalePaid = async (payload = {}) => {
         }
 
         promote.tickets.tiers[index].quantity = available - requested;
+      }
+    }
+
+    const selectedDay = normalizeDayKey(ticket?.tickets?.selectedDay);
+    if (selectedDay && Array.isArray(promote?.tickets?.dayWiseAllocations) && promote.tickets.dayWiseAllocations.length > 0) {
+      const dayIndex = promote.tickets.dayWiseAllocations.findIndex(
+        (row) => normalizeDayKey(row?.day) === selectedDay
+      );
+
+      if (dayIndex < 0) {
+        logger.error('Promote day allocation missing during payment confirmation', { eventId, ticketId, selectedDay });
+        ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+        await ticket.save();
+        return null;
+      }
+
+      const dayAvailable = Number(promote.tickets.dayWiseAllocations[dayIndex]?.ticketCount || 0);
+      if (dayAvailable < requestedTotal) {
+        logger.error('Insufficient promote day inventory during payment confirmation', {
+          eventId,
+          ticketId,
+          selectedDay,
+          requestedTotal,
+          dayAvailable,
+        });
+        ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+        await ticket.save();
+        return null;
+      }
+
+      promote.tickets.dayWiseAllocations[dayIndex].ticketCount = dayAvailable - requestedTotal;
+
+      const dayTiers = Array.isArray(promote.tickets.dayWiseAllocations[dayIndex]?.tierBreakdown)
+        ? promote.tickets.dayWiseAllocations[dayIndex].tierBreakdown
+        : [];
+
+      if (dayTiers.length > 0) {
+        for (const selectedTier of selectedTiers) {
+          const tierIndex = dayTiers.findIndex(
+            (tier) => normalizeTierNameKey(tier?.tierName || tier?.name) === normalizeTierNameKey(selectedTier?.name)
+          );
+
+          if (tierIndex < 0) {
+            logger.error('Promote day tier missing during payment confirmation', {
+              eventId,
+              ticketId,
+              selectedDay,
+              tier: selectedTier?.name,
+            });
+            ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+            await ticket.save();
+            return null;
+          }
+
+          const dayTierAvailable = Number(dayTiers[tierIndex]?.ticketCount || 0);
+          const dayTierRequested = Number(selectedTier?.noOfTickets || 0);
+          if (dayTierAvailable < dayTierRequested) {
+            logger.error('Insufficient promote day tier inventory during payment confirmation', {
+              eventId,
+              ticketId,
+              selectedDay,
+              tier: selectedTier?.name,
+              requested: dayTierRequested,
+              available: dayTierAvailable,
+            });
+            ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+            await ticket.save();
+            return null;
+          }
+
+          dayTiers[tierIndex].ticketCount = dayTierAvailable - dayTierRequested;
+        }
       }
     }
 
