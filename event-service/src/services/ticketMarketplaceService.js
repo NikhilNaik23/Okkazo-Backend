@@ -1184,6 +1184,7 @@ const mapPublicPlanningPreview = (planning) => ({
   eventType: resolvePreviewEventType(planning?.eventType, planning?.customEventType),
   eventDate: planning?.schedule?.startAt || planning?.eventDate || null,
   locationName: planning?.location?.name || '',
+  eventBanner: planning?.eventBanner || null,
   status: 'LIVE',
 });
 
@@ -1193,6 +1194,7 @@ const mapPublicPromotePreview = (promote) => ({
   eventType: resolvePreviewEventType(promote?.eventCategory || promote?.eventField, promote?.customCategory),
   eventDate: promote?.schedule?.startAt || null,
   locationName: promote?.venue?.locationName || '',
+  eventBanner: promote?.eventBanner || null,
   status: 'LIVE',
 });
 
@@ -1226,6 +1228,7 @@ const getPublicMarketplaceEventsPreview = async ({ limit = 12 } = {}) => {
     'eventTitle',
     'eventType',
     'customEventType',
+    'eventBanner',
     'location',
     'schedule',
     'eventDate',
@@ -1238,6 +1241,7 @@ const getPublicMarketplaceEventsPreview = async ({ limit = 12 } = {}) => {
     'eventCategory',
     'eventField',
     'customCategory',
+    'eventBanner',
     'venue',
     'schedule',
     'ticketAvailability',
