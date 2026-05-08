@@ -24,6 +24,27 @@ const getTicketMarketplaceEvents = async (req, res) => {
   }
 };
 
+const getPublicMarketplaceEventsPreview = async (req, res) => {
+  try {
+    const { limit = 12 } = req.query;
+
+    const result = await ticketMarketplaceService.getPublicMarketplaceEventsPreview({
+      limit,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in getPublicMarketplaceEventsPreview:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch public event preview',
+    });
+  }
+};
+
 const getMyTicketInterests = async (req, res) => {
   try {
     const userAuthId = req.user?.authId;
@@ -266,6 +287,7 @@ const verifyTicketQr = async (req, res) => {
 };
 
 module.exports = {
+  getPublicMarketplaceEventsPreview,
   getTicketMarketplaceEvents,
   getMyTicketInterests,
   prepareTicketPurchase,

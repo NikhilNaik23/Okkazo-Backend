@@ -1165,6 +1165,114 @@ const mapPromoteEvent = (event, soldCount = 0) => {
   };
 };
 
+const resolvePreviewEventType = (primary, custom) => {
+  const base = String(primary || '').trim();
+  const customValue = String(custom || '').trim();
+  if (base.toLowerCase() === 'other' && customValue) return customValue;
+  return base || customValue || 'Event';
+};
+
+const toEventTimeMs = (value) => {
+  const d = value ? new Date(value) : null;
+  if (!d || Number.isNaN(d.getTime())) return Number.POSITIVE_INFINITY;
+  return d.getTime();
+};
+
+const mapPublicPlanningPreview = (planning) => ({
+  eventId: String(planning?.eventId || '').trim(),
+  eventTitle: planning?.eventTitle || '',
+  eventType: resolvePreviewEventType(planning?.eventType, planning?.customEventType),
+  eventDate: planning?.schedule?.startAt || planning?.eventDate || null,
+  locationName: planning?.location?.name || '',
+  status: 'LIVE',
+});
+
+const mapPublicPromotePreview = (promote) => ({
+  eventId: String(promote?.eventId || '').trim(),
+  eventTitle: promote?.eventTitle || '',
+  eventType: resolvePreviewEventType(promote?.eventCategory || promote?.eventField, promote?.customCategory),
+  eventDate: promote?.schedule?.startAt || null,
+  locationName: promote?.venue?.locationName || '',
+  status: 'LIVE',
+});
+
+const getPublicMarketplaceEventsPreview = async ({ limit = 12 } = {}) => {
+  const safeLimit = Math.min(50, toPositiveInt(limit, 12));
+  const now = new Date();
+
+  const planningQuery = {
+    category: CATEGORY.PUBLIC,
+    platformFeePaid: true,
+    status: STATUS.CONFIRMED,
+    'ticketAvailability.startAt': { $lte: now },
+    'ticketAvailability.endAt': { $gte: now },
+  };
+
+  const promoteQuery = {
+    platformFeePaid: true,
+    eventStatus: PROMOTE_STATUS.LIVE,
+    $or: [
+      { refundRequest: null },
+      { refundRequest: { $exists: false } },
+      { 'refundRequest.status': 'REJECTED' },
+    ],
+    'adminDecision.status': ADMIN_DECISION_STATUS.APPROVED,
+    'ticketAvailability.startAt': { $lte: now },
+    'ticketAvailability.endAt': { $gte: now },
+  };
+
+  const planningSelect = [
+    'eventId',
+    'eventTitle',
+    'eventType',
+    'customEventType',
+    'location',
+    'schedule',
+    'eventDate',
+    'ticketAvailability',
+  ].join(' ');
+
+  const promoteSelect = [
+    'eventId',
+    'eventTitle',
+    'eventCategory',
+    'eventField',
+    'customCategory',
+    'venue',
+    'schedule',
+    'ticketAvailability',
+    'eventStatus',
+  ].join(' ');
+
+  const [planningEvents, promoteEvents] = await Promise.all([
+    Planning.find(planningQuery).select(planningSelect).lean(),
+    Promote.find(promoteQuery).select(promoteSelect).lean(),
+  ]);
+
+  const combined = [
+    ...(planningEvents || []).map(mapPublicPlanningPreview),
+    ...(promoteEvents || []).map(mapPublicPromotePreview),
+  ].filter((item) => item.eventId);
+
+  const deduped = [];
+  const seen = new Set();
+  for (const item of combined) {
+    if (seen.has(item.eventId)) continue;
+    seen.add(item.eventId);
+    deduped.push(item);
+  }
+
+  const events = deduped
+    .sort((a, b) => toEventTimeMs(a.eventDate) - toEventTimeMs(b.eventDate))
+    .slice(0, safeLimit);
+
+  return {
+    events,
+    total: events.length,
+    serverTime: now.toISOString(),
+  };
+};
+
 const getTicketMarketplaceEvents = async ({ page = 1, limit = 20 } = {}) => {
   const safePage = toPositiveInt(page, 1);
   const safeLimit = Math.min(100, toPositiveInt(limit, 20));
@@ -2851,6 +2959,7 @@ const updateTicketRefundPolicyForApi = async ({ slabs, timelineLabel, updatedByA
 });
 
 module.exports = {
+  getPublicMarketplaceEventsPreview,
   getTicketMarketplaceEvents,
   getMyTicketInterests,
   prepareTicketPurchase,

@@ -4,6 +4,13 @@ const { authorizeRoles } = require('../middleware/authorization');
 
 const router = express.Router();
 
+// GET /public/marketplace/events
+// Public preview feed (minimal fields only)
+router.get(
+  '/public/marketplace/events',
+  ticketMarketplaceController.getPublicMarketplaceEventsPreview
+);
+
 // GET /tickets/marketplace/events
 // Public-event feed for user dashboard (planning public + promote)
 router.get(
