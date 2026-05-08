@@ -14,7 +14,7 @@ const {
   USER_HIDDEN_STATUSES,
 } = require('../utils/planningConstants');
 const { PROMOTE_STATUS, ADMIN_DECISION_STATUS } = require('../utils/promoteConstants');
-const { USER_TICKET_STATUS } = require('../utils/ticketConstants');
+const { USER_TICKET_STATUS, USER_TICKET_VERIFICATION_STATUS } = require('../utils/ticketConstants');
 const vendorSelectionService = require('./vendorSelectionService');
 const vendorReservationService = require('./vendorReservationService');
 const promoteConfigService = require('./promoteConfigService');
@@ -721,6 +721,62 @@ const processPlanningGuestTicketBulkRefund = async ({
   }
 };
 
+const updatePlanningGuestTicketCancellationStatus = async ({
+  planning,
+  cancellationReason = null,
+  refundTimelineLabel = DEFAULT_REFUND_TIMELINE_LABEL,
+} = {}) => {
+  const normalizedEventId = String(planning?.eventId || '').trim();
+  if (!normalizedEventId) {
+    return {
+      skipped: true,
+      reason: 'Missing eventId for guest ticket cancellation update',
+    };
+  }
+
+  const cancelledAt = new Date();
+  const reasonText = String(cancellationReason || '').trim();
+  const cancellationReasonText = `Event cancelled: ${reasonText || 'Organizer cancelled the event'}`;
+  const requestId = String(planning?.refundRequest?.requestId || '').trim() || null;
+  const refundRef = String(planning?.refundRequest?.refundTransactionRef || '').trim() || null;
+  const timelineLabel = String(refundTimelineLabel || '').trim() || DEFAULT_REFUND_TIMELINE_LABEL;
+  const eventDate = planning?.eventDate || planning?.schedule?.startAt || null;
+
+  const updateResult = await UserEventTicket.updateMany(
+    {
+      eventId: normalizedEventId,
+      eventSource: 'planning-public',
+      ticketStatus: USER_TICKET_STATUS.SUCCESS,
+    },
+    {
+      $set: {
+        ticketStatus: USER_TICKET_STATUS.CANCELED,
+        'verification.status': USER_TICKET_VERIFICATION_STATUS.PENDING,
+        'verification.verifiedAt': null,
+        'verification.verifiedByAuthId': null,
+        'verification.lastScannedAt': null,
+        'cancellation.requestId': requestId,
+        'cancellation.cancelledAt': cancelledAt,
+        'cancellation.eventDate': eventDate,
+        'cancellation.reason': cancellationReasonText,
+        'cancellation.reasonCode': 'CLIENT_CANCELLED',
+        'cancellation.flags.eventCancelled': true,
+        'cancellation.flags.okkazoFailure': false,
+        'cancellation.timelineLabel': timelineLabel,
+        'cancellation.refundPaymentOrderId': refundRef || null,
+        'cancellation.refundedAt': cancelledAt,
+      },
+    }
+  );
+
+  return {
+    skipped: false,
+    matched: Number(updateResult?.matchedCount ?? updateResult?.n ?? 0),
+    modified: Number(updateResult?.modifiedCount ?? updateResult?.nModified ?? 0),
+    cancelledAt,
+  };
+};
+
 const handlePlanningCancellationPostActions = async ({
   planning,
   cancellationReason = null,
@@ -801,6 +857,27 @@ const handlePlanningCancellationPostActions = async ({
     }),
   ]);
 
+  let ticketUpdate = {
+    skipped: true,
+    reason: 'Ticket cancellation update not executed',
+  };
+  try {
+    ticketUpdate = await updatePlanningGuestTicketCancellationStatus({
+      planning,
+      cancellationReason,
+      refundTimelineLabel,
+    });
+  } catch (error) {
+    ticketUpdate = {
+      skipped: false,
+      error: error?.message || String(error),
+    };
+    logger.warn('Failed to update planning guest ticket cancellation status', {
+      eventId: normalizedEventId,
+      message: ticketUpdate.error,
+    });
+  }
+
   return {
     ticketWindowStarted,
     vendorRelease,
@@ -808,6 +885,7 @@ const handlePlanningCancellationPostActions = async ({
     notifications,
     emailQueue,
     bulkGuestTicketRefund,
+    ticketUpdate,
   };
 };
 
@@ -821,6 +899,7 @@ const buildPlanningCancellationOpsRecord = ({
   const notificationsFailed = Math.max(0, Number(details?.notifications?.failed || 0));
   const refundFailed = Math.max(0, Number(details?.bulkGuestTicketRefund?.failedCount || 0));
   const refundError = String(details?.bulkGuestTicketRefund?.error || '').trim();
+  const ticketUpdateError = String(details?.ticketUpdate?.error || '').trim();
   const emailQueued = Boolean(details?.emailQueue?.queued);
   const opError = String(fallbackError || details?.error || '').trim();
 
@@ -830,6 +909,7 @@ const buildPlanningCancellationOpsRecord = ({
   if (guestRecipients > 0 && !emailQueued) failures.push('Guest cancellation email queue did not succeed');
   if (guestRecipients > 0 && refundFailed > 0) failures.push('Some guest ticket refunds failed');
   if (guestRecipients > 0 && refundError) failures.push(refundError);
+  if (ticketUpdateError) failures.push(`Ticket cancellation update failed: ${ticketUpdateError}`);
 
   const status = failures.length === 0
     ? CANCELLATION_OP_STATUSES.COMPLETED

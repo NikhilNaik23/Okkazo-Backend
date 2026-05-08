@@ -42,6 +42,12 @@ router.get(
   ticketMarketplaceController.getMyTicketByTicketId
 );
 
+router.delete(
+  '/tickets/my/:ticketId',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  ticketMarketplaceController.cancelMyTicket
+);
+
 router.post(
   '/tickets/my/:ticketId/cancel',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
