@@ -1812,7 +1812,8 @@ const updatePlanningStatus = async (
     planning.assignedManagerId = assignedManagerId;
   }
 
-  await planning.save();
+  const skipValidation = normalizedStatus === STATUS.CLOSED;
+  await planning.save({ validateBeforeSave: !skipValidation });
   logger.info(`Planning status updated: ${eventId} -> ${status}`);
 
   if (planning.status === STATUS.APPROVED) {
