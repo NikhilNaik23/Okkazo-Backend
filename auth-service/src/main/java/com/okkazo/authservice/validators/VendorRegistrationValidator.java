@@ -2,6 +2,7 @@ package com.okkazo.authservice.validators;
 
 import com.okkazo.authservice.dtos.VendorRegisterRequestDto;
 import com.okkazo.authservice.models.ServiceCategory;
+import com.okkazo.authservice.utils.EmailDomainPolicy;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -53,6 +54,8 @@ public class VendorRegistrationValidator {
             errors.add("Email is required");
         } else if (!EMAIL_PATTERN.matcher(dto.getEmail()).matches()) {
             errors.add("Email should be valid");
+        } else if (!EmailDomainPolicy.isAllowedDomain(dto.getEmail())) {
+            errors.add(EmailDomainPolicy.allowedDomainsMessage());
         }
         
         // Phone validation

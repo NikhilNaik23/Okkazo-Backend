@@ -20,6 +20,7 @@ import com.okkazo.authservice.models.Role;
 import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
 import com.okkazo.authservice.repositories.EmailVerificationTokenRepository;
+import com.okkazo.authservice.utils.EmailDomainPolicy;
 import com.okkazo.authservice.utils.PasswordPolicy;
 import com.okkazo.authservice.utils.JwtUtil;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -69,6 +70,9 @@ public class AuthService {
     @Transactional
     public RegisterResponseDto register(RegisterRequestDto requestDto){
                 String normalizedEmail = normalizeEmail(requestDto.email());
+                if (!EmailDomainPolicy.isAllowedDomain(normalizedEmail)) {
+                        throw new InvalidEmailDomainException(EmailDomainPolicy.allowedDomainsMessage());
+                }
                 if (disposableEmailDomainService.isDisposableEmail(normalizedEmail)) {
                         throw new InvalidEmailDomainException("Temporary/disposable email addresses are not allowed. Please use a valid email.");
                 }

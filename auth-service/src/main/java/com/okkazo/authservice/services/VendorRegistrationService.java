@@ -13,6 +13,7 @@ import com.okkazo.authservice.models.ServiceCategory;
 import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
 import com.okkazo.authservice.repositories.PasswordResetTokenRepository;
+import com.okkazo.authservice.utils.EmailDomainPolicy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -55,6 +56,9 @@ public class VendorRegistrationService {
             }
 
             String normalizedEmail = normalizeEmail(requestDto.getEmail());
+            if (!EmailDomainPolicy.isAllowedDomain(normalizedEmail)) {
+                throw new InvalidEmailDomainException(EmailDomainPolicy.allowedDomainsMessage());
+            }
             if (disposableEmailDomainService.isDisposableEmail(normalizedEmail)) {
                 throw new InvalidEmailDomainException("Temporary/disposable email addresses are not allowed. Please use a valid business email.");
             }
