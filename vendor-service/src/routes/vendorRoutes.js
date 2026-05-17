@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const vendorController = require('../controllers/vendorController');
+const vendorComplaintController = require('../controllers/vendorComplaintController');
 const { extractUser } = require('../middleware/extractUser');
 const { authorizeRoles } = require('../middleware/authorization');
 const { upload } = require('../middleware/upload');
@@ -49,6 +50,35 @@ router.post(
   '/api/vendor/services',
   validateCreateVendorService,
   vendorController.createVendorService
+);
+
+// Vendor: raise a complaint with optional image evidence
+router.post(
+  '/api/vendor/complaints',
+  authorizeRoles(['VENDOR']),
+  upload.array('images', 5),
+  vendorComplaintController.raiseComplaint
+);
+
+// Vendor: list own complaints
+router.get(
+  '/api/vendor/complaints/me',
+  authorizeRoles(['VENDOR']),
+  vendorComplaintController.getMyComplaints
+);
+
+// Admin: list all vendor complaints
+router.get(
+  '/api/vendor/complaints',
+  authorizeRoles(['ADMIN']),
+  vendorComplaintController.getAllComplaints
+);
+
+// Admin: close a complaint
+router.patch(
+  '/api/vendor/complaints/:complaintId/close',
+  authorizeRoles(['ADMIN']),
+  vendorComplaintController.closeComplaint
 );
 
 // Vendor: get own services

@@ -50,6 +50,8 @@ const createProducer = async () => {
   }
 };
 
+const getProducer = () => producer;
+
 const disconnect = async () => {
   try {
     if (consumer) {
@@ -68,5 +70,6 @@ const disconnect = async () => {
 module.exports = {
   createConsumer,
   createProducer,
+  getProducer,
   disconnect,
 };

@@ -80,6 +80,11 @@ const handleEvent = async (event) => {
         await handleVendorRegistration(event);
         break;
 
+      case 'VENDOR_COMPLAINT_RAISED':
+      case 'VENDOR_COMPLAINT_CLOSED':
+        // Published by this service for notification fan-out.
+        break;
+
       default:
         logger.warn(`Unknown event type received: ${eventType}`);
         break;

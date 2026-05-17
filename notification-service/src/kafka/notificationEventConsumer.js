@@ -859,6 +859,59 @@ const handleVendorEvent = async (payload) => {
       metadata: payload,
       dedupePrefix: `VENDOR_APPLICATION:${payload?.applicationId || payload?.authId || 'na'}`,
     });
+    return;
+  }
+
+  if (eventType === 'VENDOR_COMPLAINT_RAISED') {
+    const complaintId = String(payload?.complaintId || '').trim();
+    const vendorAuthId = String(payload?.vendorAuthId || '').trim();
+    const vendorName = String(payload?.vendorName || 'A vendor').trim() || 'A vendor';
+    const subject = String(payload?.subject || 'Complaint').trim() || 'Complaint';
+
+    await notifyAdmins({
+      type: 'VENDOR_COMPLAINT_RAISED',
+      category: 'SYSTEM',
+      title: 'Vendor complaint raised',
+      message: `${vendorName} raised a complaint: ${subject}.`,
+      actionUrl: '/admin/complaints',
+      metadata: payload,
+      dedupePrefix: `VENDOR_COMPLAINT_RAISED:${complaintId || vendorAuthId || 'na'}`,
+    });
+
+    if (vendorAuthId) {
+      await createNotificationSafe({
+        recipientAuthId: vendorAuthId,
+        recipientRole: 'VENDOR',
+        type: 'VENDOR_COMPLAINT_RAISED',
+        category: 'SYSTEM',
+        title: 'Complaint raised',
+        message: `Your complaint "${subject}" has been sent to admin.`,
+        actionUrl: '/vendor/messages',
+        metadata: payload,
+        dedupeKey: `VENDOR_COMPLAINT_VENDOR_RAISED:${complaintId || 'na'}:${vendorAuthId}`,
+      });
+    }
+    return;
+  }
+
+  if (eventType === 'VENDOR_COMPLAINT_CLOSED') {
+    const complaintId = String(payload?.complaintId || '').trim();
+    const vendorAuthId = String(payload?.vendorAuthId || '').trim();
+    if (!vendorAuthId) return;
+
+    const subject = String(payload?.subject || 'Complaint').trim() || 'Complaint';
+
+    await createNotificationSafe({
+      recipientAuthId: vendorAuthId,
+      recipientRole: 'VENDOR',
+      type: 'VENDOR_COMPLAINT_CLOSED',
+      category: 'SYSTEM',
+      title: 'Complaint closed',
+      message: `Your complaint "${subject}" has been marked as closed.`,
+      actionUrl: '/vendor/messages',
+      metadata: payload,
+      dedupeKey: `VENDOR_COMPLAINT_CLOSED:${complaintId || 'na'}:${vendorAuthId}`,
+    });
   }
 };
 

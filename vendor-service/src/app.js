@@ -62,6 +62,9 @@ const startServer = async () => {
     verifyCloudinaryConfig();
 
     // Initialize and start Kafka consumer
+    await require('./config/kafka').createProducer();
+    logger.info('Kafka producer initialized');
+
     await vendorEventConsumer.initialize();
     await vendorEventConsumer.startConsuming();
     logger.info('Kafka consumer initialized and started');
